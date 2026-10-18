@@ -34,6 +34,12 @@
             clippy
           ];
         };
-      }
-    );
+    ) // {
+      homeModules.default = { config, lib, pkgs, ... }: {
+        home.packages = [ self.packages.${pkgs.system}.default ];
+        skills = lib.mkIf (config ? skills) {
+          commenter = "${self.packages.${pkgs.system}.default}/share/commenter/skills/commenter";
+        };
+      };
+    };
 }

@@ -18,6 +18,12 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
+
+          postInstall = ''
+            install -d $out/share/commenter/skills/commenter
+            install -m 644 skills/commenter/SKILL.md $out/share/commenter/skills/commenter/SKILL.md
+            install -m 644 skills/commenter.md $out/share/commenter/skills/commenter.md
+          '';
         };
 
         devShells.default = pkgs.mkShell {

@@ -1178,8 +1178,25 @@ export async function startServer(
         ? join(process.env.TELLIT_WEB_DIR, 'dist', 'client')
         : join(__dirname, '..', 'client');
 
-  app.use(express.static(distPath, { index: 'index.html' }));
-  app.get('/', (_req, res) => {
+  const setNoCacheHeaders = (res: express.Response) => {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+  };
+
+  app.use(
+    express.static(distPath, {
+      index: false,
+      setHeaders: (res, filePath) => {
+        if (filePath.endsWith('.html')) {
+          setNoCacheHeaders(res);
+        }
+      },
+    }),
+  );
+
+  app.get(['/', '/index.html'], (_req, res) => {
+    setNoCacheHeaders(res);
     res.sendFile(join(distPath, 'index.html'));
   });
 

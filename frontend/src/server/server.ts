@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import { createHash } from 'crypto';
+import { existsSync } from 'fs';
 import { type Server } from 'http';
 import { join, dirname, isAbsolute, resolve, sep } from 'path';
 import { fileURLToPath } from 'url';
@@ -1159,33 +1160,19 @@ export async function startServer(
     });
   });
 
-  // Always runs in production mode when distributed as a CLI tool
-  const isProduction =
-    process.env.NODE_ENV === 'production' || process.env.NODE_ENV !== 'development';
+  // Find client files relative to the CLI location or TELLIT_WEB_DIR
+  const distPath = existsSync(join(__dirname, '..', 'client', 'index.html'))
+    ? join(__dirname, '..', 'client')
+    : existsSync(join(__dirname, 'client', 'index.html'))
+      ? join(__dirname, 'client')
+      : process.env.TELLIT_WEB_DIR
+        ? join(process.env.TELLIT_WEB_DIR, 'dist', 'client')
+        : join(__dirname, '..', 'client');
 
-  if (isProduction) {
-    // Find client files relative to the CLI executable location
-    const distPath = join(__dirname, '..', 'client');
-    app.use(express.static(distPath));
-  } else {
-    app.get('/', (_req, res) => {
-      res.send(`
-        <!DOCTYPE html>
-        <html>
-          <head>
-            <title>difit - Dev Mode</title>
-          </head>
-          <body>
-            <div id="root"></div>
-            <script>
-              console.log('difit development mode');
-              console.log('Diff data available at /api/diff');
-            </script>
-          </body>
-        </html>
-      `);
-    });
-  }
+  app.use(express.static(distPath, { index: 'index.html' }));
+  app.get('/', (_req, res) => {
+    res.sendFile(join(distPath, 'index.html'));
+  });
 
   const { port, url, server } = await startServerWithFallback(
     app,

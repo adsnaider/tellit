@@ -65,12 +65,15 @@ export class JujutsuService {
   }
 
   async runJj(args: string[]): Promise<string> {
+    const effectiveArgs = args.includes('--ignore-working-copy')
+      ? args
+      : ['--ignore-working-copy', ...args];
     try {
-      const { stdout } = await execFileAsync(this.jjBin, args, { cwd: this.repoDir });
+      const { stdout } = await execFileAsync(this.jjBin, effectiveArgs, { cwd: this.repoDir });
       return stdout.trim();
     } catch {
       // Fallback to raw jj if jj-for-agents is not in PATH
-      const { stdout } = await execFileAsync('jj', ['--no-pager', ...args], { cwd: this.repoDir });
+      const { stdout } = await execFileAsync('jj', ['--no-pager', ...effectiveArgs], { cwd: this.repoDir });
       return stdout.trim();
     }
   }

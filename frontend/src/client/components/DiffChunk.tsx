@@ -36,6 +36,7 @@ interface DiffChunkProps {
   ) => Promise<void>;
   onGenerateThreadPrompt: (thread: CommentThread) => string;
   onRemoveThread: (threadId: string) => void;
+  onToggleResolve?: (threadId: string, currentResolved: boolean) => void;
   onReplyToThread: (threadId: string, body: string) => Promise<void>;
   onRemoveMessage: (threadId: string, messageId: string) => void;
   onUpdateMessage: (threadId: string, messageId: string, newBody: string) => void;
@@ -67,6 +68,7 @@ export const DiffChunk = memo(function DiffChunk({
   onAddComment,
   onGenerateThreadPrompt,
   onRemoveThread,
+  onToggleResolve,
   onReplyToThread,
   onRemoveMessage,
   onUpdateMessage,
@@ -396,6 +398,7 @@ export const DiffChunk = memo(function DiffChunk({
         onAddComment={onAddComment}
         onGenerateThreadPrompt={onGenerateThreadPrompt}
         onRemoveThread={onRemoveThread}
+        onToggleResolve={onToggleResolve}
         onReplyToThread={onReplyToThread}
         onRemoveMessage={onRemoveMessage}
         onUpdateMessage={onUpdateMessage}
@@ -430,9 +433,16 @@ export const DiffChunk = memo(function DiffChunk({
             const commentLineNumber =
               line.type === 'delete' ? line.oldLineNumber : line.newLineNumber;
             const commentSide: DiffSide = line.type === 'delete' ? 'old' : 'new';
-            const lineThreads = commentLineNumber
+            const primaryThreads = commentLineNumber
               ? getThreadsForLine(commentLineNumber, commentSide)
               : [];
+            const oldContextThreads =
+              line.type === 'normal' && line.oldLineNumber
+                ? getThreadsForLine(line.oldLineNumber, 'old')
+                : [];
+            const lineThreads = Array.from(
+              new Map([...primaryThreads, ...oldContextThreads].map((t) => [t.id, t])).values()
+            );
             // Generate ID for all lines to match the format used in useKeyboardNavigation
             const lineId = `file-${fileIndex}-chunk-${chunkIndex}-line-${index}`;
             const isCurrentLine =
@@ -526,6 +536,7 @@ export const DiffChunk = memo(function DiffChunk({
                               showAuthorBadges={showAuthorBadges}
                               onGeneratePrompt={onGenerateThreadPrompt}
                               onRemoveThread={onRemoveThread}
+                              onToggleResolve={onToggleResolve}
                               onReplyToThread={onReplyToThread}
                               onRemoveMessage={onRemoveMessage}
                               onUpdateMessage={onUpdateMessage}

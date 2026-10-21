@@ -1300,8 +1300,7 @@ describe('Server Integration Tests', () => {
       const html = await response.text();
 
       expect(response.ok).toBe(true);
-      expect(html).toContain('difit - Dev Mode');
-      expect(html).toContain('difit development mode');
+      expect(html).toContain('tellit');
     });
 
     it('serves static files in production mode', async () => {

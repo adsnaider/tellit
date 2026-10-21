@@ -529,6 +529,7 @@ function App() {
         codeContent: thread.codeSnapshot?.content,
         isOutdated: isThreadOutdated(thread, fileLineIndexByPath.get(thread.filePath)),
         messages: thread.messages,
+        resolved: thread.resolved,
       })),
     [threads, fileLineIndexByPath],
   );
@@ -1048,23 +1049,47 @@ function App() {
     };
   }, []);
 
+  const [jjBaseCommitId, setJjBaseCommitId] = useState<string | undefined>();
+
+  const refreshJjComments = useCallback(
+    async (target: string, base?: string) => {
+      try {
+        const url =
+          base && base !== 'parent'
+            ? `/api/jj/comments?target=${encodeURIComponent(target)}&base=${encodeURIComponent(base)}`
+            : `/api/jj/comments?target=${encodeURIComponent(target)}`;
+        const commentsRes = await fetch(url);
+        if (commentsRes.ok) {
+          const commentsData = (await commentsRes.json()) as { threads?: DiffCommentThread[] };
+          replaceThreads(commentsData.threads || []);
+        }
+      } catch (err) {
+        console.error('Failed to refresh jj comments:', err);
+      }
+    },
+    [replaceThreads],
+  );
+
   useEffect(() => {
     fetch('/api/jj/status')
       .then((res) => res.json())
       .then((data: { isJj?: boolean }) => {
         if (data.isJj) {
           setIsJjRepo(true);
-          if (diffData?.targetCommitish && !jjCommitId) {
-            setJjCommitId(diffData.targetCommitish);
+          const target = diffData?.targetCommitish || jjCommitId;
+          if (target) {
+            setJjCommitId(target);
+            refreshJjComments(target, diffData?.baseCommitish);
           }
         }
       })
       .catch(() => {});
-  }, [diffData?.targetCommitish, jjCommitId]);
+  }, [diffData?.baseCommitish, diffData?.targetCommitish, refreshJjComments]);
 
   const handleJjDiffChange = useCallback(
     async (targetCommitId: string, baseCommitId?: string) => {
       setJjCommitId(targetCommitId);
+      setJjBaseCommitId(baseCommitId);
       try {
         const url =
           baseCommitId && baseCommitId !== 'parent'
@@ -1075,16 +1100,12 @@ function App() {
           const newDiff = (await diffRes.json()) as DiffResponse;
           setDiffData(newDiff);
         }
-        const commentsRes = await fetch(`/api/jj/comments?commit=${encodeURIComponent(targetCommitId)}`);
-        if (commentsRes.ok) {
-          const commentsData = (await commentsRes.json()) as { threads?: DiffCommentThread[] };
-          replaceThreads(commentsData.threads || []);
-        }
+        await refreshJjComments(targetCommitId, baseCommitId);
       } catch (err) {
         console.error('Failed to change Jujutsu diff:', err);
       }
     },
-    [replaceThreads],
+    [refreshJjComments],
   );
 
   const handleAddComment = useCallback(
@@ -1096,21 +1117,21 @@ function App() {
       side?: DiffSide,
     ): Promise<void> => {
       if (isJjRepo && jjCommitId) {
+        const targetCommit =
+          side === 'old' && jjBaseCommitId && jjBaseCommitId !== 'parent'
+            ? jjBaseCommitId
+            : jjCommitId;
         await fetch('/api/jj/comments', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            commitId: jjCommitId,
+            commitId: targetCommit,
             filePath: file,
             line: typeof line === 'number' ? line : { start: line[0], end: line[1] },
             content: body,
           }),
         });
-        const commentsRes = await fetch(`/api/jj/comments?commit=${encodeURIComponent(jjCommitId)}`);
-        if (commentsRes.ok) {
-          const commentsData = (await commentsRes.json()) as { threads?: DiffCommentThread[] };
-          replaceThreads(commentsData.threads || []);
-        }
+        await refreshJjComments(jjCommitId, jjBaseCommitId);
         return;
       }
       addThread({
@@ -1128,7 +1149,7 @@ function App() {
       });
       return Promise.resolve();
     },
-    [addThread, isJjRepo, jjCommitId, replaceThreads],
+    [addThread, isJjRepo, jjBaseCommitId, jjCommitId, refreshJjComments],
   );
 
   const handleReplyToThread = useCallback(
@@ -1139,37 +1160,32 @@ function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ content: body }),
         });
-        const commentsRes = await fetch(`/api/jj/comments?commit=${encodeURIComponent(jjCommitId)}`);
-        if (commentsRes.ok) {
-          const commentsData = (await commentsRes.json()) as { threads?: DiffCommentThread[] };
-          replaceThreads(commentsData.threads || []);
-        }
+        await refreshJjComments(jjCommitId, jjBaseCommitId);
         return;
       }
       replyToThread({ threadId, body });
       return Promise.resolve();
     },
-    [isJjRepo, jjCommitId, replyToThread, replaceThreads],
+    [isJjRepo, jjBaseCommitId, jjCommitId, refreshJjComments, replyToThread],
   );
 
   const handleToggleResolve = useCallback(
-    async (threadId: string, currentResolved: boolean) => {
+    async (threadId: string, currentResolved?: boolean) => {
       if (isJjRepo && jjCommitId) {
+        const thread = threads.find((t) => t.id === threadId);
+        const isResolved =
+          currentResolved !== undefined ? currentResolved : Boolean(thread?.resolved);
         await fetch(`/api/jj/comments/${encodeURIComponent(threadId)}/resolve`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ unresolve: currentResolved }),
+          body: JSON.stringify({ unresolve: isResolved }),
         });
-        const commentsRes = await fetch(`/api/jj/comments?commit=${encodeURIComponent(jjCommitId)}`);
-        if (commentsRes.ok) {
-          const commentsData = (await commentsRes.json()) as { threads?: DiffCommentThread[] };
-          replaceThreads(commentsData.threads || []);
-        }
+        await refreshJjComments(jjCommitId, jjBaseCommitId);
         return;
       }
       removeThread(threadId);
     },
-    [isJjRepo, jjCommitId, removeThread, replaceThreads],
+    [isJjRepo, jjBaseCommitId, jjCommitId, refreshJjComments, removeThread, threads],
   );
 
   const handleCopyAllComments = async () => {
@@ -1612,6 +1628,7 @@ function App() {
                       onAddComment={handleAddComment}
                       onGenerateThreadPrompt={handleGenerateThreadPrompt}
                       onRemoveThread={handleToggleResolve}
+                      onToggleResolve={handleToggleResolve}
                       onReplyToThread={handleReplyToThread}
                       onRemoveMessage={removeMessage}
                       onUpdateMessage={updateMessage}
@@ -1693,6 +1710,7 @@ function App() {
           comments={normalizedThreads}
           showAuthorBadges={showAuthorBadges}
           onRemoveThread={handleToggleResolve}
+          onToggleResolve={handleToggleResolve}
           onGenerateThreadPrompt={handleGenerateThreadPrompt}
           onReplyToThread={handleReplyToThread}
           onRemoveMessage={removeMessage}

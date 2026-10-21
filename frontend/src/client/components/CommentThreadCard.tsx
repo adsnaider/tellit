@@ -1,4 +1,13 @@
-import { Check, ChevronDown, ChevronRight, Copy, Edit2, MessageSquare, Trash2 } from 'lucide-react';
+import {
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Copy,
+  Edit2,
+  MessageSquare,
+  RotateCcw,
+  Trash2,
+} from 'lucide-react';
 import React, { useEffect, useRef, useState } from 'react';
 
 import { type CommentThread, type DiffCommentMessage } from '../../types/diff';
@@ -120,10 +129,18 @@ function ThreadMessageItem({
                     onResolveOrDelete();
                   }}
                   className={`whitespace-nowrap rounded border border-github-border bg-github-bg-tertiary px-2 py-1 text-xs font-medium transition-all hover:bg-github-bg-primary ${
-                    isRootMessage ? 'text-green-700 hover:text-green-800' : 'text-github-danger'
+                    isRootMessage
+                      ? confirmPrompt?.startsWith('Unresolve')
+                        ? 'text-yellow-500 hover:text-yellow-400'
+                        : 'text-green-500 hover:text-green-400'
+                      : 'text-github-danger'
                   }`}
                 >
-                  {isRootMessage ? 'Resolve' : 'Delete'}
+                  {isRootMessage
+                    ? confirmPrompt?.startsWith('Unresolve')
+                      ? 'Unresolve'
+                      : 'Resolve'
+                    : 'Delete'}
                 </button>
                 <button
                   type="button"
@@ -159,12 +176,24 @@ function ThreadMessageItem({
                     onResolveOrDelete();
                   }}
                   className={`rounded border border-github-border bg-github-bg-tertiary p-1.5 transition-all hover:bg-github-bg-primary ${
-                    isRootMessage ? 'text-green-700 hover:text-green-800' : 'text-github-danger'
+                    isRootMessage
+                      ? actionLabel.startsWith('Unresolve')
+                        ? 'text-yellow-500 hover:text-yellow-400'
+                        : 'text-green-500 hover:text-green-400'
+                      : 'text-github-danger'
                   }`}
                   title={actionLabel}
                   aria-label={actionLabel}
                 >
-                  {isRootMessage ? <Check size={12} /> : <Trash2 size={12} />}
+                  {isRootMessage ? (
+                    actionLabel.startsWith('Unresolve') ? (
+                      <RotateCcw size={12} />
+                    ) : (
+                      <Check size={12} />
+                    )
+                  ) : (
+                    <Trash2 size={12} />
+                  )}
                 </button>
               </div>
             ))}
@@ -244,7 +273,11 @@ export function CommentThreadCard({
   return (
     <div
       id={`comment-thread-${thread.id}`}
-      className={`rounded-md border border-yellow-600/50 border-l-4 border-l-yellow-400 bg-github-bg-tertiary p-3 shadow-sm transition-all ${
+      className={`rounded-md border ${
+        thread.resolved
+          ? 'border-green-600/40 border-l-4 border-l-green-500 bg-github-bg-secondary/70'
+          : 'border-yellow-600/50 border-l-4 border-l-yellow-400 bg-github-bg-tertiary'
+      } p-3 shadow-sm transition-all ${
         onClick ? 'cursor-pointer hover:shadow-md' : ''
       }`}
       onClick={onClick}
@@ -263,10 +296,17 @@ export function CommentThreadCard({
           </button>
           <span
             className="font-mono px-1 py-0.5 rounded overflow-hidden text-ellipsis whitespace-nowrap"
-            style={{
-              backgroundColor: 'var(--color-yellow-path-bg)',
-              color: 'var(--color-yellow-path-text)',
-            }}
+            style={
+              thread.resolved
+                ? {
+                    backgroundColor: 'rgba(34, 197, 94, 0.15)',
+                    color: '#4ade80',
+                  }
+                : {
+                    backgroundColor: 'var(--color-yellow-path-bg)',
+                    color: 'var(--color-yellow-path-text)',
+                  }
+            }
           >
             {thread.file}:{lineLabel}
           </span>
@@ -279,11 +319,12 @@ export function CommentThreadCard({
               Outdated
             </span>
           )}
-          {(thread as any).resolved && (
+          {thread.resolved && (
             <span
-              className="inline-flex h-5 shrink-0 items-center rounded-full border border-green-500/40 bg-green-500/10 px-2 text-[10px] font-medium text-green-500"
+              className="inline-flex h-5 shrink-0 items-center gap-1 rounded-full border border-green-500/40 bg-green-500/10 px-2 text-[10px] font-medium text-green-400"
               title="This comment thread is resolved"
             >
+              <Check size={10} />
               Resolved
             </span>
           )}
@@ -339,14 +380,17 @@ export function CommentThreadCard({
             filename={thread.file}
             originalCode={thread.codeContent}
             onUpdate={(newBody) => onUpdateMessage(thread.id, rootMessage.id, newBody)}
-            onResolveOrDelete={() =>
-              onToggleResolve
-                ? onToggleResolve(thread.id, Boolean((thread as any).resolved))
-                : onRemoveThread(thread.id)
-            }
-            actionLabel={(thread as any).resolved ? 'Unresolve thread' : 'Resolve thread'}
+            onResolveOrDelete={() => {
+              const currentResolved = Boolean(thread.resolved);
+              if (onToggleResolve) {
+                onToggleResolve(thread.id, currentResolved);
+              } else {
+                (onRemoveThread as any)(thread.id, currentResolved);
+              }
+            }}
+            actionLabel={thread.resolved ? 'Unresolve thread' : 'Resolve thread'}
             confirmPrompt={
-              (thread as any).resolved
+              thread.resolved
                 ? 'Unresolve?'
                 : confirmRootAction
                   ? 'Resolve?'

@@ -520,12 +520,16 @@ export async function startServer(
 
   app.get('/api/jj/comments', async (req, res) => {
     try {
-      const commitId = req.query.commit as string;
+      const commitId = (req.query.commit || req.query.target) as string;
+      const baseCommit = req.query.base as string | undefined;
       if (!commitId) {
-        res.status(400).json({ error: 'Commit ID is required' });
+        res.status(400).json({ error: 'Commit ID or target is required' });
         return;
       }
-      const rawThreads = await jjService.getComments(commitId);
+      const rawThreads = await jjService.getCommentsForDiff({
+        targetCommit: commitId,
+        baseCommit,
+      });
       const threads: DiffCommentThread[] = rawThreads.map(t => ({
         id: t.thread_id,
         filePath: t.filepath,
@@ -533,7 +537,7 @@ export async function startServer(
         updatedAt: new Date().toISOString(),
         resolved: t.resolved,
         position: {
-          side: 'new',
+          side: t.side || 'new',
           line: t.line_range
             ? t.line_range.start === t.line_range.end
               ? t.line_range.start

@@ -248,6 +248,9 @@ pub struct GetChangeArgs {
 
     #[arg(long, help = "Output as JSON array")]
     pub json: bool,
+
+    #[arg(long, help = "Output all threads for the change as JSON")]
+    pub threads: bool,
 }
 
 #[derive(Debug, Args)]
@@ -257,6 +260,9 @@ pub struct GetCommitArgs {
 
     #[arg(long, help = "Output as JSON array")]
     pub json: bool,
+
+    #[arg(long, help = "Output all threads for the commit as JSON")]
+    pub threads: bool,
 }
 
 pub fn run_jj(args: &[&str]) -> Result<String> {
@@ -647,6 +653,122 @@ pub fn get_commit_threads(store: &Path, commit_query: &str) -> Result<Vec<String
     Ok(thread_ids)
 }
 
+pub fn get_change_threads(store: &Path, change_query: &str) -> Result<Vec<ThreadInfo>> {
+    if !store.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut matched_dirs = Vec::new();
+    for entry in std::fs::read_dir(store)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == change_query {
+                matched_dirs = vec![entry.path()];
+                break;
+            } else if name.starts_with(change_query) {
+                matched_dirs.push(entry.path());
+            }
+        }
+    }
+
+    let mut threads = Vec::new();
+    for change_dir in matched_dirs {
+        let change_id = change_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        for commit_entry in std::fs::read_dir(&change_dir)? {
+            let commit_entry = commit_entry?;
+            if commit_entry.file_type()?.is_dir() {
+                let commit_id = commit_entry.file_name().to_string_lossy().to_string();
+                for file_entry in std::fs::read_dir(commit_entry.path())? {
+                    let file_entry = file_entry?;
+                    let path = file_entry.path();
+                    if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
+                        let thread_id = path
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        if let Ok(bytes) = std::fs::read(&path) {
+                            if let Ok(thread_data) = serde_json::from_slice::<ThreadData>(&bytes) {
+                                threads.push(ThreadInfo {
+                                    thread_id,
+                                    change_id: change_id.clone(),
+                                    commit_id: commit_id.clone(),
+                                    git_commit_hash: commit_id.clone(),
+                                    filepath: thread_data.filepath,
+                                    line_range: thread_data.line_range,
+                                    comments: thread_data.comments,
+                                    resolved: thread_data.resolved,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    threads.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
+    Ok(threads)
+}
+
+pub fn get_commit_thread_infos(store: &Path, commit_query: &str) -> Result<Vec<ThreadInfo>> {
+    if !store.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut threads = Vec::new();
+    for entry in WalkDir::new(store)
+        .min_depth(2)
+        .max_depth(2)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_dir() {
+            let commit_dir_name = entry.file_name().to_string_lossy();
+            if commit_dir_name == commit_query || commit_dir_name.starts_with(commit_query) {
+                let change_id = entry
+                    .path()
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let commit_id = commit_dir_name.to_string();
+
+                for file_entry in std::fs::read_dir(entry.path())?.filter_map(|e| e.ok()) {
+                    let path = file_entry.path();
+                    if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
+                        let thread_id = path
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        if let Ok(bytes) = std::fs::read(&path) {
+                            if let Ok(thread_data) = serde_json::from_slice::<ThreadData>(&bytes) {
+                                threads.push(ThreadInfo {
+                                    thread_id,
+                                    change_id: change_id.clone(),
+                                    commit_id: commit_id.clone(),
+                                    git_commit_hash: commit_id.clone(),
+                                    filepath: thread_data.filepath,
+                                    line_range: thread_data.line_range,
+                                    comments: thread_data.comments,
+                                    resolved: thread_data.resolved,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    threads.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
+    Ok(threads)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,5 +840,16 @@ mod tests {
         // Test get_commit_threads
         let threads = get_commit_threads(&store, commit_hash).unwrap();
         assert_eq!(threads, vec![thread_id]);
+
+        // Test get_change_threads
+        let change_threads = get_change_threads(&store, "change123").unwrap();
+        assert_eq!(change_threads.len(), 1);
+        assert_eq!(change_threads[0].thread_id, thread_id);
+        assert_eq!(change_threads[0].commit_id, commit_hash);
+
+        // Test get_commit_thread_infos
+        let commit_threads = get_commit_thread_infos(&store, commit_hash).unwrap();
+        assert_eq!(commit_threads.len(), 1);
+        assert_eq!(commit_threads[0].thread_id, thread_id);
     }
 }

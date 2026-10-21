@@ -34,6 +34,7 @@ export interface CommenterThreadInfo {
   line_range?: { start: number; end: number };
   comments: string[];
   resolved: boolean;
+  side?: 'old' | 'new';
 }
 
 export class JujutsuService {
@@ -153,6 +154,26 @@ export class JujutsuService {
     };
   }
 
+  async getChangeThreads(changeId: string): Promise<CommenterThreadInfo[]> {
+    try {
+      const output = await this.runTellit(['get', 'change', changeId, '--threads', '--json']);
+      if (!output) return [];
+      return JSON.parse(output);
+    } catch {
+      return [];
+    }
+  }
+
+  async getCommitThreads(commitId: string): Promise<CommenterThreadInfo[]> {
+    try {
+      const output = await this.runTellit(['get', 'commit', commitId, '--threads', '--json']);
+      if (!output) return [];
+      return JSON.parse(output);
+    } catch {
+      return [];
+    }
+  }
+
   async getCommitsForChange(changeId: string): Promise<JjCommit[]> {
     // 1. Get visible commits from Jujutsu
     const template = 'commit_id ++ "\t" ++ committer.timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ (if(current_working_copy, "1", "0")) ++ "\t" ++ description.first_line() ++ "\n"';
@@ -179,45 +200,32 @@ export class JujutsuService {
       });
     }
 
-    // 2. Also query tellit store for any historical git commit hashes with comments
-    try {
-      const tellitCommitsRaw = await this.runTellit(['get', 'change', changeId]);
-      for (const commitId of tellitCommitsRaw.split('\n').map((c: string) => c.trim()).filter((c: string) => c.length > 0)) {
-        if (!commitMap.has(commitId)) {
-          commitMap.set(commitId, {
-            commitId,
-            shortCommitId: commitId.slice(0, 8),
-            timestamp: '',
-            isWorkingCopy: false,
-            description: '(historical revision)',
-            commentCount: 0,
-            unresolvedCommentCount: 0,
-          });
-        }
+    // 2. Fetch all threads for the change
+    const changeThreads = await this.getChangeThreads(changeId);
+
+    // 3. For any historical commit that has threads but isn't in jj log:
+    for (const thread of changeThreads) {
+      if (!commitMap.has(thread.commit_id)) {
+        commitMap.set(thread.commit_id, {
+          commitId: thread.commit_id,
+          shortCommitId: thread.commit_id.slice(0, 8),
+          timestamp: '',
+          isWorkingCopy: false,
+          description: '(historical revision)',
+          commentCount: 0,
+          unresolvedCommentCount: 0,
+        });
       }
-    } catch {
-      // No tellit comments found or empty
     }
 
-    // 3. For each commit, populate comment counts
-    for (const [commitId, commit] of commitMap.entries()) {
-      try {
-        const threadIdsRaw = await this.runTellit(['get', 'commit', commitId]);
-        const threadIds = threadIdsRaw.split('\n').map((t: string) => t.trim()).filter((t: string) => t.length > 0);
-        commit.commentCount = threadIds.length;
-        let unresolved = 0;
-        for (const threadId of threadIds) {
-          try {
-            const threadJson = await this.runTellit(['get', 'thread', threadId]);
-            const thread: CommenterThreadInfo = JSON.parse(threadJson);
-            if (!thread.resolved) unresolved++;
-          } catch {
-            // Ignore individual thread read errors
-          }
+    // 4. Populate comment counts
+    for (const thread of changeThreads) {
+      const commit = commitMap.get(thread.commit_id);
+      if (commit) {
+        commit.commentCount++;
+        if (!thread.resolved) {
+          commit.unresolvedCommentCount++;
         }
-        commit.unresolvedCommentCount = unresolved;
-      } catch {
-        // No comments for this commit
       }
     }
 
@@ -244,22 +252,67 @@ export class JujutsuService {
   }
 
   async getComments(commitId: string): Promise<CommenterThreadInfo[]> {
-    try {
-      const threadIdsRaw = await this.runTellit(['get', 'commit', commitId]);
-      const threadIds = threadIdsRaw.split('\n').map(t => t.trim()).filter(t => t.length > 0);
-      const threads: CommenterThreadInfo[] = [];
-      for (const threadId of threadIds) {
-        try {
-          const threadJson = await this.runTellit(['get', 'thread', threadId]);
-          threads.push(JSON.parse(threadJson));
-        } catch {
-          // ignore error
-        }
-      }
-      return threads;
-    } catch {
-      return [];
+    return await this.getCommitThreads(commitId);
+  }
+
+  async getCommentsForDiff(params: {
+    targetCommit: string;
+    baseCommit?: string;
+  }): Promise<(CommenterThreadInfo & { side: 'old' | 'new' })[]> {
+    const targetInfo = await this.getChange(params.targetCommit);
+    const targetCommitId = targetInfo?.commitId || params.targetCommit;
+    const changeId = targetInfo?.changeId;
+
+    let baseCommitId: string | undefined;
+    if (
+      params.baseCommit &&
+      params.baseCommit !== 'parent' &&
+      params.baseCommit !== `${params.targetCommit}-` &&
+      params.baseCommit !== `${params.targetCommit}^`
+    ) {
+      const baseInfo = await this.getChange(params.baseCommit);
+      baseCommitId = baseInfo?.commitId || params.baseCommit;
     }
+
+    const resultMap = new Map<string, CommenterThreadInfo & { side: 'old' | 'new' }>();
+
+    // If we have changeId, get all threads in change
+    const allChangeThreads = changeId ? await this.getChangeThreads(changeId) : [];
+
+    const commitMatches = (a: string, b: string) =>
+      a === b || (a.length >= 6 && b.length >= 6 && (a.startsWith(b) || b.startsWith(a)));
+
+    // 1. If diffing against base commit (Requirement 3):
+    // All comments on baseCommit (resolved or unresolved) get side: 'old'
+    if (baseCommitId) {
+      const baseThreads = allChangeThreads.length > 0
+        ? allChangeThreads.filter(t => commitMatches(t.commit_id, baseCommitId!))
+        : await this.getCommitThreads(baseCommitId);
+
+      for (const t of baseThreads) {
+        resultMap.set(t.thread_id, { ...t, side: 'old' });
+      }
+    }
+
+    // 2. Comments on targetCommit -> side: 'new'
+    const targetThreads = allChangeThreads.length > 0
+      ? allChangeThreads.filter(t => commitMatches(t.commit_id, targetCommitId))
+      : await this.getCommitThreads(targetCommitId);
+
+    for (const t of targetThreads) {
+      resultMap.set(t.thread_id, { ...t, side: 'new' });
+    }
+
+    // 3. Any other unresolved comments in the change (Requirement 2):
+    // When stepping to a later commit in the same change, unresolved comments
+    // from earlier commits are carried forward so open comments don't disappear.
+    for (const t of allChangeThreads) {
+      if (!t.resolved && !resultMap.has(t.thread_id)) {
+        resultMap.set(t.thread_id, { ...t, side: 'new' });
+      }
+    }
+
+    return Array.from(resultMap.values());
   }
 
   async addComment(params: {

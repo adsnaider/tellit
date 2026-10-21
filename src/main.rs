@@ -2,9 +2,9 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use tellit_cli::{
-    add_comment, get_change_commits, get_commit_threads, get_thread, get_workspace_root,
-    locate_web_cli, reply_comment, resolve_comment, resolve_store, Cli, Command, CommentAction,
-    GetTarget,
+    add_comment, get_change_commits, get_change_threads, get_commit_thread_infos,
+    get_commit_threads, get_thread, get_workspace_root, locate_web_cli, reply_comment,
+    resolve_comment, resolve_store, Cli, Command, CommentAction, GetTarget,
 };
 
 fn locate_node() -> std::path::PathBuf {
@@ -131,22 +131,32 @@ fn run() -> anyhow::Result<()> {
                         println!("{}", serde_json::to_string_pretty(&info)?);
                     }
                     GetTarget::Change(c) => {
-                        let commits = get_change_commits(&store, &c.change_id)?;
-                        if c.json {
-                            println!("{}", serde_json::to_string_pretty(&commits)?);
+                        if c.threads {
+                            let threads = get_change_threads(&store, &c.change_id)?;
+                            println!("{}", serde_json::to_string_pretty(&threads)?);
                         } else {
-                            for commit in commits {
-                                println!("{commit}");
+                            let commits = get_change_commits(&store, &c.change_id)?;
+                            if c.json {
+                                println!("{}", serde_json::to_string_pretty(&commits)?);
+                            } else {
+                                for commit in commits {
+                                    println!("{commit}");
+                                }
                             }
                         }
                     }
                     GetTarget::Commit(co) => {
-                        let threads = get_commit_threads(&store, &co.commit_hash)?;
-                        if co.json {
+                        if co.threads {
+                            let threads = get_commit_thread_infos(&store, &co.commit_hash)?;
                             println!("{}", serde_json::to_string_pretty(&threads)?);
                         } else {
-                            for thread in threads {
-                                println!("{thread}");
+                            let threads = get_commit_threads(&store, &co.commit_hash)?;
+                            if co.json {
+                                println!("{}", serde_json::to_string_pretty(&threads)?);
+                            } else {
+                                for thread in threads {
+                                    println!("{thread}");
+                                }
                             }
                         }
                     }

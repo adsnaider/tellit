@@ -14,6 +14,7 @@ interface CommentsListModalProps {
   comments: CommentThread[];
   showAuthorBadges?: boolean;
   onRemoveThread: (threadId: string) => void;
+  onToggleResolve?: (threadId: string, currentResolved: boolean) => void;
   onGenerateThreadPrompt: (thread: CommentThread) => string;
   onReplyToThread: (threadId: string, body: string) => Promise<void>;
   onRemoveMessage: (threadId: string, messageId: string) => void;
@@ -28,6 +29,7 @@ export function CommentsListModal({
   comments,
   showAuthorBadges = false,
   onRemoveThread,
+  onToggleResolve,
   onGenerateThreadPrompt,
   onReplyToThread,
   onRemoveMessage,
@@ -179,6 +181,15 @@ export function CommentsListModal({
                             handleDeleteThread(thread);
                           }
                         }}
+                        onToggleResolve={
+                          onToggleResolve
+                            ? (id, curr) => onToggleResolve(id, curr)
+                            : (id) => {
+                                if (id === thread.id) {
+                                  handleDeleteThread(thread);
+                                }
+                              }
+                        }
                         onReplyToThread={onReplyToThread}
                         onRemoveMessage={onRemoveMessage}
                         onUpdateMessage={onUpdateMessage}

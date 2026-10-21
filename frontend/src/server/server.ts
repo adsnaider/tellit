@@ -457,8 +457,14 @@ export async function startServer(
     }
   });
 
-  app.get('/api/jj/changes', async (_req, res) => {
+  app.get('/api/jj/changes', async (req, res) => {
     try {
+      const query = req.query.query as string | undefined;
+      if (query && query.trim()) {
+        const change = await jjService.getChange(query.trim());
+        res.json({ changes: change ? [change] : [] });
+        return;
+      }
       const changes = await jjService.getChanges();
       res.json({ changes });
     } catch (error) {

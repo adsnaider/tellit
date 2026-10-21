@@ -98,7 +98,8 @@ export class JujutsuService {
 
   async getChanges(): Promise<JjChange[]> {
     const template = 'change_id ++ "\t" ++ commit_id ++ "\t" ++ (if(current_working_copy, "1", "0")) ++ "\t" ++ committer.timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ description.first_line() ++ "\n"';
-    const output = await this.runJj(['log', '-r', 'all()', '-n', '100', '--no-graph', '-T', template]);
+    // Run default jj log to match the active working stack/revisions
+    const output = await this.runJj(['log', '--no-graph', '-T', template]);
     const lines = output.split('\n').filter(line => line.trim().length > 0);
     const seenChanges = new Set<string>();
     const changes: JjChange[] = [];
@@ -122,6 +123,34 @@ export class JujutsuService {
     }
 
     return changes;
+  }
+
+  async getChange(query: string): Promise<JjChange | null> {
+    const template = 'change_id ++ "\t" ++ commit_id ++ "\t" ++ (if(current_working_copy, "1", "0")) ++ "\t" ++ committer.timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ description.first_line() ++ "\n"';
+    let output = '';
+    try {
+      output = await this.runJj(['log', '-r', `change_id(${query})`, '-n', '1', '--no-graph', '-T', template]);
+    } catch {
+      try {
+        output = await this.runJj(['log', '-r', query, '-n', '1', '--no-graph', '-T', template]);
+      } catch {
+        return null;
+      }
+    }
+    const lines = output.split('\n').filter(l => l.trim().length > 0);
+    if (lines.length === 0) return null;
+    const parts = lines[0].split('\t');
+    if (parts.length < 5) return null;
+    const [changeId, commitId, isWorkingCopy, timestamp, description] = parts;
+    return {
+      changeId,
+      shortChangeId: changeId.slice(0, 8),
+      commitId,
+      shortCommitId: commitId.slice(0, 8),
+      isWorkingCopy: isWorkingCopy === '1',
+      timestamp,
+      description: description || '(no description set)',
+    };
   }
 
   async getCommitsForChange(changeId: string): Promise<JjCommit[]> {

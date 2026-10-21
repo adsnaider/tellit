@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { GitCommit, GitBranch, MessageSquare, CheckCircle2, ArrowRight, Layers, FileDiff } from 'lucide-react';
+import { GitCommit, GitBranch, MessageSquare, CheckCircle2, ArrowRight, Layers, FileDiff, Search, X } from 'lucide-react';
 import { type JjChange, type JjCommit } from '../../types/diff';
 
 interface JjRevisionSelectorProps {
@@ -18,8 +18,11 @@ export function JjRevisionSelector({
   const [baseCommitId, setBaseCommitId] = useState<string>('parent');
   const [loadingChanges, setLoadingChanges] = useState(true);
   const [loadingCommits, setLoadingCommits] = useState(false);
+  const [isCustomInput, setIsCustomInput] = useState(false);
+  const [customInput, setCustomInput] = useState('');
+  const [customError, setCustomError] = useState<string | null>(null);
 
-  // Load changes
+  // Load changes (default jj log set)
   useEffect(() => {
     let mounted = true;
     fetch('/api/jj/changes')
@@ -45,6 +48,33 @@ export function JjRevisionSelector({
       mounted = false;
     };
   }, []);
+
+  const handleCustomSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const query = customInput.trim();
+    if (!query) return;
+    setCustomError(null);
+    try {
+      const res = await fetch(`/api/jj/changes?query=${encodeURIComponent(query)}`);
+      if (res.ok) {
+        const data = (await res.json()) as { changes?: JjChange[] };
+        if (data.changes && data.changes.length > 0) {
+          const found = data.changes[0];
+          setChanges((prev) => {
+            const exists = prev.some((c) => c.changeId === found.changeId);
+            return exists ? prev : [found, ...prev];
+          });
+          setSelectedChangeId(found.changeId);
+          setIsCustomInput(false);
+          setCustomInput('');
+          return;
+        }
+      }
+      setCustomError('Not found');
+    } catch {
+      setCustomError('Query failed');
+    }
+  };
 
   // When selected change changes, load its commits
   useEffect(() => {
@@ -118,19 +148,74 @@ export function JjRevisionSelector({
       <div className="flex items-center gap-1.5 bg-github-bg-tertiary border border-github-border rounded px-2 py-1">
         <GitBranch size={13} className="text-github-accent shrink-0" />
         <span className="font-semibold text-github-text-secondary">Change:</span>
-        <select
-          value={selectedChangeId}
-          onChange={(e) => setSelectedChangeId(e.target.value)}
-          className="bg-transparent text-github-text-primary text-xs font-mono outline-none cursor-pointer max-w-[190px] truncate"
-          title="Select Jujutsu Change"
-        >
-          {changes.map((change) => (
-            <option key={change.changeId} value={change.changeId} className="bg-github-bg-secondary text-github-text-primary font-mono">
-              {change.isWorkingCopy ? '@ ' : ''}
-              {change.shortChangeId} {change.description.slice(0, 28)}
-            </option>
-          ))}
-        </select>
+        {isCustomInput ? (
+          <form onSubmit={handleCustomSubmit} className="flex items-center gap-1">
+            <input
+              type="text"
+              value={customInput}
+              onChange={(e) => {
+                setCustomInput(e.target.value);
+                setCustomError(null);
+              }}
+              placeholder="e.g. kkmpptxz or @-"
+              className="bg-github-bg-secondary text-github-text-primary text-xs font-mono px-1.5 py-0.5 rounded border border-github-border outline-none w-[150px]"
+              autoFocus
+            />
+            <button
+              type="submit"
+              className="bg-github-accent text-white px-1.5 py-0.5 rounded text-[11px] font-semibold hover:opacity-90"
+            >
+              Go
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setIsCustomInput(false);
+                setCustomError(null);
+              }}
+              className="text-github-text-muted hover:text-github-text-primary px-0.5"
+              title="Cancel"
+            >
+              <X size={12} />
+            </button>
+            {customError && (
+              <span className="text-red-400 text-[10px] whitespace-nowrap">{customError}</span>
+            )}
+          </form>
+        ) : (
+          <div className="flex items-center gap-1">
+            <select
+              value={selectedChangeId}
+              onChange={(e) => {
+                if (e.target.value === '__custom__') {
+                  setIsCustomInput(true);
+                } else {
+                  setSelectedChangeId(e.target.value);
+                }
+              }}
+              className="bg-transparent text-github-text-primary text-xs font-mono outline-none cursor-pointer max-w-[190px] truncate"
+              title="Select Jujutsu Change"
+            >
+              {changes.map((change) => (
+                <option key={change.changeId} value={change.changeId} className="bg-github-bg-secondary text-github-text-primary font-mono">
+                  {change.isWorkingCopy ? '@ ' : ''}
+                  {change.shortChangeId} {change.description.slice(0, 28)}
+                </option>
+              ))}
+              <option value="__custom__" className="bg-github-bg-secondary text-github-accent font-sans">
+                ✏️ Enter Change ID...
+              </option>
+            </select>
+            <button
+              type="button"
+              onClick={() => setIsCustomInput(true)}
+              className="text-github-text-muted hover:text-github-text-primary p-0.5"
+              title="Enter specific change ID"
+            >
+              <Search size={12} />
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Target Commit Selector (Chronological) */}

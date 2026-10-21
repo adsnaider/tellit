@@ -479,20 +479,29 @@ export async function startServer(
 
   app.get('/api/jj/diff', async (req, res) => {
     try {
-      const commitId = req.query.commit as string;
+      const commitId = (req.query.target || req.query.commit) as string;
+      const baseId = req.query.base as string | undefined;
       if (!commitId) {
         res.status(400).json({ error: 'Commit ID is required' });
         return;
       }
-      const rawDiff = await jjService.getDiffForCommit(commitId);
+      const rawDiff = await jjService.getDiff(commitId, baseId);
       const files = parser.parseUnifiedDiff(rawDiff);
+      const isInterDiff = Boolean(
+        baseId &&
+        baseId !== 'parent' &&
+        !baseId.endsWith('^') &&
+        !baseId.endsWith('-')
+      );
+      const baseCommitish = isInterDiff ? (baseId as string) : `${commitId}^`;
+
       res.json({
         commit: commitId,
         files,
         isEmpty: files.length === 0,
-        baseCommitish: `${commitId}^`,
+        baseCommitish,
         targetCommitish: commitId,
-        requestedBaseCommitish: `${commitId}^`,
+        requestedBaseCommitish: baseCommitish,
         requestedTargetCommitish: commitId,
         openInEditorAvailable: true,
         repositoryId,

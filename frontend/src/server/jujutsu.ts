@@ -198,8 +198,20 @@ export class JujutsuService {
     return result;
   }
 
+  async getDiff(targetCommitId: string, baseCommitId?: string): Promise<string> {
+    if (
+      baseCommitId &&
+      baseCommitId !== 'parent' &&
+      baseCommitId !== `${targetCommitId}-` &&
+      baseCommitId !== `${targetCommitId}^`
+    ) {
+      return await this.runJj(['diff', '--from', baseCommitId, '--to', targetCommitId, '--git']);
+    }
+    return await this.runJj(['diff', '-r', targetCommitId, '--git']);
+  }
+
   async getDiffForCommit(commitId: string): Promise<string> {
-    return await this.runJj(['diff', '-r', commitId, '--git']);
+    return await this.getDiff(commitId);
   }
 
   async getComments(commitId: string): Promise<CommenterThreadInfo[]> {

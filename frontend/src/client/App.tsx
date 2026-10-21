@@ -1062,22 +1062,26 @@ function App() {
       .catch(() => {});
   }, [diffData?.targetCommitish, jjCommitId]);
 
-  const handleJjCommitChange = useCallback(
-    async (commitId: string) => {
-      setJjCommitId(commitId);
+  const handleJjDiffChange = useCallback(
+    async (targetCommitId: string, baseCommitId?: string) => {
+      setJjCommitId(targetCommitId);
       try {
-        const diffRes = await fetch(`/api/jj/diff?commit=${encodeURIComponent(commitId)}`);
+        const url =
+          baseCommitId && baseCommitId !== 'parent'
+            ? `/api/jj/diff?target=${encodeURIComponent(targetCommitId)}&base=${encodeURIComponent(baseCommitId)}`
+            : `/api/jj/diff?commit=${encodeURIComponent(targetCommitId)}`;
+        const diffRes = await fetch(url);
         if (diffRes.ok) {
           const newDiff = (await diffRes.json()) as DiffResponse;
           setDiffData(newDiff);
         }
-        const commentsRes = await fetch(`/api/jj/comments?commit=${encodeURIComponent(commitId)}`);
+        const commentsRes = await fetch(`/api/jj/comments?commit=${encodeURIComponent(targetCommitId)}`);
         if (commentsRes.ok) {
           const commentsData = (await commentsRes.json()) as { threads?: DiffCommentThread[] };
           replaceThreads(commentsData.threads || []);
         }
       } catch (err) {
-        console.error('Failed to change Jujutsu commit:', err);
+        console.error('Failed to change Jujutsu diff:', err);
       }
     },
     [replaceThreads],
@@ -1438,7 +1442,7 @@ function App() {
               {isJjRepo ? (
                 <JjRevisionSelector
                   currentCommitId={jjCommitId || diffData?.targetCommitish}
-                  onSelectCommit={handleJjCommitChange}
+                  onSelectDiff={handleJjDiffChange}
                 />
               ) : revisionOptions ? (
                 <DiffQuickMenu

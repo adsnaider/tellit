@@ -3,7 +3,6 @@ import {
   Copy,
   MessageSquare,
   PanelRightClose,
-  RotateCcw,
 } from 'lucide-react';
 import React, { useMemo, useState } from 'react';
 

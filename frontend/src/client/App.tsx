@@ -1,4 +1,4 @@
-import { Columns, AlignLeft, Settings, PanelLeftClose, PanelLeft, Keyboard } from 'lucide-react';
+import { Columns, AlignLeft, Settings, PanelLeftClose, PanelLeft, Keyboard, MessageSquare } from 'lucide-react';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 
 import {
@@ -576,19 +576,6 @@ function App() {
     () => hasMultipleCommentAuthors(normalizedThreads.flatMap((thread) => thread.messages)),
     [normalizedThreads],
   );
-  const threadsByFile = useMemo(() => {
-    const map = new Map<string, CommentThread[]>();
-    normalizedThreads.forEach((thread) => {
-      const entry = map.get(thread.file);
-      if (entry) {
-        entry.push(thread);
-      } else {
-        map.set(thread.file, [thread]);
-      }
-    });
-    return map;
-  }, [normalizedThreads]);
-
   const unresolvedCommentsCount = useMemo(
     () => normalizedThreads.filter((t) => !t.resolved).length,
     [normalizedThreads],
@@ -1747,7 +1734,17 @@ function App() {
             ref={diffScrollContainerRef}
             className={`flex-1 overflow-y-auto ${showMobileCommentsBar ? 'pb-16' : ''}`}
           >
-            {diffData.files.map((file, fileIndex) => {
+            {diffData.files.length === 0 ? (
+              <div className="flex flex-col items-center justify-center p-16 text-center text-github-text-secondary h-full min-h-[300px]">
+                <div className="text-lg font-medium text-github-text-primary mb-2">
+                  No changes in this revision
+                </div>
+                <p className="text-sm text-github-text-muted max-w-md">
+                  Working copy or commit <code className="text-github-text-primary bg-github-bg-tertiary px-1.5 py-0.5 rounded text-xs">{diffData.commit}</code> has no modified files. Select a commit or change above to view diffs and comments.
+                </p>
+              </div>
+            ) : (
+              diffData.files.map((file, fileIndex) => {
               const fileThreads = diffThreadsByFile.get(file.path) ?? EMPTY_COMMENT_THREADS;
               const mergedChunks =
                 getMergedChunksForVersion(mergedChunksState, diffDataVersion, file.path) ??
@@ -1831,7 +1828,8 @@ function App() {
                   )}
                 </div>
               );
-            })}
+            })
+          )}
           </main>
 
           {!isMobile && isCommentsSidebarOpen && (

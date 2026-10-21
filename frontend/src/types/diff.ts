@@ -121,6 +121,27 @@ export interface DiffCommentThread {
   codeSnapshot?: DiffCommentCodeSnapshot;
 
   messages: DiffCommentMessage[];
+  resolved?: boolean;
+}
+
+export interface JjChange {
+  changeId: string;
+  shortChangeId: string;
+  commitId: string;
+  shortCommitId: string;
+  isWorkingCopy: boolean;
+  timestamp: string;
+  description: string;
+}
+
+export interface JjCommit {
+  commitId: string;
+  shortCommitId: string;
+  timestamp: string;
+  description: string;
+  isWorkingCopy: boolean;
+  commentCount: number;
+  unresolvedCommentCount: number;
 }
 
 interface CommentImportBase {
@@ -197,6 +218,27 @@ export interface CommentThread {
   codeContent?: string;
   isOutdated?: boolean;
   messages: DiffCommentMessage[];
+  resolved?: boolean;
+}
+
+export interface JjChange {
+  changeId: string;
+  shortChangeId: string;
+  commitId: string;
+  shortCommitId: string;
+  isWorkingCopy: boolean;
+  timestamp: string;
+  description: string;
+}
+
+export interface JjCommit {
+  commitId: string;
+  shortCommitId: string;
+  timestamp: string;
+  description: string;
+  isWorkingCopy: boolean;
+  commentCount: number;
+  unresolvedCommentCount: number;
 }
 
 // Revision selector types

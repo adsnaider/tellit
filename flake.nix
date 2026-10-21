@@ -10,8 +10,8 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-      in {
-        packages.default = pkgs.rustPlatform.buildRustPackage {
+      in rec {
+        packages.commenter = pkgs.rustPlatform.buildRustPackage {
           pname = "commenter";
           version = "0.1.0";
           src = ./.;
@@ -26,20 +26,41 @@
           '';
         };
 
+        packages.difit = pkgs.buildNpmPackage rec {
+          pname = "difit";
+          version = "5.0.12";
+          src = ./frontend;
+          packageJSON = ./frontend/package.json;
+          npmDepsHash = "sha256-eL/UxLcu2cqfFuTaGQkzBG1nEALCEBopIwXn7bl1Nyw=";
+          npmFlags = [ "--legacy-peer-deps" ];
+          postInstall = ''
+            mkdir -p $out/share/difit
+            cp -r skills $out/share/difit/
+          '';
+        };
+
+        packages.default = packages.commenter;
+
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             cargo
             rustc
             rustfmt
             clippy
+            nodejs
           ];
         };
       }
     ) // {
       homeModules.default = { config, lib, pkgs, ... }: {
-        home.packages = [ self.packages.${pkgs.system}.default ];
+        home.packages = [
+          self.packages.${pkgs.system}.commenter
+          self.packages.${pkgs.system}.difit
+        ];
         skills = lib.mkIf (config ? skills) {
-          commenter = "${self.packages.${pkgs.system}.default}/share/commenter/skills/commenter";
+          commenter = "${self.packages.${pkgs.system}.commenter}/share/commenter/skills/commenter";
+          difit = "${self.packages.${pkgs.system}.difit}/share/difit/skills/difit";
+          difit-review = "${self.packages.${pkgs.system}.difit}/share/difit/skills/difit-review";
         };
       };
     };

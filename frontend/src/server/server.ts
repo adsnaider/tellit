@@ -27,6 +27,7 @@ import { getFileExtension } from '../utils/fileUtils.js';
 
 import { FileWatcherService } from './file-watcher.js';
 import { GitDiffParser } from './git-diff.js';
+import { JujutsuService } from './jujutsu.js';
 import { parseUserSettingsPatch, readUserConfig, updateUserClientSettings } from './user-config.js';
 
 import {
@@ -134,6 +135,7 @@ export async function startServer(
       ? createHash('sha256').update(serializeCommentImports(initialCommentImports)).digest('hex')
       : undefined;
   const parser = new GitDiffParser(repositoryPath);
+  const jjService = new JujutsuService(repositoryPath);
   const fileWatcher = new FileWatcherService();
   const generatedStatusCache = new Map<
     string,
@@ -441,6 +443,144 @@ export async function startServer(
     } catch (error) {
       console.error('Error fetching revisions:', error);
       res.status(500).json({ error: 'Failed to fetch revisions' });
+    }
+  });
+
+  app.get('/api/jj/status', async (_req, res) => {
+    try {
+      const isJj = await jjService.isJjRepo();
+      const repoRoot = isJj ? await jjService.getRepoRoot() : undefined;
+      res.json({ isJj, repoRoot });
+    } catch {
+      res.json({ isJj: false });
+    }
+  });
+
+  app.get('/api/jj/changes', async (_req, res) => {
+    try {
+      const changes = await jjService.getChanges();
+      res.json({ changes });
+    } catch (error) {
+      console.error('Error fetching jj changes:', error);
+      res.status(500).json({ error: 'Failed to fetch jj changes' });
+    }
+  });
+
+  app.get('/api/jj/changes/:changeId/commits', async (req, res) => {
+    try {
+      const commits = await jjService.getCommitsForChange(req.params.changeId);
+      res.json({ commits });
+    } catch (error) {
+      console.error('Error fetching jj commits for change:', error);
+      res.status(500).json({ error: 'Failed to fetch commits for change' });
+    }
+  });
+
+  app.get('/api/jj/diff', async (req, res) => {
+    try {
+      const commitId = req.query.commit as string;
+      if (!commitId) {
+        res.status(400).json({ error: 'Commit ID is required' });
+        return;
+      }
+      const rawDiff = await jjService.getDiffForCommit(commitId);
+      const files = parser.parseUnifiedDiff(rawDiff);
+      res.json({
+        commit: commitId,
+        files,
+        isEmpty: files.length === 0,
+        baseCommitish: `${commitId}^`,
+        targetCommitish: commitId,
+        requestedBaseCommitish: `${commitId}^`,
+        requestedTargetCommitish: commitId,
+        openInEditorAvailable: true,
+        repositoryId,
+      });
+    } catch (error) {
+      console.error('Error getting jj diff:', error);
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to get jj diff' });
+    }
+  });
+
+  app.get('/api/jj/comments', async (req, res) => {
+    try {
+      const commitId = req.query.commit as string;
+      if (!commitId) {
+        res.status(400).json({ error: 'Commit ID is required' });
+        return;
+      }
+      const rawThreads = await jjService.getComments(commitId);
+      const threads: DiffCommentThread[] = rawThreads.map(t => ({
+        id: t.thread_id,
+        filePath: t.filepath,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        resolved: t.resolved,
+        position: {
+          side: 'new',
+          line: t.line_range
+            ? t.line_range.start === t.line_range.end
+              ? t.line_range.start
+              : { start: t.line_range.start, end: t.line_range.end }
+            : 1,
+        },
+        messages: t.comments.map((body, i) => ({
+          id: `${t.thread_id}:${i}`,
+          body,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        })),
+      }));
+      res.json({ threads });
+    } catch (error) {
+      console.error('Error getting jj comments:', error);
+      res.status(500).json({ error: 'Failed to get comments' });
+    }
+  });
+
+  app.post('/api/jj/comments', async (req, res) => {
+    try {
+      const { commitId, filePath, line, content } = req.body;
+      if (!commitId || !filePath || !content) {
+        res.status(400).json({ error: 'commitId, filePath, and content are required' });
+        return;
+      }
+      const threadId = await jjService.addComment({
+        commitId,
+        filePath,
+        lineRange: line,
+        content,
+      });
+      res.json({ success: true, threadId });
+    } catch (error) {
+      console.error('Error adding jj comment:', error);
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to add comment' });
+    }
+  });
+
+  app.post('/api/jj/comments/:threadId/reply', async (req, res) => {
+    try {
+      const { content } = req.body;
+      if (!content) {
+        res.status(400).json({ error: 'content is required' });
+        return;
+      }
+      await jjService.replyComment(req.params.threadId, content);
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Error replying to jj comment:', error);
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to reply' });
+    }
+  });
+
+  app.post('/api/jj/comments/:threadId/resolve', async (req, res) => {
+    try {
+      const unresolve = Boolean(req.body.unresolve);
+      await jjService.resolveComment(req.params.threadId, unresolve);
+      res.json({ success: true, resolved: !unresolve });
+    } catch (error) {
+      console.error('Error resolving jj comment:', error);
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to toggle resolve' });
     }
   });
 

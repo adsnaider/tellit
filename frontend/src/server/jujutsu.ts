@@ -1,0 +1,249 @@
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import { existsSync } from 'fs';
+import { resolve, join } from 'path';
+
+const execFileAsync = promisify(execFile);
+
+export interface JjChange {
+  changeId: string;
+  shortChangeId: string;
+  commitId: string;
+  shortCommitId: string;
+  isWorkingCopy: boolean;
+  timestamp: string;
+  description: string;
+}
+
+export interface JjCommit {
+  commitId: string;
+  shortCommitId: string;
+  timestamp: string;
+  description: string;
+  isWorkingCopy: boolean;
+  commentCount: number;
+  unresolvedCommentCount: number;
+}
+
+export interface CommenterThreadInfo {
+  thread_id: string;
+  change_id: string;
+  commit_id: string;
+  git_commit_hash: string;
+  filepath: string;
+  line_range?: { start: number; end: number };
+  comments: string[];
+  resolved: boolean;
+}
+
+export class JujutsuService {
+  private repoDir: string;
+  private jjBin: string = 'jj-for-agents';
+  private commenterBin: string;
+
+  constructor(repoDir = process.cwd()) {
+    this.repoDir = resolve(repoDir);
+    this.commenterBin = this.resolveCommenterBin();
+  }
+
+  private resolveCommenterBin(): string {
+    if (process.env.COMMENTER_BIN && existsSync(process.env.COMMENTER_BIN)) {
+      return process.env.COMMENTER_BIN;
+    }
+    // Look up from current directory to find target/debug/commenter or target/release/commenter
+    let cur = this.repoDir;
+    for (let i = 0; i < 5; i++) {
+      const debugBin = join(cur, 'target', 'debug', 'commenter');
+      if (existsSync(debugBin)) return debugBin;
+      const releaseBin = join(cur, 'target', 'release', 'commenter');
+      if (existsSync(releaseBin)) return releaseBin;
+      const parent = resolve(cur, '..');
+      if (parent === cur) break;
+      cur = parent;
+    }
+    return 'commenter';
+  }
+
+  async runJj(args: string[]): Promise<string> {
+    try {
+      const { stdout } = await execFileAsync(this.jjBin, args, { cwd: this.repoDir });
+      return stdout.trim();
+    } catch {
+      // Fallback to raw jj if jj-for-agents is not in PATH
+      const { stdout } = await execFileAsync('jj', ['--no-pager', ...args], { cwd: this.repoDir });
+      return stdout.trim();
+    }
+  }
+
+  async runCommenter(args: string[]): Promise<string> {
+    const { stdout } = await execFileAsync(this.commenterBin, args, { cwd: this.repoDir });
+    return stdout.trim();
+  }
+
+  async isJjRepo(): Promise<boolean> {
+    try {
+      await this.runJj(['root']);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async getRepoRoot(): Promise<string> {
+    return await this.runJj(['root']);
+  }
+
+  async getChanges(): Promise<JjChange[]> {
+    const template = 'change_id ++ "\t" ++ commit_id ++ "\t" ++ (if(current_working_copy, "1", "0")) ++ "\t" ++ committer.timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ description.first_line() ++ "\n"';
+    const output = await this.runJj(['log', '-r', 'all()', '-n', '100', '--no-graph', '-T', template]);
+    const lines = output.split('\n').filter(line => line.trim().length > 0);
+    const seenChanges = new Set<string>();
+    const changes: JjChange[] = [];
+
+    for (const line of lines) {
+      const parts = line.split('\t');
+      if (parts.length < 5) continue;
+      const [changeId, commitId, isWorkingCopy, timestamp, description] = parts;
+      if (seenChanges.has(changeId) || changeId === '00000000000000000000000000000000') continue;
+      seenChanges.add(changeId);
+
+      changes.push({
+        changeId,
+        shortChangeId: changeId.slice(0, 8),
+        commitId,
+        shortCommitId: commitId.slice(0, 8),
+        isWorkingCopy: isWorkingCopy === '1',
+        timestamp,
+        description: description || '(no description set)',
+      });
+    }
+
+    return changes;
+  }
+
+  async getCommitsForChange(changeId: string): Promise<JjCommit[]> {
+    // 1. Get visible commits from Jujutsu
+    const template = 'commit_id ++ "\t" ++ committer.timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ (if(current_working_copy, "1", "0")) ++ "\t" ++ description.first_line() ++ "\n"';
+    let jjCommitsRaw = '';
+    try {
+      jjCommitsRaw = await this.runJj(['log', '-r', `change_id(${changeId})`, '--reversed', '--no-graph', '-T', template]);
+    } catch {
+      // Ignored if revset fails
+    }
+
+    const commitMap = new Map<string, JjCommit>();
+    for (const line of jjCommitsRaw.split('\n').filter(l => l.trim().length > 0)) {
+      const parts = line.split('\t');
+      if (parts.length < 4) continue;
+      const [commitId, timestamp, isWorkingCopy, description] = parts;
+      commitMap.set(commitId, {
+        commitId,
+        shortCommitId: commitId.slice(0, 8),
+        timestamp,
+        isWorkingCopy: isWorkingCopy === '1',
+        description: description || '(no description set)',
+        commentCount: 0,
+        unresolvedCommentCount: 0,
+      });
+    }
+
+    // 2. Also query commenter store for any historical git commit hashes with comments
+    try {
+      const commenterCommitsRaw = await this.runCommenter(['get', 'change', changeId]);
+      for (const commitId of commenterCommitsRaw.split('\n').map(c => c.trim()).filter(c => c.length > 0)) {
+        if (!commitMap.has(commitId)) {
+          commitMap.set(commitId, {
+            commitId,
+            shortCommitId: commitId.slice(0, 8),
+            timestamp: '',
+            isWorkingCopy: false,
+            description: '(historical revision)',
+            commentCount: 0,
+            unresolvedCommentCount: 0,
+          });
+        }
+      }
+    } catch {
+      // No commenter comments found or empty
+    }
+
+    // 3. For each commit, populate comment counts
+    for (const [commitId, commit] of commitMap.entries()) {
+      try {
+        const threadIdsRaw = await this.runCommenter(['get', 'commit', commitId]);
+        const threadIds = threadIdsRaw.split('\n').map(t => t.trim()).filter(t => t.length > 0);
+        commit.commentCount = threadIds.length;
+        let unresolved = 0;
+        for (const threadId of threadIds) {
+          try {
+            const threadJson = await this.runCommenter(['get', 'thread', threadId]);
+            const thread: CommenterThreadInfo = JSON.parse(threadJson);
+            if (!thread.resolved) unresolved++;
+          } catch {
+            // Ignore individual thread read errors
+          }
+        }
+        commit.unresolvedCommentCount = unresolved;
+      } catch {
+        // No comments for this commit
+      }
+    }
+
+    // Convert map to array and sort chronologically (oldest to newest)
+    const result = Array.from(commitMap.values());
+    result.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    return result;
+  }
+
+  async getDiffForCommit(commitId: string): Promise<string> {
+    return await this.runJj(['diff', '-r', commitId, '--git']);
+  }
+
+  async getComments(commitId: string): Promise<CommenterThreadInfo[]> {
+    try {
+      const threadIdsRaw = await this.runCommenter(['get', 'commit', commitId]);
+      const threadIds = threadIdsRaw.split('\n').map(t => t.trim()).filter(t => t.length > 0);
+      const threads: CommenterThreadInfo[] = [];
+      for (const threadId of threadIds) {
+        try {
+          const threadJson = await this.runCommenter(['get', 'thread', threadId]);
+          threads.push(JSON.parse(threadJson));
+        } catch {
+          // ignore error
+        }
+      }
+      return threads;
+    } catch {
+      return [];
+    }
+  }
+
+  async addComment(params: {
+    filePath: string;
+    lineRange?: { start: number; end: number } | number;
+    content: string;
+    commitId: string;
+  }): Promise<string> {
+    const args = ['add', '--file', params.filePath, '--content', params.content, '-r', params.commitId];
+    if (params.lineRange !== undefined) {
+      if (typeof params.lineRange === 'number') {
+        args.push('--at', `${params.lineRange}`);
+      } else {
+        args.push('--at', `${params.lineRange.start}..${params.lineRange.end}`);
+      }
+    }
+    return await this.runCommenter(args);
+  }
+
+  async replyComment(threadId: string, content: string): Promise<string> {
+    return await this.runCommenter(['reply', '-t', threadId, '-c', content]);
+  }
+
+  async resolveComment(threadId: string, unresolve = false): Promise<string> {
+    const args = ['resolve', '-t', threadId];
+    if (unresolve) {
+      args.push('--unresolve');
+    }
+    return await this.runCommenter(args);
+  }
+}

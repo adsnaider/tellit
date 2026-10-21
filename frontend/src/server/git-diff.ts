@@ -143,7 +143,7 @@ export class GitDiffParser {
     }
   }
 
-  private parseUnifiedDiff(diffText: string): DiffFile[] {
+  public parseUnifiedDiff(diffText: string): DiffFile[] {
     const files: DiffFile[] = [];
     const fileBlocks = diffText.split(/^diff --git /m).slice(1);
 

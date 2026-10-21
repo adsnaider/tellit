@@ -28,6 +28,7 @@ import { DiffViewer } from './components/DiffViewer';
 import { FileList } from './components/FileList';
 import { GitHubIcon } from './components/GitHubIcon';
 import { HelpModal } from './components/HelpModal';
+import { JjRevisionSelector } from './components/JjRevisionSelector';
 import { Logo } from './components/Logo';
 import { ReloadButton } from './components/ReloadButton';
 import { RevisionDetailModal } from './components/RevisionDetailModal';
@@ -153,6 +154,8 @@ function App() {
   );
   const [resolvedBaseRevision, setResolvedBaseRevision] = useState<string>('');
   const [resolvedTargetRevision, setResolvedTargetRevision] = useState<string>('');
+  const [isJjRepo, setIsJjRepo] = useState(false);
+  const [jjCommitId, setJjCommitId] = useState<string>('');
   const hasUserSelectedRevisionRef = useRef(false);
   const currentRequestedBaseModeRef = useRef(selectedRevision.baseMode);
   currentRequestedBaseModeRef.current = diffData?.requestedBaseMode ?? selectedRevision.baseMode;
@@ -1045,14 +1048,67 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    fetch('/api/jj/status')
+      .then((res) => res.json())
+      .then((data: { isJj?: boolean }) => {
+        if (data.isJj) {
+          setIsJjRepo(true);
+          if (diffData?.targetCommitish && !jjCommitId) {
+            setJjCommitId(diffData.targetCommitish);
+          }
+        }
+      })
+      .catch(() => {});
+  }, [diffData?.targetCommitish, jjCommitId]);
+
+  const handleJjCommitChange = useCallback(
+    async (commitId: string) => {
+      setJjCommitId(commitId);
+      try {
+        const diffRes = await fetch(`/api/jj/diff?commit=${encodeURIComponent(commitId)}`);
+        if (diffRes.ok) {
+          const newDiff = (await diffRes.json()) as DiffResponse;
+          setDiffData(newDiff);
+        }
+        const commentsRes = await fetch(`/api/jj/comments?commit=${encodeURIComponent(commitId)}`);
+        if (commentsRes.ok) {
+          const commentsData = (await commentsRes.json()) as { threads?: DiffCommentThread[] };
+          replaceThreads(commentsData.threads || []);
+        }
+      } catch (err) {
+        console.error('Failed to change Jujutsu commit:', err);
+      }
+    },
+    [replaceThreads],
+  );
+
   const handleAddComment = useCallback(
-    (
+    async (
       file: string,
       line: LineNumber,
       body: string,
       codeContent?: string,
       side?: DiffSide,
     ): Promise<void> => {
+      if (isJjRepo && jjCommitId) {
+        await fetch('/api/jj/comments', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            commitId: jjCommitId,
+            filePath: file,
+            line: typeof line === 'number' ? line : { start: line[0], end: line[1] },
+            content: body,
+          }),
+        });
+        const commentsRes = await fetch(`/api/jj/comments?commit=${encodeURIComponent(jjCommitId)}`);
+        if (commentsRes.ok) {
+          const commentsData = (await commentsRes.json()) as { threads?: DiffCommentThread[] };
+          replaceThreads(commentsData.threads || []);
+        }
+        return;
+      }
       addThread({
         filePath: file,
         body,
@@ -1068,7 +1124,48 @@ function App() {
       });
       return Promise.resolve();
     },
-    [addThread],
+    [addThread, isJjRepo, jjCommitId, replaceThreads],
+  );
+
+  const handleReplyToThread = useCallback(
+    async (threadId: string, body: string): Promise<void> => {
+      if (isJjRepo && jjCommitId) {
+        await fetch(`/api/jj/comments/${encodeURIComponent(threadId)}/reply`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: body }),
+        });
+        const commentsRes = await fetch(`/api/jj/comments?commit=${encodeURIComponent(jjCommitId)}`);
+        if (commentsRes.ok) {
+          const commentsData = (await commentsRes.json()) as { threads?: DiffCommentThread[] };
+          replaceThreads(commentsData.threads || []);
+        }
+        return;
+      }
+      replyToThread({ threadId, body });
+      return Promise.resolve();
+    },
+    [isJjRepo, jjCommitId, replyToThread, replaceThreads],
+  );
+
+  const handleToggleResolve = useCallback(
+    async (threadId: string, currentResolved: boolean) => {
+      if (isJjRepo && jjCommitId) {
+        await fetch(`/api/jj/comments/${encodeURIComponent(threadId)}/resolve`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ unresolve: currentResolved }),
+        });
+        const commentsRes = await fetch(`/api/jj/comments?commit=${encodeURIComponent(jjCommitId)}`);
+        if (commentsRes.ok) {
+          const commentsData = (await commentsRes.json()) as { threads?: DiffCommentThread[] };
+          replaceThreads(commentsData.threads || []);
+        }
+        return;
+      }
+      removeThread(threadId);
+    },
+    [isJjRepo, jjCommitId, removeThread, replaceThreads],
   );
 
   const handleCopyAllComments = async () => {
@@ -1088,13 +1185,6 @@ function App() {
     }
   };
 
-  const handleReplyToThread = useCallback(
-    (threadId: string, body: string): Promise<void> => {
-      replyToThread({ threadId, body });
-      return Promise.resolve();
-    },
-    [replyToThread],
-  );
 
   const handleNavigateToComment = (thread: CommentThread) => {
     if (!diffData) return;
@@ -1345,7 +1435,12 @@ function App() {
                   />
                 </div>
               </div>
-              {revisionOptions ? (
+              {isJjRepo ? (
+                <JjRevisionSelector
+                  currentCommitId={jjCommitId || diffData?.targetCommitish}
+                  onSelectCommit={handleJjCommitChange}
+                />
+              ) : revisionOptions ? (
                 <DiffQuickMenu
                   options={revisionOptions}
                   selection={selectedRevision}
@@ -1512,7 +1607,7 @@ function App() {
                       onToggleAllCollapsed={toggleAllFilesCollapsed}
                       onAddComment={handleAddComment}
                       onGenerateThreadPrompt={handleGenerateThreadPrompt}
-                      onRemoveThread={removeThread}
+                      onRemoveThread={handleToggleResolve}
                       onReplyToThread={handleReplyToThread}
                       onRemoveMessage={removeMessage}
                       onUpdateMessage={updateMessage}
@@ -1593,7 +1688,7 @@ function App() {
           onNavigate={handleNavigateToComment}
           comments={normalizedThreads}
           showAuthorBadges={showAuthorBadges}
-          onRemoveThread={removeThread}
+          onRemoveThread={handleToggleResolve}
           onGenerateThreadPrompt={handleGenerateThreadPrompt}
           onReplyToThread={handleReplyToThread}
           onRemoveMessage={removeMessage}

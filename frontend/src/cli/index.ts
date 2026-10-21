@@ -5,6 +5,7 @@ import { simpleGit, type SimpleGit } from 'simple-git';
 
 import pkg from '../../package.json' with { type: 'json' };
 import { startServer } from '../server/server.js';
+import { JujutsuService } from '../server/jujutsu.js';
 import { type CommentImport, type DiffSelection } from '../types/diff.js';
 import { createDiffSelection } from '../utils/diffSelection.js';
 import { DiffMode } from '../types/watch.js';
@@ -254,12 +255,24 @@ program
         return;
       }
 
-      // Detect git root
+      // Detect git or jj root
       let repoPath: string | undefined;
+      const jjService = new JujutsuService();
+      const isJj = await jjService.isJjRepo();
+      if (isJj && commitish === 'HEAD') {
+        try {
+          const jjCommit = await jjService.runJj(['log', '-r', '@', '--no-graph', '-T', 'commit_id']);
+          if (jjCommit) {
+            commitish = jjCommit;
+          }
+        } catch {
+          // ignore
+        }
+      }
       try {
-        repoPath = getGitRoot();
+        repoPath = isJj ? await jjService.getRepoRoot() : getGitRoot();
       } catch {
-        // If not in a git repository, fall back to process.cwd()
+        // If not in a git/jj repository, fall back to process.cwd()
         repoPath = undefined;
       }
 

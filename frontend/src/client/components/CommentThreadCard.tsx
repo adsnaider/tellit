@@ -193,6 +193,7 @@ interface CommentThreadCardProps {
   confirmRootAction?: boolean;
   onGeneratePrompt: (thread: CommentThread) => string;
   onRemoveThread: (threadId: string) => void;
+  onToggleResolve?: (threadId: string, currentResolved: boolean) => void;
   onReplyToThread: (threadId: string, body: string) => Promise<void>;
   onRemoveMessage: (threadId: string, messageId: string) => void;
   onUpdateMessage: (threadId: string, messageId: string, newBody: string) => void;
@@ -206,6 +207,7 @@ export function CommentThreadCard({
   confirmRootAction = true,
   onGeneratePrompt,
   onRemoveThread,
+  onToggleResolve,
   onReplyToThread,
   onRemoveMessage,
   onUpdateMessage,
@@ -277,6 +279,14 @@ export function CommentThreadCard({
               Outdated
             </span>
           )}
+          {(thread as any).resolved && (
+            <span
+              className="inline-flex h-5 shrink-0 items-center rounded-full border border-green-500/40 bg-green-500/10 px-2 text-[10px] font-medium text-green-500"
+              title="This comment thread is resolved"
+            >
+              Resolved
+            </span>
+          )}
           {isCollapsed && (
             <button
               type="button"
@@ -329,9 +339,19 @@ export function CommentThreadCard({
             filename={thread.file}
             originalCode={thread.codeContent}
             onUpdate={(newBody) => onUpdateMessage(thread.id, rootMessage.id, newBody)}
-            onResolveOrDelete={() => onRemoveThread(thread.id)}
-            actionLabel="Resolve thread"
-            confirmPrompt={confirmRootAction ? 'Resolve?' : undefined}
+            onResolveOrDelete={() =>
+              onToggleResolve
+                ? onToggleResolve(thread.id, Boolean((thread as any).resolved))
+                : onRemoveThread(thread.id)
+            }
+            actionLabel={(thread as any).resolved ? 'Unresolve thread' : 'Resolve thread'}
+            confirmPrompt={
+              (thread as any).resolved
+                ? 'Unresolve?'
+                : confirmRootAction
+                  ? 'Resolve?'
+                  : undefined
+            }
           />
 
           {thread.messages.slice(1).map((message) => (

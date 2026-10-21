@@ -75,16 +75,58 @@ pub struct ThreadInfo {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "commenter", about = "Code review commenting tool for Jujutsu (jj)")]
+#[command(name = "tellit", about = "Code review diff viewer and commenting tool for Jujutsu (jj)")]
 pub struct Cli {
     #[arg(
         long,
         short,
         global = true,
-        help = "Path to comments store directory (defaults to <main-repo>/.comments)"
+        help = "Path to comments store directory (defaults to <main-repo>/.tellit)"
     )]
     pub store: Option<PathBuf>,
 
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    #[command(about = "Launch the web diff viewer")]
+    Launch(LaunchArgs),
+
+    #[command(about = "Manage code review comments")]
+    Comment(CommentArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct LaunchArgs {
+    #[arg(help = "Commit-ish, change ID, or revision to review (default: @)")]
+    pub commit_ish: Option<String>,
+
+    #[arg(help = "Optional: compare with this commit/branch")]
+    pub compare_with: Option<String>,
+
+    #[arg(long, help = "Port to listen on")]
+    pub port: Option<u16>,
+
+    #[arg(long, help = "Host address to bind")]
+    pub host: Option<String>,
+
+    #[arg(long, help = "Do not automatically open browser")]
+    pub no_open: bool,
+
+    #[arg(long, help = "Keep server running even after browser disconnects")]
+    pub keep_alive: bool,
+
+    #[arg(long, help = "Run in background and print JSON info")]
+    pub background: bool,
+
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub extra_args: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct CommentArgs {
     #[arg(
         long,
         short = 'C',
@@ -93,11 +135,11 @@ pub struct Cli {
     pub change: Option<String>,
 
     #[command(subcommand)]
-    pub action: Commenter,
+    pub action: CommentAction,
 }
 
 #[derive(Subcommand, Debug)]
-pub enum Commenter {
+pub enum CommentAction {
     #[command(about = "Add a new comment thread")]
     Add(Add),
     #[command(about = "Resolve or unresolve a comment thread")]
@@ -242,7 +284,7 @@ pub fn resolve_store(custom_store: Option<&Path>) -> Result<PathBuf> {
     let workspace_root = get_workspace_root()?;
     let jj_repo = workspace_root.join(".jj").join("repo");
 
-    if jj_repo.is_file() {
+    let repo_root = if jj_repo.is_file() {
         let content = std::fs::read_to_string(&jj_repo)
             .with_context(|| format!("Failed to read {}", jj_repo.display()))?;
         let trimmed = content.trim();
@@ -254,7 +296,7 @@ pub fn resolve_store(custom_store: Option<&Path>) -> Result<PathBuf> {
         let canonical_repo = target_repo
             .canonicalize()
             .with_context(|| format!("Failed to canonicalize {}", target_repo.display()))?;
-        let main_repo = canonical_repo
+        canonical_repo
             .parent()
             .and_then(|p| p.parent())
             .ok_or_else(|| {
@@ -262,11 +304,74 @@ pub fn resolve_store(custom_store: Option<&Path>) -> Result<PathBuf> {
                     "Could not determine main repo root from {}",
                     canonical_repo.display()
                 )
-            })?;
-        Ok(main_repo.join(".comments"))
+            })?
+            .to_path_buf()
     } else {
-        Ok(workspace_root.join(".comments"))
+        workspace_root
+    };
+
+    let tellit_store = repo_root.join(".tellit");
+    Ok(tellit_store)
+}
+
+pub fn locate_web_cli() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("TELLIT_WEB_CLI") {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return Ok(p);
+        }
     }
+    if let Ok(dir) = std::env::var("TELLIT_WEB_DIR") {
+        let p = PathBuf::from(&dir).join("dist/cli/index.js");
+        if p.exists() {
+            return Ok(p);
+        }
+        let p2 = PathBuf::from(&dir).join("cli/index.js");
+        if p2.exists() {
+            return Ok(p2);
+        }
+        let p3 = PathBuf::from(&dir).join("index.js");
+        if p3.exists() {
+            return Ok(p3);
+        }
+    }
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let candidates = [
+                exe_dir.join("../share/tellit/web/dist/cli/index.js"),
+                exe_dir.join("../share/tellit/dist/cli/index.js"),
+                exe_dir.join("../dist/cli/index.js"),
+            ];
+            for cand in candidates {
+                if cand.exists() {
+                    return Ok(cand);
+                }
+            }
+        }
+    }
+
+    // Check development paths (walk up from current directory)
+    if let Ok(cur) = std::env::current_dir() {
+        let mut d = cur.as_path();
+        for _ in 0..6 {
+            let candidate = d.join("frontend/dist/cli/index.js");
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+            let candidate2 = d.join("dist/cli/index.js");
+            if candidate2.exists() {
+                return Ok(candidate2);
+            }
+            if let Some(parent) = d.parent() {
+                d = parent;
+            } else {
+                break;
+            }
+        }
+    }
+
+    anyhow::bail!("Could not locate tellit web CLI (dist/cli/index.js). Try setting TELLIT_WEB_DIR or TELLIT_WEB_CLI.")
 }
 
 pub fn get_rev_info(rev: &str) -> Result<(String, String)> {
@@ -562,7 +667,7 @@ mod tests {
     #[test]
     fn test_store_operations() {
         let dir = tempdir().unwrap();
-        let store = dir.path().join(".comments");
+        let store = dir.path().join(".tellit");
 
         let change_id = "change123";
         let commit_hash = "gitcommithash456";

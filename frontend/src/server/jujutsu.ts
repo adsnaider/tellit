@@ -39,29 +39,29 @@ export interface CommenterThreadInfo {
 export class JujutsuService {
   private repoDir: string;
   private jjBin: string = 'jj-for-agents';
-  private commenterBin: string;
+  private tellitBin: string;
 
   constructor(repoDir = process.cwd()) {
     this.repoDir = resolve(repoDir);
-    this.commenterBin = this.resolveCommenterBin();
+    this.tellitBin = this.resolveTellitBin();
   }
 
-  private resolveCommenterBin(): string {
-    if (process.env.COMMENTER_BIN && existsSync(process.env.COMMENTER_BIN)) {
-      return process.env.COMMENTER_BIN;
+  private resolveTellitBin(): string {
+    if (process.env.TELLIT_BIN && existsSync(process.env.TELLIT_BIN)) {
+      return process.env.TELLIT_BIN;
     }
-    // Look up from current directory to find target/debug/commenter or target/release/commenter
+    // Look up from current directory to find target/debug/tellit or target/release/tellit
     let cur = this.repoDir;
     for (let i = 0; i < 5; i++) {
-      const debugBin = join(cur, 'target', 'debug', 'commenter');
+      const debugBin = join(cur, 'target', 'debug', 'tellit');
       if (existsSync(debugBin)) return debugBin;
-      const releaseBin = join(cur, 'target', 'release', 'commenter');
+      const releaseBin = join(cur, 'target', 'release', 'tellit');
       if (existsSync(releaseBin)) return releaseBin;
       const parent = resolve(cur, '..');
       if (parent === cur) break;
       cur = parent;
     }
-    return 'commenter';
+    return 'tellit';
   }
 
   async runJj(args: string[]): Promise<string> {
@@ -75,8 +75,8 @@ export class JujutsuService {
     }
   }
 
-  async runCommenter(args: string[]): Promise<string> {
-    const { stdout } = await execFileAsync(this.commenterBin, args, { cwd: this.repoDir });
+  async runTellit(args: string[]): Promise<string> {
+    const { stdout } = await execFileAsync(this.tellitBin, ['comment', ...args], { cwd: this.repoDir });
     return stdout.trim();
   }
 
@@ -147,10 +147,10 @@ export class JujutsuService {
       });
     }
 
-    // 2. Also query commenter store for any historical git commit hashes with comments
+    // 2. Also query tellit store for any historical git commit hashes with comments
     try {
-      const commenterCommitsRaw = await this.runCommenter(['get', 'change', changeId]);
-      for (const commitId of commenterCommitsRaw.split('\n').map(c => c.trim()).filter(c => c.length > 0)) {
+      const tellitCommitsRaw = await this.runTellit(['get', 'change', changeId]);
+      for (const commitId of tellitCommitsRaw.split('\n').map((c: string) => c.trim()).filter((c: string) => c.length > 0)) {
         if (!commitMap.has(commitId)) {
           commitMap.set(commitId, {
             commitId,
@@ -164,19 +164,19 @@ export class JujutsuService {
         }
       }
     } catch {
-      // No commenter comments found or empty
+      // No tellit comments found or empty
     }
 
     // 3. For each commit, populate comment counts
     for (const [commitId, commit] of commitMap.entries()) {
       try {
-        const threadIdsRaw = await this.runCommenter(['get', 'commit', commitId]);
-        const threadIds = threadIdsRaw.split('\n').map(t => t.trim()).filter(t => t.length > 0);
+        const threadIdsRaw = await this.runTellit(['get', 'commit', commitId]);
+        const threadIds = threadIdsRaw.split('\n').map((t: string) => t.trim()).filter((t: string) => t.length > 0);
         commit.commentCount = threadIds.length;
         let unresolved = 0;
         for (const threadId of threadIds) {
           try {
-            const threadJson = await this.runCommenter(['get', 'thread', threadId]);
+            const threadJson = await this.runTellit(['get', 'thread', threadId]);
             const thread: CommenterThreadInfo = JSON.parse(threadJson);
             if (!thread.resolved) unresolved++;
           } catch {
@@ -201,12 +201,12 @@ export class JujutsuService {
 
   async getComments(commitId: string): Promise<CommenterThreadInfo[]> {
     try {
-      const threadIdsRaw = await this.runCommenter(['get', 'commit', commitId]);
+      const threadIdsRaw = await this.runTellit(['get', 'commit', commitId]);
       const threadIds = threadIdsRaw.split('\n').map(t => t.trim()).filter(t => t.length > 0);
       const threads: CommenterThreadInfo[] = [];
       for (const threadId of threadIds) {
         try {
-          const threadJson = await this.runCommenter(['get', 'thread', threadId]);
+          const threadJson = await this.runTellit(['get', 'thread', threadId]);
           threads.push(JSON.parse(threadJson));
         } catch {
           // ignore error
@@ -243,13 +243,13 @@ export class JujutsuService {
         }
       }
     }
-    const output = await this.runCommenter(args);
+    const output = await this.runTellit(args);
     const firstLine = output.trim().split('\n')[0].trim();
     return firstLine;
   }
 
   async replyComment(threadId: string, content: string): Promise<string> {
-    return await this.runCommenter(['reply', '-t', threadId, '-c', content]);
+    return await this.runTellit(['reply', '-t', threadId, '-c', content]);
   }
 
   async resolveComment(threadId: string, unresolve = false): Promise<string> {
@@ -257,6 +257,6 @@ export class JujutsuService {
     if (unresolve) {
       args.push('--unresolve');
     }
-    return await this.runCommenter(args);
+    return await this.runTellit(args);
   }
 }

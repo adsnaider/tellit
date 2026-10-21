@@ -1,6 +1,6 @@
 use std::fs;
 use tempfile::tempdir;
-use commenter::{
+use tellit_cli::{
     get_change_commits, get_commit_threads, get_thread, reply_comment, resolve_comment, LineRange,
     ThreadData,
 };
@@ -8,7 +8,7 @@ use commenter::{
 #[test]
 fn test_full_comment_workflow() {
     let dir = tempdir().unwrap();
-    let store = dir.path().join(".comments");
+    let store = dir.path().join(".tellit");
     let workspace = dir.path().join("workspace");
     fs::create_dir_all(&workspace).unwrap();
 

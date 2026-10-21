@@ -96,8 +96,8 @@ interface CliOptions {
 const program = new Command();
 
 program
-  .name('difit')
-  .description('A lightweight Git diff viewer with GitHub-like interface')
+  .name('tellit')
+  .description('Code review diff viewer and commenting tool for Jujutsu and Git')
   .version(pkg.version, '-v, --version', 'output the version number')
   .enablePositionalOptions()
   .addCommand(createCommentCommand())
@@ -246,7 +246,7 @@ program
           return;
         }
 
-        console.log(`\n🚀 difit server started on ${url}`);
+        console.log(`\n🚀 tellit server started on ${url}`);
         console.log(`📋 Reviewing: ${stdinReviewLabel}`);
         if (options.keepAlive) {
           console.log('🔒 Keep-alive mode: server will stay running after browser disconnects');
@@ -321,7 +321,7 @@ program
         return;
       }
 
-      console.log(`\n🚀 difit server started on ${url}`);
+      console.log(`\n🚀 tellit server started on ${url}`);
       console.log(`📋 Reviewing: ${selection.targetCommitish}`);
 
       if (options.keepAlive) {
@@ -344,7 +344,7 @@ program
       }
 
       process.on('SIGINT', async () => {
-        console.log('\n👋 Shutting down difit server...');
+        console.log('\n👋 Shutting down tellit server...');
 
         // Try to fetch comments before shutting down
         try {

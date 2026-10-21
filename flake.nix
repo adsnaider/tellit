@@ -1,5 +1,5 @@
 {
-  description = "Code review commenting tool for Jujutsu (jj)";
+  description = "Code review diff viewer and commenting tool for Jujutsu (jj)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -10,36 +10,43 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-      in rec {
-        packages.commenter = pkgs.rustPlatform.buildRustPackage {
-          pname = "commenter";
+
+        tellit-web = pkgs.buildNpmPackage rec {
+          pname = "tellit-web";
+          version = "0.1.0";
+          src = ./frontend;
+          packageJSON = ./frontend/package.json;
+          npmDepsHash = "sha256-eL/UxLcu2cqfFuTaGQkzBG1nEALCEBopIwXn7bl1Nyw=";
+          npmFlags = [ "--legacy-peer-deps" ];
+        };
+
+        tellit-bin = pkgs.rustPlatform.buildRustPackage {
+          pname = "tellit-cli";
           version = "0.1.0";
           src = ./.;
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
+        };
+      in rec {
+        packages.tellit = pkgs.symlinkJoin {
+          name = "tellit-0.1.0";
+          paths = [ tellit-bin ];
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+          postBuild = ''
+            mkdir -p $out/share/tellit/skills/tellit
+            mkdir -p $out/share/tellit/web
+            cp -r ${tellit-web}/lib/node_modules/difit/* $out/share/tellit/web/
+            install -m 644 ${./skills/tellit/SKILL.md} $out/share/tellit/skills/tellit/SKILL.md
+            install -m 644 ${./skills/tellit.md} $out/share/tellit/skills/tellit.md
 
-          postInstall = ''
-            install -d $out/share/commenter/skills/commenter
-            install -m 644 skills/commenter/SKILL.md $out/share/commenter/skills/commenter/SKILL.md
-            install -m 644 skills/commenter.md $out/share/commenter/skills/commenter.md
+            wrapProgram $out/bin/tellit \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.nodejs ]} \
+              --set-default TELLIT_WEB_DIR $out/share/tellit/web
           '';
         };
 
-        packages.difit = pkgs.buildNpmPackage rec {
-          pname = "difit";
-          version = "5.0.12";
-          src = ./frontend;
-          packageJSON = ./frontend/package.json;
-          npmDepsHash = "sha256-eL/UxLcu2cqfFuTaGQkzBG1nEALCEBopIwXn7bl1Nyw=";
-          npmFlags = [ "--legacy-peer-deps" ];
-          postInstall = ''
-            mkdir -p $out/share/difit
-            cp -r skills $out/share/difit/
-          '';
-        };
-
-        packages.default = packages.commenter;
+        packages.default = packages.tellit;
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
@@ -54,13 +61,10 @@
     ) // {
       homeModules.default = { config, lib, pkgs, ... }: {
         home.packages = [
-          self.packages.${pkgs.system}.commenter
-          self.packages.${pkgs.system}.difit
+          self.packages.${pkgs.system}.tellit
         ];
         skills = lib.mkIf (config ? skills) {
-          commenter = "${self.packages.${pkgs.system}.commenter}/share/commenter/skills/commenter";
-          difit = "${self.packages.${pkgs.system}.difit}/share/difit/skills/difit";
-          difit-review = "${self.packages.${pkgs.system}.difit}/share/difit/skills/difit-review";
+          tellit = "${self.packages.${pkgs.system}.tellit}/share/tellit/skills/tellit";
         };
       };
     };

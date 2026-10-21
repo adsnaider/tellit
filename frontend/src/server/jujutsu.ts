@@ -220,19 +220,32 @@ export class JujutsuService {
 
   async addComment(params: {
     filePath: string;
-    lineRange?: { start: number; end: number } | number;
+    lineRange?: { start?: number; end?: number } | number | string;
     content: string;
     commitId: string;
   }): Promise<string> {
     const args = ['add', '--file', params.filePath, '--content', params.content, '-r', params.commitId];
-    if (params.lineRange !== undefined) {
+    if (params.lineRange !== undefined && params.lineRange !== null) {
       if (typeof params.lineRange === 'number') {
         args.push('--at', `${params.lineRange}`);
-      } else {
-        args.push('--at', `${params.lineRange.start}..${params.lineRange.end}`);
+      } else if (typeof params.lineRange === 'string') {
+        const cleaned = params.lineRange.replace('-', '..');
+        args.push('--at', cleaned);
+      } else if (typeof params.lineRange === 'object') {
+        const start = params.lineRange.start;
+        const end = params.lineRange.end ?? start;
+        if (typeof start === 'number') {
+          if (start === end || end === undefined) {
+            args.push('--at', `${start}`);
+          } else {
+            args.push('--at', `${start}..${end}`);
+          }
+        }
       }
     }
-    return await this.runCommenter(args);
+    const output = await this.runCommenter(args);
+    const firstLine = output.trim().split('\n')[0].trim();
+    return firstLine;
   }
 
   async replyComment(threadId: string, content: string): Promise<string> {

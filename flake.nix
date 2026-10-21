@@ -34,6 +34,7 @@
             clippy
           ];
         };
+      }
     ) // {
       homeModules.default = { config, lib, pkgs, ... }: {
         home.packages = [ self.packages.${pkgs.system}.default ];

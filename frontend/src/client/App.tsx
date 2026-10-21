@@ -23,6 +23,7 @@ import {
 import { Checkbox } from './components/Checkbox';
 import { CommentsDropdown } from './components/CommentsDropdown';
 import { CommentsListModal } from './components/CommentsListModal';
+import { CommentsSidebar } from './components/CommentsSidebar';
 import { DiffQuickMenu } from './components/DiffQuickMenu';
 import { DiffViewer } from './components/DiffViewer';
 import { FileList } from './components/FileList';
@@ -64,6 +65,34 @@ const SIDEBAR_OPEN_STORAGE_KEY = 'difit.sidebarOpen';
 const SIDEBAR_MIN_WIDTH = 200;
 const SIDEBAR_MAX_WIDTH = 600;
 const SIDEBAR_DEFAULT_WIDTH = 280;
+
+const COMMENTS_SIDEBAR_WIDTH_KEY = 'tellit.commentsSidebarWidth';
+const COMMENTS_SIDEBAR_OPEN_KEY = 'tellit.commentsSidebarOpen';
+const SHOW_RESOLVED_INLINE_KEY = 'tellit.showResolvedInline';
+const COMMENTS_SIDEBAR_MIN_WIDTH = 260;
+const COMMENTS_SIDEBAR_MAX_WIDTH = 700;
+const COMMENTS_SIDEBAR_DEFAULT_WIDTH = 380;
+
+const getInitialCommentsSidebarWidth = () => {
+  if (typeof window === 'undefined') return COMMENTS_SIDEBAR_DEFAULT_WIDTH;
+  const stored = window.localStorage.getItem(COMMENTS_SIDEBAR_WIDTH_KEY);
+  if (!stored) return COMMENTS_SIDEBAR_DEFAULT_WIDTH;
+  const parsed = Number(stored);
+  return Number.isFinite(parsed)
+    ? Math.max(COMMENTS_SIDEBAR_MIN_WIDTH, Math.min(COMMENTS_SIDEBAR_MAX_WIDTH, parsed))
+    : COMMENTS_SIDEBAR_DEFAULT_WIDTH;
+};
+
+const getInitialCommentsSidebarOpen = () => {
+  if (typeof window === 'undefined') return false;
+  return window.localStorage.getItem(COMMENTS_SIDEBAR_OPEN_KEY) === 'true';
+};
+
+const getInitialShowResolvedInline = () => {
+  if (typeof window === 'undefined') return true;
+  const stored = window.localStorage.getItem(SHOW_RESOLVED_INLINE_KEY);
+  return stored === null ? true : stored === 'true';
+};
 
 const parseDiffViewMode = (value: unknown): DiffViewMode | null => {
   switch (value) {
@@ -139,6 +168,16 @@ function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isFileTreeOpen, setIsFileTreeOpen] = useState(getInitialFileTreeOpen);
   const [isDragging, setIsDragging] = useState(false);
+  const [commentsSidebarWidth, setCommentsSidebarWidth] = useState(
+    getInitialCommentsSidebarWidth,
+  );
+  const [isCommentsSidebarOpen, setIsCommentsSidebarOpen] = useState(
+    getInitialCommentsSidebarOpen,
+  );
+  const [showResolvedInline, setShowResolvedInline] = useState(
+    getInitialShowResolvedInline,
+  );
+  const [isRightDragging, setIsRightDragging] = useState(false);
   const [showSparkles, setShowSparkles] = useState(false);
   const [hasTriggeredSparkles, setHasTriggeredSparkles] = useState(false);
   const [isCommentsListOpen, setIsCommentsListOpen] = useState(false);
@@ -550,6 +589,27 @@ function App() {
     return map;
   }, [normalizedThreads]);
 
+  const unresolvedCommentsCount = useMemo(
+    () => normalizedThreads.filter((t) => !t.resolved).length,
+    [normalizedThreads],
+  );
+
+  const diffThreadsByFile = useMemo(() => {
+    const map = new Map<string, CommentThread[]>();
+    normalizedThreads.forEach((thread) => {
+      if (!showResolvedInline && thread.resolved) {
+        return;
+      }
+      const entry = map.get(thread.file);
+      if (entry) {
+        entry.push(thread);
+      } else {
+        map.set(thread.file, [thread]);
+      }
+    });
+    return map;
+  }, [normalizedThreads, showResolvedInline]);
+
   // State to trigger comment creation from keyboard
   const [commentTrigger, setCommentTrigger] = useState<{
     fileIndex: number;
@@ -611,7 +671,7 @@ function App() {
         }
       },
       onShowCommentsList: () => {
-        setIsCommentsListOpen(true);
+        setIsCommentsSidebarOpen((prev) => !prev);
       },
       onRefresh: () => {
         reload();
@@ -683,6 +743,30 @@ function App() {
 
     const handleMouseUp = () => {
       setIsDragging(false);
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+  };
+
+  const handleRightResizeMouseDown = (e: React.MouseEvent) => {
+    e.preventDefault();
+    setIsRightDragging(true);
+    const startX = e.clientX;
+    const startWidth = commentsSidebarWidth;
+
+    const handleMouseMove = (e: MouseEvent) => {
+      const newWidth = Math.max(
+        COMMENTS_SIDEBAR_MIN_WIDTH,
+        Math.min(COMMENTS_SIDEBAR_MAX_WIDTH, startWidth - (e.clientX - startX)),
+      );
+      setCommentsSidebarWidth(newWidth);
+    };
+
+    const handleMouseUp = () => {
+      setIsRightDragging(false);
       document.removeEventListener('mousemove', handleMouseMove);
       document.removeEventListener('mouseup', handleMouseUp);
     };
@@ -855,6 +939,30 @@ function App() {
     }
     saveClientSettings({ sidebarOpen: isFileTreeOpen });
   }, [isFileTreeOpen]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(COMMENTS_SIDEBAR_WIDTH_KEY, String(commentsSidebarWidth));
+    } catch {
+      // Ignore
+    }
+  }, [commentsSidebarWidth]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(COMMENTS_SIDEBAR_OPEN_KEY, String(isCommentsSidebarOpen));
+    } catch {
+      // Ignore
+    }
+  }, [isCommentsSidebarOpen]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SHOW_RESOLVED_INLINE_KEY, String(showResolvedInline));
+    } catch {
+      // Ignore
+    }
+  }, [showResolvedInline]);
 
   // Fetch revision options on mount
   useEffect(() => {
@@ -1209,6 +1317,26 @@ function App() {
   const handleNavigateToComment = (thread: CommentThread) => {
     if (!diffData) return;
 
+    if (!showResolvedInline && thread.resolved) {
+      setShowResolvedInline(true);
+    }
+
+    const fileIndex = diffData.files.findIndex((f) => f.path === thread.file);
+    if (fileIndex !== -1) {
+      ensureFileRendered(thread.file);
+      scrollFileIntoDiffContainer(fileIndex);
+      setTimeout(() => {
+        const element = document.getElementById(`comment-thread-${thread.id}`);
+        if (element) {
+          element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          element.classList.add('ring-2', 'ring-blue-500');
+          setTimeout(() => {
+            element.classList.remove('ring-2', 'ring-blue-500');
+          }, 2000);
+        }
+      }, 300);
+    }
+
     const position = findCommentPosition(thread, diffData.files);
     if (position) {
       setCursorPosition(position);
@@ -1416,13 +1544,42 @@ function App() {
                 isMobile ? 'gap-3' : 'gap-4'
               }`}
             >
+              <button
+                type="button"
+                onClick={() => setIsCommentsSidebarOpen((prev) => !prev)}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md border transition-all flex items-center gap-1.5 cursor-pointer ${
+                  isCommentsSidebarOpen
+                    ? 'bg-github-bg-primary border-blue-500/60 text-github-text-primary shadow-xs'
+                    : 'bg-github-bg-tertiary border-github-border text-github-text-secondary hover:text-github-text-primary hover:bg-github-bg-primary'
+                }`}
+                title="Toggle comments sidebar (c)"
+                aria-expanded={isCommentsSidebarOpen}
+                aria-label="Toggle comments sidebar"
+              >
+                <MessageSquare size={14} />
+                <span>Comments</span>
+                {normalizedThreads.length > 0 && (
+                  <span
+                    className={`inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-semibold ${
+                      unresolvedCommentsCount > 0
+                        ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30'
+                        : 'bg-green-500/20 text-green-400 border border-green-500/30'
+                    }`}
+                  >
+                    {unresolvedCommentsCount > 0
+                      ? `${unresolvedCommentsCount} open`
+                      : 'All resolved'}
+                  </span>
+                )}
+              </button>
+
               {!isMobile && threads.length > 0 && (
                 <CommentsDropdown
                   commentsCount={threads.length}
                   isCopiedAll={isCopiedAll}
                   onCopyAll={handleCopyAllComments}
                   onDeleteAll={clearAllComments}
-                  onViewAll={() => setIsCommentsListOpen(true)}
+                  onViewAll={() => setIsCommentsSidebarOpen(true)}
                 />
               )}
               <div className="flex flex-col gap-1 items-center">
@@ -1591,7 +1748,7 @@ function App() {
             className={`flex-1 overflow-y-auto ${showMobileCommentsBar ? 'pb-16' : ''}`}
           >
             {diffData.files.map((file, fileIndex) => {
-              const fileThreads = threadsByFile.get(file.path) ?? EMPTY_COMMENT_THREADS;
+              const fileThreads = diffThreadsByFile.get(file.path) ?? EMPTY_COMMENT_THREADS;
               const mergedChunks =
                 getMergedChunksForVersion(mergedChunksState, diffDataVersion, file.path) ??
                 EMPTY_MERGED_CHUNKS;
@@ -1676,6 +1833,40 @@ function App() {
               );
             })}
           </main>
+
+          {!isMobile && isCommentsSidebarOpen && (
+            <div
+              className={`bg-github-border hover:bg-github-text-muted cursor-col-resize ${
+                !isRightDragging ? '!transition-all !duration-300 !ease-in-out' : ''
+              }`}
+              style={{
+                width: '4px',
+              }}
+              onMouseDown={handleRightResizeMouseDown}
+              title="Drag to resize comments sidebar"
+            />
+          )}
+
+          <CommentsSidebar
+            isOpen={isCommentsSidebarOpen}
+            onClose={() => setIsCommentsSidebarOpen(false)}
+            width={commentsSidebarWidth}
+            comments={normalizedThreads}
+            showAuthorBadges={showAuthorBadges}
+            showResolvedInline={showResolvedInline}
+            onToggleShowResolvedInline={setShowResolvedInline}
+            onNavigateToComment={handleNavigateToComment}
+            onGenerateThreadPrompt={handleGenerateThreadPrompt}
+            onRemoveThread={handleToggleResolve}
+            onToggleResolve={handleToggleResolve}
+            onReplyToThread={handleReplyToThread}
+            onRemoveMessage={removeMessage}
+            onUpdateMessage={updateMessage}
+            syntaxTheme={settings.syntaxTheme}
+            onCopyAllComments={handleCopyAllComments}
+            isCopiedAll={isCopiedAll}
+            isMobile={isMobile}
+          />
         </div>
 
         {showMobileCommentsBar && (

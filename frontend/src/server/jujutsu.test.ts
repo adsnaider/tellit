@@ -126,7 +126,7 @@ describe('JujutsuService comment aggregation', () => {
       targetCommit: 'commit-current-bbb',
     });
 
-    expect(result).toHaveLength(2);
+    expect(result).toHaveLength(3);
     const carriedOver = result.find((t) => t.thread_id === 't-earlier-unresolved');
     const current = result.find((t) => t.thread_id === 't-current-new');
     const oldResolved = result.find((t) => t.thread_id === 't-earlier-resolved');
@@ -138,6 +138,8 @@ describe('JujutsuService comment aggregation', () => {
     expect(current).toBeDefined();
     expect(current?.side).toBe('new');
 
-    expect(oldResolved).toBeUndefined();
+    expect(oldResolved).toBeDefined();
+    expect(oldResolved?.side).toBe('new');
+    expect(oldResolved?.resolved).toBe(true);
   });
 });

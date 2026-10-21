@@ -303,11 +303,11 @@ export class JujutsuService {
       resultMap.set(t.thread_id, { ...t, side: 'new' });
     }
 
-    // 3. Any other unresolved comments in the change (Requirement 2):
-    // When stepping to a later commit in the same change, unresolved comments
-    // from earlier commits are carried forward so open comments don't disappear.
+    // 3. Any other comments in the change:
+    // Include all comments for the change (both unresolved and resolved)
+    // so they are accessible in the UI comments sidebar and diff view.
     for (const t of allChangeThreads) {
-      if (!t.resolved && !resultMap.has(t.thread_id)) {
+      if (!resultMap.has(t.thread_id)) {
         resultMap.set(t.thread_id, { ...t, side: 'new' });
       }
     }

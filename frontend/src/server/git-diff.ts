@@ -248,15 +248,16 @@ export class GitDiffParser {
     filepaths: string[],
     ref: string,
   ): Promise<Set<string>> {
-    if (filepaths.length === 0) {
+    const validPaths = filepaths.filter((p) => p !== 'Commit Message');
+    if (validPaths.length === 0) {
       return new Set();
     }
 
     const generatedPaths = new Set<string>();
 
     try {
-      for (let i = 0; i < filepaths.length; i += GitDiffParser.GITATTRIBUTES_CHECK_CHUNK_SIZE) {
-        const chunk = filepaths.slice(i, i + GitDiffParser.GITATTRIBUTES_CHECK_CHUNK_SIZE);
+      for (let i = 0; i < validPaths.length; i += GitDiffParser.GITATTRIBUTES_CHECK_CHUNK_SIZE) {
+        const chunk = validPaths.slice(i, i + GitDiffParser.GITATTRIBUTES_CHECK_CHUNK_SIZE);
         const output = await this.git.raw([
           'check-attr',
           '-z',
@@ -617,6 +618,10 @@ export class GitDiffParser {
 
   async getBlobContent(filepath: string, ref: string): Promise<Buffer> {
     try {
+      if (filepath === 'Commit Message') {
+        throw new Error('Virtual file');
+      }
+
       // For working directory, read directly from filesystem
       if (ref === 'working' || ref === '.') {
         const fs = await import('fs');
@@ -636,6 +641,9 @@ export class GitDiffParser {
       }
 
       const normalizedFilepath = this.normalizeRepositoryRelativePath(filepath);
+      if (normalizedFilepath === 'Commit Message') {
+        throw new Error('Virtual file');
+      }
 
       // For git refs, we need to use child_process to execute git cat-file
       // to properly handle binary data
@@ -647,6 +655,7 @@ export class GitDiffParser {
         // Using execFileSync to prevent command injection
         const buffer = execFileSync('git', ['show', `:${normalizedFilepath}`], {
           maxBuffer: 10 * 1024 * 1024, // 10MB limit
+          stdio: ['pipe', 'pipe', 'pipe'],
         });
         return buffer;
       }
@@ -656,12 +665,14 @@ export class GitDiffParser {
       const blobHash = execFileSync('git', ['rev-parse', `${ref}:${normalizedFilepath}`], {
         encoding: 'utf8',
         maxBuffer: 10 * 1024 * 1024,
+        stdio: ['pipe', 'pipe', 'pipe'],
       }).trim();
 
       // Then use git cat-file to get the raw binary content
       // Increase maxBuffer to handle large files (default is 1024*1024 = 1MB)
       const buffer = execFileSync('git', ['cat-file', 'blob', blobHash], {
         maxBuffer: 10 * 1024 * 1024, // 10MB limit
+        stdio: ['pipe', 'pipe', 'pipe'],
       });
 
       return buffer;
@@ -676,7 +687,9 @@ export class GitDiffParser {
 
       if (
         error instanceof Error &&
-        (error.message === 'Invalid file path' || error.message === 'File path outside repository')
+        (error.message === 'Invalid file path' ||
+          error.message === 'File path outside repository' ||
+          error.message === 'Virtual file')
       ) {
         throw error;
       }
@@ -688,6 +701,9 @@ export class GitDiffParser {
   }
 
   async getLineCount(filepath: string, ref: string): Promise<number> {
+    if (filepath === 'Commit Message') {
+      return 0;
+    }
     const buffer = await this.getBlobContent(filepath, ref);
     let count = 0;
     for (let i = 0; i < buffer.length; i++) {
@@ -709,6 +725,9 @@ export class GitDiffParser {
     filepath: string,
     ref: string,
   ): Promise<{ isGenerated: boolean; source: 'path' | 'content' }> {
+    if (filepath === 'Commit Message') {
+      return { isGenerated: false, source: 'path' };
+    }
     const pathResult = isGeneratedFile(filepath);
     if (pathResult.isGenerated) {
       return { isGenerated: true, source: 'path' };

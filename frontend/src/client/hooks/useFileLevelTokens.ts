@@ -87,7 +87,7 @@ export function useFileLevelTokens({
   }, [enabled, language]);
 
   useEffect(() => {
-    if (!enabled || isStdinDiff) {
+    if (!enabled || isStdinDiff || file.path === 'Commit Message') {
       setOldContent(null);
       setNewContent(null);
       return;

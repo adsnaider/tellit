@@ -274,6 +274,7 @@ export function useLazyDiffRendering({
 
     diffData.files.forEach((file) => {
       if (
+        file.path === 'Commit Message' ||
         !renderedFilePaths.has(file.path) ||
         file.isGenerated !== false ||
         file.status === 'deleted'

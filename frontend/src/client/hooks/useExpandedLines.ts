@@ -112,7 +112,7 @@ export function useExpandedLines({
 
   const ensureFileContent = useCallback(
     async (file: DiffFile): Promise<FileExpandedState | null> => {
-      if (isStdinDiff) {
+      if (isStdinDiff || file.path === 'Commit Message') {
         return null;
       }
 
@@ -342,7 +342,7 @@ export function useExpandedLines({
   // Pre-fetch only line counts (lightweight) to show bottom expand button
   const prefetchFileContent = useCallback(
     async (file: DiffFile) => {
-      if (isStdinDiff) {
+      if (isStdinDiff || file.path === 'Commit Message') {
         return;
       }
 
@@ -407,8 +407,8 @@ export function useExpandedLines({
 
   const getHiddenLinesBefore = useCallback(
     (file: DiffFile, chunk: DiffChunk, chunkIndex: number): number => {
-      // Fully added/deleted files show all lines in the diff - no hidden lines
-      if (file.status === 'added' || file.status === 'deleted') {
+      // Fully added/deleted files or commit message diffs show all lines - no hidden lines
+      if (file.status === 'added' || file.status === 'deleted' || file.path === 'Commit Message') {
         return 0;
       }
 
@@ -448,8 +448,8 @@ export function useExpandedLines({
    */
   const getHiddenLinesAfter = useCallback(
     (file: DiffFile, chunk: DiffChunk, chunkIndex: number): number => {
-      // Fully added/deleted files show all lines in the diff - no hidden lines
-      if (file.status === 'added' || file.status === 'deleted') {
+      // Fully added/deleted files or commit message diffs show all lines - no hidden lines
+      if (file.status === 'added' || file.status === 'deleted' || file.path === 'Commit Message') {
         return 0;
       }
 

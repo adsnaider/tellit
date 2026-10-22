@@ -342,9 +342,16 @@ export async function startServer(
       return { ok: false, error: 'Invalid file path' };
     }
 
-    const normalizedFilepath = filepath.replace(/\\/g, '/');
+    let decoded = filepath;
+    try {
+      decoded = decodeURIComponent(filepath);
+    } catch {
+      // ignore malformed URI encoding and use raw filepath
+    }
+
+    const normalizedFilepath = decoded.replace(/\\/g, '/');
     const hasParentTraversal = normalizedFilepath.split('/').some((segment) => segment === '..');
-    if (isAbsolute(filepath) || normalizedFilepath.startsWith('/') || hasParentTraversal) {
+    if (isAbsolute(decoded) || normalizedFilepath.startsWith('/') || hasParentTraversal) {
       return { ok: false, error: 'File path outside repository' };
     }
 
@@ -514,6 +521,17 @@ export async function startServer(
         return;
       }
       const normalizedFilepath = filepathResult.path;
+
+      if (normalizedFilepath === 'Commit Message') {
+        const ref = (req.query.ref as string) || currentSelection.targetCommitish || 'HEAD';
+        res.json({
+          path: 'Commit Message',
+          ref,
+          isGenerated: false,
+          source: 'path',
+        });
+        return;
+      }
 
       const ref = (req.query.ref as string) || currentSelection.targetCommitish || 'HEAD';
       const cacheKey = `${ref}:${normalizedFilepath}`;
@@ -767,10 +785,6 @@ export async function startServer(
 
   app.get(/^\/api\/line-count\/(.*)$/, async (req, res) => {
     try {
-      if (req.params[0] === 'Commit Message') {
-        res.json({ oldLineCount: 0, newLineCount: 0 });
-        return;
-      }
       if (options.stdinDiff) {
         res.status(404).json({ error: 'Line count not available for stdin diff' });
         return;
@@ -782,6 +796,10 @@ export async function startServer(
         return;
       }
       const filepath = filepathResult.path;
+      if (filepath === 'Commit Message') {
+        res.json({ oldLineCount: 0, newLineCount: 0 });
+        return;
+      }
       const oldRef = req.query.oldRef as string | undefined;
       const oldPathResult = req.query.oldPath
         ? parseRepositoryRelativePath(req.query.oldPath)
@@ -831,6 +849,10 @@ export async function startServer(
         return;
       }
       const filepath = filepathResult.path;
+      if (filepath === 'Commit Message') {
+        res.status(404).json({ error: 'Blob content not available for virtual commit message' });
+        return;
+      }
       const ref = (req.query.ref as string) || 'HEAD';
 
       const blob = await parser.getBlobContent(filepath, ref);

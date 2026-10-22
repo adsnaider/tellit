@@ -88,6 +88,7 @@ describe('GitDiffParser', () => {
 
       expect(mockExecFileSync).toHaveBeenCalledWith('git', ['show', ':test.txt'], {
         maxBuffer: 10 * 1024 * 1024,
+        stdio: ['pipe', 'pipe', 'pipe'],
       });
       expect(result).toBe(mockBuffer);
     });
@@ -105,9 +106,11 @@ describe('GitDiffParser', () => {
       expect(mockExecFileSync).toHaveBeenCalledWith('git', ['rev-parse', 'HEAD:test.txt'], {
         encoding: 'utf8',
         maxBuffer: 10 * 1024 * 1024,
+        stdio: ['pipe', 'pipe', 'pipe'],
       });
       expect(mockExecFileSync).toHaveBeenCalledWith('git', ['cat-file', 'blob', blobHash], {
         maxBuffer: 10 * 1024 * 1024,
+        stdio: ['pipe', 'pipe', 'pipe'],
       });
       expect(result).toBe(mockBuffer);
     });
@@ -132,6 +135,11 @@ describe('GitDiffParser', () => {
       await expect(parser.getBlobContent('large-file.jpg', 'HEAD')).rejects.toThrow(
         'Image file large-file.jpg is too large to display (over 10MB limit)',
       );
+    });
+
+    it('rejects virtual Commit Message path without invoking git', async () => {
+      await expect(parser.getBlobContent('Commit Message', 'HEAD')).rejects.toThrow('Virtual file');
+      expect(mockExecFileSync).not.toHaveBeenCalled();
     });
 
     it('handles general git errors', async () => {

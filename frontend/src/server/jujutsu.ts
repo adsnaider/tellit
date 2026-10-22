@@ -193,13 +193,49 @@ export class JujutsuService {
   }
 
   async getCommitsForChange(changeId: string): Promise<JjCommit[]> {
-    // 1. Get visible commits from Jujutsu
-    const template = 'commit_id ++ "\t" ++ committer.timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ (if(current_working_copy, "1", "0")) ++ "\t" ++ description.first_line() ++ "\n"';
+    // 1. Get all commits for the change using Jujutsu evolution log (evolog)
+    const evologTemplate =
+      'commit.commit_id() ++ "\t" ++ commit.committer().timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ (if(commit.current_working_copy(), "1", "0")) ++ "\t" ++ commit.description().first_line() ++ "\n"';
     let jjCommitsRaw = '';
     try {
-      jjCommitsRaw = await this.runJj(['log', '-r', `change_id(${changeId})`, '--reversed', '--no-graph', '-T', template]);
+      jjCommitsRaw = await this.runJj([
+        'evolog',
+        '-r',
+        `change_id(${changeId})`,
+        '--reversed',
+        '--no-graph',
+        '-T',
+        evologTemplate,
+      ]);
     } catch {
-      // Ignored if revset fails
+      try {
+        jjCommitsRaw = await this.runJj([
+          'evolog',
+          '-r',
+          changeId,
+          '--reversed',
+          '--no-graph',
+          '-T',
+          evologTemplate,
+        ]);
+      } catch {
+        // Fallback to standard jj log if evolog fails
+        const fallbackTemplate =
+          'commit_id ++ "\t" ++ committer.timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ (if(current_working_copy, "1", "0")) ++ "\t" ++ description.first_line() ++ "\n"';
+        try {
+          jjCommitsRaw = await this.runJj([
+            'log',
+            '-r',
+            `change_id(${changeId})`,
+            '--reversed',
+            '--no-graph',
+            '-T',
+            fallbackTemplate,
+          ]);
+        } catch {
+          // Ignored
+        }
+      }
     }
 
     const commitMap = new Map<string, JjCommit>();
@@ -247,9 +283,14 @@ export class JujutsuService {
       }
     }
 
-    // Convert map to array and sort chronologically (oldest to newest)
+    // Convert map to array and preserve chronological order (oldest to newest)
     const result = Array.from(commitMap.values());
-    result.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    result.sort((a, b) => {
+      if (a.timestamp && b.timestamp) {
+        return a.timestamp.localeCompare(b.timestamp);
+      }
+      return 0;
+    });
     return result;
   }
 

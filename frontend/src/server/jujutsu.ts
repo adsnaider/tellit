@@ -15,6 +15,7 @@ export interface JjChange {
   description: string;
   commentCount: number;
   unresolvedCommentCount: number;
+  approved?: boolean;
 }
 
 export interface JjCommit {
@@ -25,6 +26,7 @@ export interface JjCommit {
   isWorkingCopy: boolean;
   commentCount: number;
   unresolvedCommentCount: number;
+  approved?: boolean;
 }
 
 export interface CommenterThreadInfo {
@@ -129,9 +131,10 @@ export class JujutsuService {
 
     await Promise.all(
       changes.map(async (c) => {
-        const threads = await this.getChangeThreads(c.changeId);
-        c.commentCount = threads.length;
-        c.unresolvedCommentCount = threads.filter((t) => !t.resolved).length;
+        const details = await this.getChangeDetails(c.changeId);
+        c.commentCount = details.threads.length;
+        c.unresolvedCommentCount = details.threads.filter((t) => !t.resolved).length;
+        c.approved = details.approval;
       }),
     );
 
@@ -166,30 +169,55 @@ export class JujutsuService {
       commentCount: 0,
       unresolvedCommentCount: 0,
     };
-    const threads = await this.getChangeThreads(changeId);
-    change.commentCount = threads.length;
-    change.unresolvedCommentCount = threads.filter((t) => !t.resolved).length;
+    const details = await this.getChangeDetails(changeId);
+    change.commentCount = details.threads.length;
+    change.unresolvedCommentCount = details.threads.filter((t) => !t.resolved).length;
+    change.approved = details.approval;
     return change;
   }
 
-  async getChangeThreads(changeId: string): Promise<CommenterThreadInfo[]> {
+  async getChangeDetails(changeId: string): Promise<{ threads: CommenterThreadInfo[]; approval: boolean }> {
     try {
       const output = await this.runTellit(['get', 'change', changeId, '--threads', '--json']);
-      if (!output) return [];
-      return JSON.parse(output);
+      if (!output) return { threads: [], approval: false };
+      const parsed = JSON.parse(output);
+      if (Array.isArray(parsed)) {
+        return { threads: parsed, approval: false };
+      }
+      return {
+        threads: parsed.threads || [],
+        approval: Boolean(parsed.approval),
+      };
     } catch {
-      return [];
+      return { threads: [], approval: false };
+    }
+  }
+
+  async getChangeThreads(changeId: string): Promise<CommenterThreadInfo[]> {
+    const details = await this.getChangeDetails(changeId);
+    return details.threads;
+  }
+
+  async getCommitDetails(commitId: string): Promise<{ threads: CommenterThreadInfo[]; approval: boolean }> {
+    try {
+      const output = await this.runTellit(['get', 'commit', commitId, '--threads', '--json']);
+      if (!output) return { threads: [], approval: false };
+      const parsed = JSON.parse(output);
+      if (Array.isArray(parsed)) {
+        return { threads: parsed, approval: false };
+      }
+      return {
+        threads: parsed.threads || [],
+        approval: Boolean(parsed.approval),
+      };
+    } catch {
+      return { threads: [], approval: false };
     }
   }
 
   async getCommitThreads(commitId: string): Promise<CommenterThreadInfo[]> {
-    try {
-      const output = await this.runTellit(['get', 'commit', commitId, '--threads', '--json']);
-      if (!output) return [];
-      return JSON.parse(output);
-    } catch {
-      return [];
-    }
+    const details = await this.getCommitDetails(commitId);
+    return details.threads;
   }
 
   async getCommitsForChange(changeId: string): Promise<JjCommit[]> {
@@ -291,6 +319,14 @@ export class JujutsuService {
       }
       return 0;
     });
+
+    await Promise.all(
+      result.map(async (c) => {
+        const details = await this.getCommitDetails(c.commitId);
+        c.approved = details.approval;
+      }),
+    );
+
     return result;
   }
 
@@ -422,5 +458,14 @@ export class JujutsuService {
       args.push('--unresolve');
     }
     return await this.runTellit(args);
+  }
+
+  async approve(target: string, disapprove = false): Promise<boolean> {
+    const args = ['approve', target];
+    if (disapprove) {
+      args.push('--disapprove');
+    }
+    await this.runTellit(args);
+    return !disapprove;
   }
 }

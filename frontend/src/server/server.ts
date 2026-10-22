@@ -749,6 +749,22 @@ export async function startServer(
     }
   });
 
+  app.post('/api/jj/approve', async (req, res) => {
+    try {
+      const { commitId, target, disapprove } = req.body;
+      const effectiveTarget = commitId || target;
+      if (!effectiveTarget) {
+        res.status(400).json({ error: 'commitId or target is required' });
+        return;
+      }
+      const approved = await jjService.approve(effectiveTarget, Boolean(disapprove));
+      res.json({ success: true, approved });
+    } catch (error) {
+      console.error('Error approving target in Jujutsu:', error);
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to approve' });
+    }
+  });
+
   app.get(/^\/api\/line-count\/(.*)$/, async (req, res) => {
     try {
       if (req.params[0] === 'Commit Message') {

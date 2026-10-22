@@ -3,8 +3,10 @@ use std::process::ExitCode;
 use clap::Parser;
 use tellit_cli::{
     add_comment, get_all_threads, get_change_commits, get_change_threads, get_commit_thread_infos,
-    get_commit_threads, get_thread, get_workspace_root, locate_web_cli, reply_comment,
-    resolve_comment, resolve_store, Cli, Command, CommentAction, GetTarget,
+    get_commit_threads, get_thread, get_workspace_root, is_change_approved, is_commit_approved,
+    locate_web_cli, reply_comment, resolve_comment, resolve_store, set_commit_approval,
+    ChangeCommitsGetResponse, ChangeThreadsGetResponse, Cli, Command, CommentAction,
+    CommitGetResponse, CommitIdsGetResponse, GetTarget,
 };
 
 fn locate_node() -> std::path::PathBuf {
@@ -136,38 +138,55 @@ fn run() -> anyhow::Result<()> {
                     let thread_ids = get_all_threads(&store, &args.target, resolved_filter)?;
                     println!("{}", serde_json::to_string_pretty(&thread_ids)?);
                 }
+                CommentAction::Approve(args) => {
+                    let (change_id, commit_id, approved) =
+                        set_commit_approval(&store, args.target.as_deref(), args.disapprove)?;
+                    if approved {
+                        eprintln!("Approved commit {commit_id} (change {change_id})");
+                    } else {
+                        eprintln!("Revoked approval for commit {commit_id} (change {change_id})");
+                    }
+                }
                 CommentAction::Get(get) => match get.target {
                     GetTarget::Thread(t) => {
                         let info = get_thread(&store, &t.thread_id)?;
                         println!("{}", serde_json::to_string_pretty(&info)?);
                     }
                     GetTarget::Change(c) => {
+                        let approval = is_change_approved(&store, &c.change_id);
                         if c.threads {
                             let threads = get_change_threads(&store, &c.change_id)?;
-                            println!("{}", serde_json::to_string_pretty(&threads)?);
+                            let resp = ChangeThreadsGetResponse { threads, approval };
+                            println!("{}", serde_json::to_string_pretty(&resp)?);
                         } else {
                             let commits = get_change_commits(&store, &c.change_id)?;
                             if c.json {
-                                println!("{}", serde_json::to_string_pretty(&commits)?);
+                                let resp = ChangeCommitsGetResponse { commits, approval };
+                                println!("{}", serde_json::to_string_pretty(&resp)?);
                             } else {
-                                for commit in commits {
+                                for commit in &commits {
                                     println!("{commit}");
                                 }
+                                println!("approval: {approval}");
                             }
                         }
                     }
                     GetTarget::Commit(co) => {
+                        let approval = is_commit_approved(&store, &co.commit_hash);
                         if co.threads {
                             let threads = get_commit_thread_infos(&store, &co.commit_hash)?;
-                            println!("{}", serde_json::to_string_pretty(&threads)?);
+                            let resp = CommitGetResponse { threads, approval };
+                            println!("{}", serde_json::to_string_pretty(&resp)?);
                         } else {
                             let threads = get_commit_threads(&store, &co.commit_hash)?;
                             if co.json {
-                                println!("{}", serde_json::to_string_pretty(&threads)?);
+                                let resp = CommitIdsGetResponse { threads, approval };
+                                println!("{}", serde_json::to_string_pretty(&resp)?);
                             } else {
-                                for thread in threads {
+                                for thread in &threads {
                                     println!("{thread}");
                                 }
+                                println!("approval: {approval}");
                             }
                         }
                     }

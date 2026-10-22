@@ -5,8 +5,9 @@ import {
   ArrowRight,
   Search,
   X,
+  CheckCircle2,
 } from 'lucide-react';
-import React, { useEffect, useState, useRef, useMemo } from 'react';
+import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react';
 
 import { type JjChange, type JjCommit } from '../../types/diff';
 import { useClickOutside } from '../hooks/useClickOutside';
@@ -14,26 +15,44 @@ import { useClickOutside } from '../hooks/useClickOutside';
 export function CommentDot({
   commentCount,
   unresolvedCommentCount,
+  approved,
 }: {
   commentCount?: number;
   unresolvedCommentCount?: number;
+  approved?: boolean;
 }) {
   const count = commentCount ?? 0;
   const unresolved = unresolvedCommentCount ?? 0;
-  if (count === 0) return null;
-  const isUnresolved = unresolved > 0;
-  return (
-    <span
-      className={`inline-block w-2 h-2 rounded-full shrink-0 ${
-        isUnresolved ? 'bg-yellow-400 shadow-sm' : 'bg-gray-400'
-      }`}
-      title={
-        isUnresolved
-          ? `${unresolved} unresolved comment${unresolved > 1 ? 's' : ''}`
-          : 'All comments resolved'
-      }
-    />
-  );
+
+  // Comments take precedence. Only if all comments are resolved should it show green.
+  if (unresolved > 0) {
+    return (
+      <span
+        className="inline-block w-2 h-2 rounded-full shrink-0 bg-yellow-400 shadow-sm"
+        title={`${unresolved} unresolved comment${unresolved > 1 ? 's' : ''}`}
+      />
+    );
+  }
+
+  if (approved) {
+    return (
+      <span
+        className="inline-block w-2 h-2 rounded-full shrink-0 bg-green-500 shadow-sm"
+        title={count > 0 ? 'Approved (all comments resolved)' : 'Approved'}
+      />
+    );
+  }
+
+  if (count > 0) {
+    return (
+      <span
+        className="inline-block w-2 h-2 rounded-full shrink-0 bg-gray-400"
+        title="All comments resolved"
+      />
+    );
+  }
+
+  return null;
 }
 
 export interface UseJjRevisionsProps {
@@ -56,7 +75,32 @@ export function useJjRevisions({
   const [customInput, setCustomInput] = useState('');
   const [customError, setCustomError] = useState<string | null>(null);
 
-  // Load changes
+  const loadChanges = useCallback(async () => {
+    try {
+      const res = await fetch('/api/jj/changes');
+      if (res.ok) {
+        const data = (await res.json()) as { changes?: JjChange[] };
+        setChanges(data.changes || []);
+      }
+    } catch (err) {
+      console.error('Failed to reload jj changes:', err);
+    }
+  }, []);
+
+  const loadCommits = useCallback(async (changeId: string) => {
+    if (!changeId) return;
+    try {
+      const res = await fetch(`/api/jj/changes/${encodeURIComponent(changeId)}/commits`);
+      if (res.ok) {
+        const data = (await res.json()) as { commits?: JjCommit[] };
+        setCommits(data.commits || []);
+      }
+    } catch (err) {
+      console.error('Failed to reload jj commits:', err);
+    }
+  }, []);
+
+  // Initial load of changes
   useEffect(() => {
     let mounted = true;
     fetch('/api/jj/changes')
@@ -114,7 +158,7 @@ export function useJjRevisions({
     if (!selectedChangeId) return;
     let mounted = true;
     setLoadingCommits(true);
-    fetch(`/api/jj/changes/${selectedChangeId}/commits`)
+    fetch(`/api/jj/changes/${encodeURIComponent(selectedChangeId)}/commits`)
       .then((res) => res.json())
       .then((data: { commits?: JjCommit[] }) => {
         if (!mounted) return;
@@ -149,6 +193,22 @@ export function useJjRevisions({
     onSelectDiff(targetCommitId, newBase === 'parent' ? undefined : newBase);
   };
 
+  const handleToggleApprove = async (commitId: string, currentApproved: boolean) => {
+    try {
+      const res = await fetch('/api/jj/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ commitId, disapprove: currentApproved }),
+      });
+      if (res.ok) {
+        await loadCommits(selectedChangeId);
+        await loadChanges();
+      }
+    } catch (err) {
+      console.error('Failed to toggle approval:', err);
+    }
+  };
+
   return {
     changes,
     selectedChangeId,
@@ -167,6 +227,7 @@ export function useJjRevisions({
     handleCustomSubmit,
     handleTargetChange,
     handleBaseChange,
+    handleToggleApprove,
   };
 }
 
@@ -262,6 +323,7 @@ export function JjChangeSelector({
                 <CommentDot
                   commentCount={selectedChange.commentCount}
                   unresolvedCommentCount={selectedChange.unresolvedCommentCount}
+                  approved={selectedChange.approved}
                 />
               )}
               <ChevronDown size={12} className="text-github-text-muted shrink-0" />
@@ -313,6 +375,7 @@ export function JjChangeSelector({
                 <CommentDot
                   commentCount={change.commentCount}
                   unresolvedCommentCount={change.unresolvedCommentCount}
+                  approved={change.approved}
                 />
               </button>
             );
@@ -342,6 +405,7 @@ export interface JjCommitComparisonSelectorProps {
   baseCommitId: string;
   onSelectTarget: (targetId: string) => void;
   onSelectBase: (baseId: string) => void;
+  onToggleApprove?: (commitId: string, currentApproved: boolean) => void;
   loading?: boolean;
 }
 
@@ -351,6 +415,7 @@ export function JjCommitComparisonSelector({
   baseCommitId,
   onSelectTarget,
   onSelectBase,
+  onToggleApprove,
   loading = false,
 }: JjCommitComparisonSelectorProps) {
   const [isFromOpen, setIsFromOpen] = useState(false);
@@ -405,6 +470,7 @@ export function JjCommitComparisonSelector({
             <CommentDot
               commentCount={activeBaseCommit.commentCount}
               unresolvedCommentCount={activeBaseCommit.unresolvedCommentCount}
+              approved={activeBaseCommit.approved}
             />
           )}
           <ChevronDown size={12} className="text-github-text-muted shrink-0" />
@@ -474,6 +540,7 @@ export function JjCommitComparisonSelector({
                   <CommentDot
                     commentCount={commit.commentCount}
                     unresolvedCommentCount={commit.unresolvedCommentCount}
+                    approved={commit.approved}
                   />
                 </button>
               );
@@ -508,6 +575,7 @@ export function JjCommitComparisonSelector({
             <CommentDot
               commentCount={activeTargetCommit.commentCount}
               unresolvedCommentCount={activeTargetCommit.unresolvedCommentCount}
+              approved={activeTargetCommit.approved}
             />
           )}
           <ChevronDown size={12} className="text-github-text-muted shrink-0" />
@@ -554,6 +622,7 @@ export function JjCommitComparisonSelector({
                   <CommentDot
                     commentCount={commit.commentCount}
                     unresolvedCommentCount={commit.unresolvedCommentCount}
+                    approved={commit.approved}
                   />
                 </button>
               );
@@ -561,6 +630,30 @@ export function JjCommitComparisonSelector({
           </div>
         )}
       </div>
+
+      {/* Approve Button */}
+      {onToggleApprove && activeTargetCommit && (
+        <button
+          type="button"
+          onClick={() => onToggleApprove(targetCommitId, Boolean(activeTargetCommit.approved))}
+          className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium border transition-all cursor-pointer ${
+            activeTargetCommit.approved
+              ? 'bg-green-500/15 text-green-400 border-green-500/40 hover:bg-green-500/25'
+              : 'bg-github-bg-tertiary text-github-text-secondary border-github-border hover:text-github-text-primary hover:border-github-accent'
+          }`}
+          title={
+            activeTargetCommit.approved
+              ? 'Approved - click to revoke approval'
+              : 'Approve this revision'
+          }
+        >
+          <CheckCircle2
+            size={13}
+            className={activeTargetCommit.approved ? 'text-green-400' : 'text-github-text-muted'}
+          />
+          <span>{activeTargetCommit.approved ? 'Approved' : 'Approve'}</span>
+        </button>
+      )}
     </div>
   );
 }
@@ -594,6 +687,7 @@ export function JjRevisionSelector({
         baseCommitId={revisions.baseCommitId}
         onSelectTarget={revisions.handleTargetChange}
         onSelectBase={revisions.handleBaseChange}
+        onToggleApprove={revisions.handleToggleApprove}
         loading={revisions.loadingCommits}
       />
     </div>

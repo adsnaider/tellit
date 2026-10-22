@@ -134,6 +134,7 @@ export interface JjChange {
   description: string;
   commentCount: number;
   unresolvedCommentCount: number;
+  approved?: boolean;
 }
 
 export interface JjCommit {
@@ -144,6 +145,7 @@ export interface JjCommit {
   isWorkingCopy: boolean;
   commentCount: number;
   unresolvedCommentCount: number;
+  approved?: boolean;
 }
 
 interface CommentImportBase {
@@ -233,6 +235,7 @@ export interface JjChange {
   description: string;
   commentCount: number;
   unresolvedCommentCount: number;
+  approved?: boolean;
 }
 
 export interface JjCommit {
@@ -243,6 +246,7 @@ export interface JjCommit {
   isWorkingCopy: boolean;
   commentCount: number;
   unresolvedCommentCount: number;
+  approved?: boolean;
 }
 
 // Revision selector types

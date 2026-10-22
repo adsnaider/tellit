@@ -1,8 +1,8 @@
 use std::fs;
 use tempfile::tempdir;
 use tellit_cli::{
-    get_all_threads, get_change_commits, get_commit_threads, get_thread, reply_comment,
-    resolve_comment, LineRange, ThreadData,
+    get_all_threads, get_change_commits, get_commit_threads, get_thread, is_commit_approved,
+    reply_comment, resolve_comment, set_commit_approval, LineRange, ThreadData,
 };
 
 #[test]
@@ -114,4 +114,14 @@ fn test_full_comment_workflow() {
     // Test get_all_threads on nonexistent target
     let empty = get_all_threads(&store, "nonexistent", None).unwrap();
     assert!(empty.is_empty());
+
+    // Test commit approval workflow
+    assert!(!is_commit_approved(&store, git_commit));
+    set_commit_approval(&store, Some(git_commit), false).unwrap();
+    assert!(is_commit_approved(&store, git_commit));
+    assert!(is_commit_approved(&store, &git_commit[..8]));
+
+    // Disapprove
+    set_commit_approval(&store, Some(git_commit), true).unwrap();
+    assert!(!is_commit_approved(&store, git_commit));
 }

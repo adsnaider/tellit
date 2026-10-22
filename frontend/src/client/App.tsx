@@ -1621,6 +1621,7 @@ function App() {
                   baseCommitId={jjRevisions.baseCommitId}
                   onSelectTarget={jjRevisions.handleTargetChange}
                   onSelectBase={jjRevisions.handleBaseChange}
+                  onToggleApprove={jjRevisions.handleToggleApprove}
                   loading={jjRevisions.loadingCommits}
                 />
               ) : revisionOptions ? (

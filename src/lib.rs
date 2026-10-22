@@ -74,6 +74,40 @@ pub struct ThreadInfo {
     pub resolved: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalData {
+    pub approved: bool,
+    pub timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitGetResponse {
+    pub threads: Vec<ThreadInfo>,
+    pub approval: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitIdsGetResponse {
+    pub threads: Vec<String>,
+    pub approval: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeThreadsGetResponse {
+    pub threads: Vec<ThreadInfo>,
+    pub approval: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeCommitsGetResponse {
+    pub commits: Vec<String>,
+    pub approval: bool,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "tellit", about = "Code review diff viewer and commenting tool for Jujutsu (jj)")]
 pub struct Cli {
@@ -150,6 +184,17 @@ pub enum CommentAction {
     Get(Get),
     #[command(name = "get-all", about = "Get thread IDs for a change, commit, or revision as a JSON array")]
     GetAll(GetAllArgs),
+    #[command(about = "Approve or disapprove a commit or change")]
+    Approve(ApproveArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ApproveArgs {
+    #[arg(help = "Target revision, change ID, or commit hash (defaults to @)")]
+    pub target: Option<String>,
+
+    #[arg(long, help = "Disapprove the commit/change instead of approving")]
+    pub disapprove: bool,
 }
 
 #[derive(Debug, Args)]
@@ -462,6 +507,9 @@ pub fn find_thread_file(store: &Path, thread_query: &str) -> Result<FoundThread>
                 Some(s) => s,
                 None => continue,
             };
+            if stem == "approval" {
+                continue;
+            }
             let parent_commit = match path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) {
                 Some(s) => s,
                 None => continue,
@@ -640,7 +688,11 @@ pub fn get_change_commits(store: &Path, change_query: &str) -> Result<Vec<String
             if entry.file_type()?.is_dir() {
                 let has_json = std::fs::read_dir(entry.path())?
                     .filter_map(|e| e.ok())
-                    .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"));
+                    .any(|e| {
+                        let p = e.path();
+                        p.extension().and_then(|s| s.to_str()) == Some("json")
+                            && p.file_stem().and_then(|s| s.to_str()) != Some("approval")
+                    });
                 if has_json {
                     commit_hashes.push(entry.file_name().to_string_lossy().to_string());
                 }
@@ -671,7 +723,9 @@ pub fn get_commit_threads(store: &Path, commit_query: &str) -> Result<Vec<String
                     let path = file_entry.path();
                     if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
                         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                            thread_ids.push(stem.to_string());
+                            if stem != "approval" {
+                                thread_ids.push(stem.to_string());
+                            }
                         }
                     }
                 }
@@ -722,6 +776,9 @@ pub fn get_change_threads(store: &Path, change_query: &str) -> Result<Vec<Thread
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string();
+                        if thread_id == "approval" {
+                            continue;
+                        }
                         if let Ok(bytes) = std::fs::read(&path) {
                             if let Ok(thread_data) = serde_json::from_slice::<ThreadData>(&bytes) {
                                 threads.push(ThreadInfo {
@@ -776,6 +833,9 @@ pub fn get_commit_thread_infos(store: &Path, commit_query: &str) -> Result<Vec<T
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string();
+                        if thread_id == "approval" {
+                            continue;
+                        }
                         if let Ok(bytes) = std::fs::read(&path) {
                             if let Ok(thread_data) = serde_json::from_slice::<ThreadData>(&bytes) {
                                 threads.push(ThreadInfo {
@@ -844,6 +904,165 @@ pub fn get_all_threads(
     thread_ids.sort();
     thread_ids.dedup();
     Ok(thread_ids)
+}
+
+pub fn is_commit_approved(store: &Path, commit_query: &str) -> bool {
+    if !store.exists() {
+        return false;
+    }
+    for entry in WalkDir::new(store)
+        .min_depth(2)
+        .max_depth(2)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_dir() {
+            let commit_name = entry.file_name().to_string_lossy();
+            if commit_name == commit_query
+                || (commit_query.len() >= 6 && commit_name.starts_with(commit_query))
+                || (commit_name.len() >= 6 && commit_query.starts_with(&*commit_name))
+            {
+                let approval_file = entry.path().join("approval.json");
+                if approval_file.exists() {
+                    if let Ok(bytes) = std::fs::read(&approval_file) {
+                        if let Ok(data) = serde_json::from_slice::<ApprovalData>(&bytes) {
+                            return data.approved;
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+pub fn is_change_approved(store: &Path, change_query: &str) -> bool {
+    // 1. Ask Jujutsu for the latest commit of the change
+    let latest_commit = match run_jj(&[
+        "log",
+        "-r",
+        &format!("change_id({})", change_query),
+        "-n",
+        "1",
+        "--no-graph",
+        "-T",
+        "commit_id",
+    ]) {
+        Ok(out) if !out.trim().is_empty() => Some(out.trim().to_string()),
+        _ => match run_jj(&[
+            "log",
+            "-r",
+            change_query,
+            "-n",
+            "1",
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ]) {
+            Ok(out) if !out.trim().is_empty() => Some(out.trim().to_string()),
+            _ => None,
+        },
+    };
+
+    if let Some(commit_id) = latest_commit {
+        return is_commit_approved(store, &commit_id);
+    }
+
+    false
+}
+
+pub fn set_commit_approval(
+    store: &Path,
+    target: Option<&str>,
+    disapprove: bool,
+) -> Result<(String, String, bool)> {
+    let rev = target.unwrap_or("@");
+
+    // 1. Resolve rev using Jujutsu log
+    let (change_id, commit_id) = match get_rev_info(rev) {
+        Ok(info) => info,
+        Err(_) => match run_jj(&[
+            "log",
+            "-r",
+            &format!("change_id({})", rev),
+            "-n",
+            "1",
+            "--no-graph",
+            "-T",
+            "change_id ++ \"\n\" ++ commit_id",
+        ]) {
+            Ok(out) => {
+                let lines: Vec<&str> = out.lines().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                if lines.len() >= 2 {
+                    (lines[0].to_string(), lines[1].to_string())
+                } else {
+                    anyhow::bail!("Failed to resolve revision or change '{}'", rev);
+                }
+            }
+            Err(_) => {
+                // Search store as fallback
+                let mut found: Option<(String, String)> = None;
+                if store.exists() {
+                    for entry in WalkDir::new(store)
+                        .min_depth(2)
+                        .max_depth(2)
+                        .into_iter()
+                        .filter_map(|e| e.ok())
+                    {
+                        if entry.file_type().is_dir() {
+                            let commit_name = entry.file_name().to_string_lossy();
+                            let change_name = entry
+                                .path()
+                                .parent()
+                                .and_then(|p| p.file_name())
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            if commit_name == rev
+                                || (rev.len() >= 6 && commit_name.starts_with(rev))
+                                || change_name == rev
+                                || (rev.len() >= 6 && change_name.starts_with(rev))
+                            {
+                                found = Some((change_name, commit_name.to_string()));
+                                break;
+                            }
+                        }
+                    }
+                }
+                found.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Could not resolve target '{}' to a Jujutsu revision or store commit",
+                        rev
+                    )
+                })?
+            }
+        },
+    };
+
+    let commit_dir = store.join(&change_id).join(&commit_id);
+    let approval_file = commit_dir.join("approval.json");
+
+    if disapprove {
+        if approval_file.exists() {
+            let _ = std::fs::remove_file(&approval_file);
+        }
+        Ok((change_id, commit_id, false))
+    } else {
+        std::fs::create_dir_all(&commit_dir)?;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let data = ApprovalData {
+            approved: true,
+            timestamp: now_secs.to_string(),
+            commit_id: Some(commit_id.clone()),
+            change_id: Some(change_id.clone()),
+        };
+        let bytes = serde_json::to_vec_pretty(&data)?;
+        std::fs::write(&approval_file, bytes)?;
+        Ok((change_id, commit_id, true))
+    }
 }
 
 #[cfg(test)]
@@ -928,5 +1147,14 @@ mod tests {
         let commit_threads = get_commit_thread_infos(&store, commit_hash).unwrap();
         assert_eq!(commit_threads.len(), 1);
         assert_eq!(commit_threads[0].thread_id, thread_id);
+
+        // Test approval operations
+        assert!(!is_commit_approved(&store, commit_hash));
+        set_commit_approval(&store, Some(commit_hash), false).unwrap();
+        assert!(is_commit_approved(&store, commit_hash));
+
+        // Test disapprove
+        set_commit_approval(&store, Some(commit_hash), true).unwrap();
+        assert!(!is_commit_approved(&store, commit_hash));
     }
 }

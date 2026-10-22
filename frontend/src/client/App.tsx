@@ -27,7 +27,6 @@ import { CommentsSidebar } from './components/CommentsSidebar';
 import { DiffQuickMenu } from './components/DiffQuickMenu';
 import { DiffViewer } from './components/DiffViewer';
 import { FileList } from './components/FileList';
-import { GitHubIcon } from './components/GitHubIcon';
 import { HelpModal } from './components/HelpModal';
 import {
   useJjRevisions,
@@ -1724,16 +1723,6 @@ function App() {
                     <Keyboard size={16} />
                     <span className="text-sm">Shortcuts</span>
                   </button>
-                  <a
-                    href="https://github.com/yoshiko-pg/difit"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex items-center gap-2 text-github-text-secondary hover:text-github-text-primary transition-colors"
-                    title="View on GitHub"
-                  >
-                    <span className="text-sm">Star on GitHub</span>
-                    <GitHubIcon style={{ height: '18px', width: '18px' }} />
-                  </a>
                 </div>
               )}
             </aside>

@@ -1,11 +1,11 @@
 ---
 name: tellit
-description: Code review diff viewer and commenting tool for Jujutsu (jj). Use when launching the web diff viewer (`tellit launch`) or when creating, viewing, replying to, or resolving line-level and file-level review comments (`tellit comment`).
+description: Code review diff viewer and commenting tool for Jujutsu (jj). Use when launching the web diff viewer (`tellit launch`) or when creating, viewing, replying to, resolving, approving, or querying review comments (`tellit comment`).
 ---
 
 # tellit
 
-`tellit` is a code review diff viewer and commenting tool for Jujutsu (`jj`) and Git repositories. It provides an interactive web diff viewer and CLI comment management, persisting discussion threads as structured JSON files organized by Jujutsu change IDs and Git commit hashes.
+`tellit` is a code review diff viewer and commenting tool for Jujutsu (`jj`) and Git repositories. It provides an interactive web diff viewer and CLI comment management, persisting discussion threads and commit approval status as structured JSON files organized by Jujutsu change IDs and Git commit hashes.
 
 ## Storage Layout
 
@@ -14,9 +14,10 @@ The file hierarchy follows:
 
 ```
 <store>/[jj change ID]/[git commit hash]/[thread-id].json
+<store>/[jj change ID]/[git commit hash]/approval.json
 ```
 
-Each thread file has the schema:
+### Comment Threads (`[thread-id].json`)
 
 ```json
 {
@@ -39,11 +40,24 @@ Each thread file has the schema:
 - `comments`: Ordered list of comment strings.
 - `resolved`: Boolean flag indicating if the thread is resolved.
 
+### Commit Approval (`approval.json`)
+
+```json
+{
+  "approved": true,
+  "approved_at": "2026-10-22T20:30:00Z"
+}
+```
+
+- Approvals are strictly tracked per **Git commit hash**.
+- A change is considered approved **only if its latest commit** has an active approval.
+- Modifying, squashing, or amending a change creates a new commit hash in Jujutsu, naturally resetting approval without mutating historical records.
+
 ---
 
 ## Web Diff Viewer (`tellit launch`)
 
-Launches the interactive web review interface with Jujutsu revision picker and comment threading:
+Launches the interactive web review interface with Jujutsu revision picker, virtual commit message diffs, and comment threading:
 
 ```bash
 tellit launch [COMMIT_ISH] [COMPARE_WITH] [OPTIONS]
@@ -55,6 +69,18 @@ tellit launch [COMMIT_ISH] [COMPARE_WITH] [OPTIONS]
 - `--port <PORT>` : Custom port (defaults to 3333 or next free port).
 - `--no-open` : Do not open browser automatically.
 - `--keep-alive` : Keep server running even after browser disconnects.
+
+### UI Features:
+- **Change & Commit Navigation**: Dropdowns on the top toolbar let you switch between Jujutsu changes and view all commits within each change (evolog) in reverse chronological order (latest on top).
+- **Diff Comparison Controls**: Select `[From (base)] -> [To (diff head)]` directly in the toolbar.
+- **Approve Button**: An `Approve` / `Approved` toggle button sits directly beside the comparison controls to approve the commit currently being diffed.
+- **Virtual Commit Message Diff**: Appears like a file at the top of the diff viewer, showing additions or inter-commit diffs between commit descriptions.
+- **Review Status Indicators (Colored Dots)**:
+  - **Yellow**: Unresolved comments present (comments always take precedence).
+  - **Green**: Approved commit or change (only when 0 unresolved comments exist).
+  - **Gray**: All comments resolved, but not approved.
+  - **None**: No comments and not approved.
+- **Comments Sidebar**: Click the `Comments` button in the top navigation to view all comments for the change, grouped with unresolved comments first and resolved comments after.
 
 ---
 
@@ -98,7 +124,18 @@ tellit comment resolve <THREAD_ID>
 tellit comment resolve <THREAD_ID> --unresolve
 ```
 
-### 4. Querying Comments (`get`)
+### 4. Approving / Revoking Approval (`approve`)
+
+Approves (or revokes approval for) a commit or change.
+
+```bash
+tellit comment approve [TARGET] [--disapprove]
+```
+
+- `TARGET` (optional, defaults to `@`): Commit hash or change ID. If a change ID is provided, approves the latest commit representing that change.
+- `--disapprove`: Revokes the approval.
+
+### 5. Querying Comments & Approval (`get` and `get-all`)
 
 #### Get Thread Details
 
@@ -111,14 +148,19 @@ Outputs full JSON object including `thread_id`, `change_id`, `commit_id`, `git_c
 #### Get Commit Hashes for a Change ID
 
 ```bash
-tellit comment get change <CHANGE_ID> [--json]
+tellit comment get change <CHANGE_ID> [--threads] [--json]
 ```
+
+- Returns `{ "commits": [...], "approval": bool }` (or `{ "threads": [...], "approval": bool }` with `--threads`).
+- `approval` evaluates whether the **latest** commit of the change is approved.
 
 #### Get Thread IDs for a Git Commit Hash
 
 ```bash
-tellit comment get commit <COMMIT_HASH> [--json]
+tellit comment get commit <COMMIT_HASH> [--threads] [--json]
 ```
+
+- Returns `{ "threads": [...], "approval": bool }`.
 
 #### Get All Thread IDs for a Change, Commit, or Revision (`get-all`)
 

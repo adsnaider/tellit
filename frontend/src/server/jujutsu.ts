@@ -13,6 +13,8 @@ export interface JjChange {
   isWorkingCopy: boolean;
   timestamp: string;
   description: string;
+  commentCount: number;
+  unresolvedCommentCount: number;
 }
 
 export interface JjCommit {
@@ -120,8 +122,18 @@ export class JujutsuService {
         isWorkingCopy: isWorkingCopy === '1',
         timestamp,
         description: description || '(no description set)',
+        commentCount: 0,
+        unresolvedCommentCount: 0,
       });
     }
+
+    await Promise.all(
+      changes.map(async (c) => {
+        const threads = await this.getChangeThreads(c.changeId);
+        c.commentCount = threads.length;
+        c.unresolvedCommentCount = threads.filter((t) => !t.resolved).length;
+      }),
+    );
 
     return changes;
   }
@@ -143,7 +155,7 @@ export class JujutsuService {
     const parts = lines[0].split('\t');
     if (parts.length < 5) return null;
     const [changeId, commitId, isWorkingCopy, timestamp, description] = parts;
-    return {
+    const change: JjChange = {
       changeId,
       shortChangeId: changeId.slice(0, 8),
       commitId,
@@ -151,7 +163,13 @@ export class JujutsuService {
       isWorkingCopy: isWorkingCopy === '1',
       timestamp,
       description: description || '(no description set)',
+      commentCount: 0,
+      unresolvedCommentCount: 0,
     };
+    const threads = await this.getChangeThreads(changeId);
+    change.commentCount = threads.length;
+    change.unresolvedCommentCount = threads.filter((t) => !t.resolved).length;
+    return change;
   }
 
   async getChangeThreads(changeId: string): Promise<CommenterThreadInfo[]> {

@@ -132,6 +132,8 @@ export interface JjChange {
   isWorkingCopy: boolean;
   timestamp: string;
   description: string;
+  commentCount: number;
+  unresolvedCommentCount: number;
 }
 
 export interface JjCommit {
@@ -229,6 +231,8 @@ export interface JjChange {
   isWorkingCopy: boolean;
   timestamp: string;
   description: string;
+  commentCount: number;
+  unresolvedCommentCount: number;
 }
 
 export interface JjCommit {

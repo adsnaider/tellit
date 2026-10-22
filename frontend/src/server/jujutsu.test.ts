@@ -41,6 +41,8 @@ describe('JujutsuService comment aggregation', () => {
           isWorkingCopy: false,
           timestamp: '2026-10-20 12:00:00',
           description: 'Base commit',
+          commentCount: 0,
+          unresolvedCommentCount: 0,
         };
       }
       return {
@@ -51,6 +53,8 @@ describe('JujutsuService comment aggregation', () => {
         isWorkingCopy: true,
         timestamp: '2026-10-20 13:00:00',
         description: 'Target commit',
+        commentCount: 0,
+        unresolvedCommentCount: 0,
       };
     });
 
@@ -114,6 +118,8 @@ describe('JujutsuService comment aggregation', () => {
       isWorkingCopy: true,
       timestamp: '2026-10-20 14:00:00',
       description: 'Current commit',
+      commentCount: 0,
+      unresolvedCommentCount: 0,
     });
 
     vi.spyOn(jjService, 'getChangeThreads').mockResolvedValue([

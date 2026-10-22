@@ -6,9 +6,13 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
+  outputs = {
+    self,
+    nixpkgs,
+    flake-utils,
+  }:
+    flake-utils.lib.eachDefaultSystem (
+      system: let
         pkgs = nixpkgs.legacyPackages.${system};
 
         tellit-web = pkgs.buildNpmPackage rec {
@@ -17,7 +21,7 @@
           src = ./frontend;
           packageJSON = ./frontend/package.json;
           npmDepsHash = "sha256-eL/UxLcu2cqfFuTaGQkzBG1nEALCEBopIwXn7bl1Nyw=";
-          npmFlags = [ "--legacy-peer-deps" ];
+          npmFlags = ["--legacy-peer-deps"];
         };
 
         tellit-bin = pkgs.rustPlatform.buildRustPackage {
@@ -31,17 +35,16 @@
       in rec {
         packages.tellit = pkgs.symlinkJoin {
           name = "tellit-0.1.0";
-          paths = [ tellit-bin ];
-          nativeBuildInputs = [ pkgs.makeWrapper ];
+          paths = [tellit-bin];
+          nativeBuildInputs = [pkgs.makeWrapper];
           postBuild = ''
             mkdir -p $out/share/tellit/skills/tellit
             mkdir -p $out/share/tellit/web
             cp -r ${tellit-web}/lib/node_modules/difit/* $out/share/tellit/web/
             install -m 644 ${./skills/tellit/SKILL.md} $out/share/tellit/skills/tellit/SKILL.md
-            install -m 644 ${./skills/tellit.md} $out/share/tellit/skills/tellit.md
 
             wrapProgram $out/bin/tellit \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.nodejs ]} \
+              --prefix PATH : ${pkgs.lib.makeBinPath [pkgs.nodejs]} \
               --set-default TELLIT_WEB_DIR $out/share/tellit/web
           '';
         };
@@ -58,8 +61,14 @@
           ];
         };
       }
-    ) // {
-      homeModules.default = { config, lib, pkgs, ... }: {
+    )
+    // {
+      homeModules.default = {
+        config,
+        lib,
+        pkgs,
+        ...
+      }: {
         home.packages = [
           self.packages.${pkgs.system}.tellit
         ];

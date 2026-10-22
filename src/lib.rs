@@ -148,6 +148,8 @@ pub enum CommentAction {
     Reply(Reply),
     #[command(about = "Retrieve comments, commit hashes, or thread IDs")]
     Get(Get),
+    #[command(name = "get-all", about = "Get thread IDs for a change, commit, or revision as a JSON array")]
+    GetAll(GetAllArgs),
 }
 
 #[derive(Debug, Args)]
@@ -233,6 +235,34 @@ pub enum GetTarget {
 
     #[command(about = "Get thread IDs for a git commit hash")]
     Commit(GetCommitArgs),
+
+    #[command(name = "all", about = "Get thread IDs for a change, commit, or revision as a JSON array")]
+    All(GetAllArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GetAllArgs {
+    #[arg(
+        value_name = "TARGET",
+        default_value = "@",
+        help = "Change ID, commit hash, or revision (defaults to @)"
+    )]
+    pub target: String,
+
+    #[arg(
+        long,
+        alias = "unresovled",
+        conflicts_with = "resolved",
+        help = "Only return unresolved comment thread IDs"
+    )]
+    pub unresolved: bool,
+
+    #[arg(
+        long,
+        conflicts_with = "unresolved",
+        help = "Only return resolved comment thread IDs"
+    )]
+    pub resolved: bool,
 }
 
 #[derive(Debug, Args)]
@@ -767,6 +797,53 @@ pub fn get_commit_thread_infos(store: &Path, commit_query: &str) -> Result<Vec<T
     }
     threads.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
     Ok(threads)
+}
+
+pub fn get_all_threads(
+    store: &Path,
+    target: &str,
+    resolved_filter: Option<bool>,
+) -> Result<Vec<String>> {
+    if !store.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut threads = Vec::new();
+
+    // 1. Check if target matches any change directory in store
+    let change_threads = get_change_threads(store, target).unwrap_or_default();
+    if !change_threads.is_empty() {
+        threads = change_threads;
+    } else {
+        // 2. Check if target matches any commit directory in store
+        let commit_threads = get_commit_thread_infos(store, target).unwrap_or_default();
+        if !commit_threads.is_empty() {
+            threads = commit_threads;
+        } else {
+            // 3. Try resolving target as a Jujutsu revision (e.g. '@', '@-', bookmark, or revset)
+            if let Ok((change_id, commit_id)) = get_rev_info(target) {
+                let change_threads = get_change_threads(store, &change_id).unwrap_or_default();
+                if !change_threads.is_empty() {
+                    threads = change_threads;
+                } else {
+                    threads = get_commit_thread_infos(store, &commit_id).unwrap_or_default();
+                }
+            }
+        }
+    }
+
+    let mut thread_ids: Vec<String> = threads
+        .into_iter()
+        .filter(|t| match resolved_filter {
+            Some(expected) => t.resolved == expected,
+            None => true,
+        })
+        .map(|t| t.thread_id)
+        .collect();
+
+    thread_ids.sort();
+    thread_ids.dedup();
+    Ok(thread_ids)
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use tellit_cli::{
-    add_comment, get_change_commits, get_change_threads, get_commit_thread_infos,
+    add_comment, get_all_threads, get_change_commits, get_change_threads, get_commit_thread_infos,
     get_commit_threads, get_thread, get_workspace_root, locate_web_cli, reply_comment,
     resolve_comment, resolve_store, Cli, Command, CommentAction, GetTarget,
 };
@@ -125,6 +125,17 @@ fn run() -> anyhow::Result<()> {
                         if resolved { "resolved" } else { "unresolved" }
                     );
                 }
+                CommentAction::GetAll(args) => {
+                    let resolved_filter = if args.unresolved {
+                        Some(false)
+                    } else if args.resolved {
+                        Some(true)
+                    } else {
+                        None
+                    };
+                    let thread_ids = get_all_threads(&store, &args.target, resolved_filter)?;
+                    println!("{}", serde_json::to_string_pretty(&thread_ids)?);
+                }
                 CommentAction::Get(get) => match get.target {
                     GetTarget::Thread(t) => {
                         let info = get_thread(&store, &t.thread_id)?;
@@ -159,6 +170,17 @@ fn run() -> anyhow::Result<()> {
                                 }
                             }
                         }
+                    }
+                    GetTarget::All(args) => {
+                        let resolved_filter = if args.unresolved {
+                            Some(false)
+                        } else if args.resolved {
+                            Some(true)
+                        } else {
+                            None
+                        };
+                        let thread_ids = get_all_threads(&store, &args.target, resolved_filter)?;
+                        println!("{}", serde_json::to_string_pretty(&thread_ids)?);
                     }
                 },
             }

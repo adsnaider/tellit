@@ -1,8 +1,8 @@
 use std::fs;
 use tempfile::tempdir;
 use tellit_cli::{
-    get_change_commits, get_commit_threads, get_thread, reply_comment, resolve_comment, LineRange,
-    ThreadData,
+    get_all_threads, get_change_commits, get_commit_threads, get_thread, reply_comment,
+    resolve_comment, LineRange, ThreadData,
 };
 
 #[test]
@@ -79,4 +79,39 @@ fn test_full_comment_workflow() {
     // Test get commit prefix
     let threads_prefix = get_commit_threads(&store, "e9a03f48").unwrap();
     assert_eq!(threads_prefix, vec![thread_id]);
+
+    // Add a second resolved thread to test get_all_threads
+    let thread_id_2 = "b2c3d4e5-f6a7-4b5c-9d0e-1f2a3b4c5d6e";
+    let thread_file_2 = thread_dir.join(format!("{}.json", thread_id_2));
+    let data_2 = ThreadData {
+        filepath: "src/main.rs".to_string(),
+        line_range: None,
+        comments: vec!["Looks good".to_string()],
+        resolved: true,
+    };
+    fs::write(&thread_file_2, serde_json::to_vec_pretty(&data_2).unwrap()).unwrap();
+
+    // Test get_all_threads: all, unresolved, resolved
+    let all = get_all_threads(&store, change_id, None).unwrap();
+    assert_eq!(all, vec![thread_id, thread_id_2]);
+
+    let unresolved = get_all_threads(&store, change_id, Some(false)).unwrap();
+    assert_eq!(unresolved, vec![thread_id]);
+
+    let resolved = get_all_threads(&store, change_id, Some(true)).unwrap();
+    assert_eq!(resolved, vec![thread_id_2]);
+
+    // Test get_all_threads by commit
+    let commit_all = get_all_threads(&store, git_commit, None).unwrap();
+    assert_eq!(commit_all, vec![thread_id, thread_id_2]);
+
+    let commit_unresolved = get_all_threads(&store, git_commit, Some(false)).unwrap();
+    assert_eq!(commit_unresolved, vec![thread_id]);
+
+    let commit_resolved = get_all_threads(&store, git_commit, Some(true)).unwrap();
+    assert_eq!(commit_resolved, vec![thread_id_2]);
+
+    // Test get_all_threads on nonexistent target
+    let empty = get_all_threads(&store, "nonexistent", None).unwrap();
+    assert!(empty.is_empty());
 }

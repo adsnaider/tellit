@@ -119,3 +119,24 @@ tellit comment get change <CHANGE_ID> [--json]
 ```bash
 tellit comment get commit <COMMIT_HASH> [--json]
 ```
+
+#### Get All Thread IDs for a Change, Commit, or Revision (`get-all`)
+
+Retrieves a JSON array of thread IDs for a Jujutsu change ID, Git commit hash, or revision (e.g. `@`, `@-`). Ideal for agents inspecting comments in a change.
+
+```bash
+tellit comment get-all [TARGET] [--unresolved] [--resolved]
+# Or via get subcommand:
+tellit comment get all [TARGET] [--unresolved] [--resolved]
+```
+
+- `TARGET` (optional, defaults to `@`): Change ID, commit hash, or Jujutsu revision.
+- `--unresolved`: Only return unresolved comment thread IDs.
+- `--resolved`: Only return resolved comment thread IDs.
+- If neither flag is passed, returns all comment thread IDs.
+
+Example:
+```bash
+# Get all unresolved comment thread IDs in the active change (@)
+tellit comment get-all --unresolved
+```

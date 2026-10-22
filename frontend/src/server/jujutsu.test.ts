@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { JujutsuService, CommenterThreadInfo } from './jujutsu';
+import { createCommitMessageDiffFile } from './server';
 
 describe('JujutsuService comment aggregation', () => {
   let jjService: JujutsuService;
@@ -147,5 +148,56 @@ describe('JujutsuService comment aggregation', () => {
     expect(oldResolved).toBeDefined();
     expect(oldResolved?.side).toBe('new');
     expect(oldResolved?.resolved).toBe(true);
+  });
+
+  it('retrieves commit description using getCommitDescription', async () => {
+    vi.spyOn(jjService, 'runJj').mockResolvedValue('feat: test description\n\nDetailed message');
+    const desc = await jjService.getCommitDescription('@');
+    expect(desc).toBe('feat: test description\n\nDetailed message');
+  });
+
+  describe('createCommitMessageDiffFile', () => {
+    it('creates an added virtual file when base description is empty', () => {
+      const file = createCommitMessageDiffFile('', 'feat: add user login\n\nFirst line\nSecond line');
+      expect(file.path).toBe('Commit Message');
+      expect(file.status).toBe('added');
+      expect(file.additions).toBe(4);
+      expect(file.deletions).toBe(0);
+      expect(file.chunks[0].lines).toHaveLength(4);
+      expect(file.chunks[0].lines[0]).toEqual({
+        type: 'add',
+        content: 'feat: add user login',
+        newLineNumber: 1,
+      });
+    });
+
+    it('creates a normal context virtual file when base and target descriptions are identical', () => {
+      const desc = 'feat: same message';
+      const file = createCommitMessageDiffFile(desc, desc);
+      expect(file.path).toBe('Commit Message');
+      expect(file.status).toBe('modified');
+      expect(file.additions).toBe(0);
+      expect(file.deletions).toBe(0);
+      expect(file.chunks[0].lines[0]).toEqual({
+        type: 'normal',
+        content: 'feat: same message',
+        oldLineNumber: 1,
+        newLineNumber: 1,
+      });
+    });
+
+    it('creates a diff virtual file when commit messages differ across commits in a change', () => {
+      const base = 'feat: initial commit message\n\nSome body';
+      const target = 'feat: updated commit message\n\nSome body';
+      const file = createCommitMessageDiffFile(base, target);
+      expect(file.path).toBe('Commit Message');
+      expect(file.status).toBe('modified');
+      expect(file.additions).toBeGreaterThan(0);
+      expect(file.deletions).toBeGreaterThan(0);
+      const delLine = file.chunks[0].lines.find((l) => l.type === 'delete');
+      const addLine = file.chunks[0].lines.find((l) => l.type === 'add');
+      expect(delLine?.content).toBe('feat: initial commit message');
+      expect(addLine?.content).toBe('feat: updated commit message');
+    });
   });
 });

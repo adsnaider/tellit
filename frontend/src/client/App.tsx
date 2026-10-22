@@ -29,8 +29,11 @@ import { DiffViewer } from './components/DiffViewer';
 import { FileList } from './components/FileList';
 import { GitHubIcon } from './components/GitHubIcon';
 import { HelpModal } from './components/HelpModal';
-import { JjRevisionSelector } from './components/JjRevisionSelector';
-import { Logo } from './components/Logo';
+import {
+  useJjRevisions,
+  JjChangeSelector,
+  JjCommitComparisonSelector,
+} from './components/JjRevisionSelector';
 import { ReloadButton } from './components/ReloadButton';
 import { RevisionDetailModal } from './components/RevisionDetailModal';
 import { SettingsModal } from './components/SettingsModal';
@@ -1203,6 +1206,11 @@ function App() {
     [refreshJjComments],
   );
 
+  const jjRevisions = useJjRevisions({
+    currentCommitId: jjCommitId || diffData?.targetCommitish,
+    onSelectDiff: handleJjDiffChange,
+  });
+
   const handleAddComment = useCallback(
     async (
       file: string,
@@ -1332,6 +1340,7 @@ function App() {
 
   const handleOpenInEditor = useCallback(
     async (filePath: string, lineNumber: number) => {
+      if (filePath === 'Commit Message') return;
       try {
         const response = await fetch('/api/open-in-editor', {
           method: 'POST',
@@ -1440,14 +1449,6 @@ function App() {
               maxWidth: isMobile ? 'none' : isFileTreeOpen ? '600px' : 'none',
             }}
           >
-            <h1>
-              <Logo
-                style={{
-                  height: '18px',
-                  color: 'var(--color-github-text-secondary)',
-                }}
-              />
-            </h1>
             <div className="flex items-center gap-1">
               <button
                 onClick={() => setIsFileTreeOpen(!isFileTreeOpen)}
@@ -1485,6 +1486,20 @@ function App() {
             }`}
           >
             <div className={`flex flex-wrap items-center ${isMobile ? 'gap-2' : 'gap-3'}`}>
+              {isJjRepo && (
+                <JjChangeSelector
+                  changes={jjRevisions.changes}
+                  selectedChangeId={jjRevisions.selectedChangeId}
+                  onSelectChange={jjRevisions.setSelectedChangeId}
+                  isCustomInput={jjRevisions.isCustomInput}
+                  setIsCustomInput={jjRevisions.setIsCustomInput}
+                  customInput={jjRevisions.customInput}
+                  setCustomInput={jjRevisions.setCustomInput}
+                  customError={jjRevisions.customError}
+                  handleCustomSubmit={jjRevisions.handleCustomSubmit}
+                  loading={jjRevisions.loadingChanges}
+                />
+              )}
               {!isMobile && (
                 <div className="flex bg-github-bg-tertiary border border-github-border rounded-md p-1">
                   <button
@@ -1600,9 +1615,13 @@ function App() {
                 </div>
               </div>
               {isJjRepo ? (
-                <JjRevisionSelector
-                  currentCommitId={jjCommitId || diffData?.targetCommitish}
-                  onSelectDiff={handleJjDiffChange}
+                <JjCommitComparisonSelector
+                  commits={jjRevisions.commits}
+                  targetCommitId={jjRevisions.targetCommitId}
+                  baseCommitId={jjRevisions.baseCommitId}
+                  onSelectTarget={jjRevisions.handleTargetChange}
+                  onSelectBase={jjRevisions.handleBaseChange}
+                  loading={jjRevisions.loadingCommits}
                 />
               ) : revisionOptions ? (
                 <DiffQuickMenu
@@ -1786,7 +1805,11 @@ function App() {
                       onReplyToThread={handleReplyToThread}
                       onRemoveMessage={removeMessage}
                       onUpdateMessage={updateMessage}
-                      onOpenInEditor={canOpenInEditor ? handleOpenInEditor : undefined}
+                      onOpenInEditor={
+                        canOpenInEditor && file.path !== 'Commit Message'
+                          ? handleOpenInEditor
+                          : undefined
+                      }
                       syntaxTheme={settings.syntaxTheme}
                       baseCommitish={diffData.baseCommitish}
                       targetCommitish={diffData.targetCommitish}

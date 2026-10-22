@@ -294,6 +294,14 @@ export class JujutsuService {
     return result;
   }
 
+  async getCommitDescription(rev: string): Promise<string> {
+    try {
+      return await this.runJj(['log', '-r', rev, '--no-graph', '-T', 'description']);
+    } catch {
+      return '';
+    }
+  }
+
   async getDiff(targetCommitId: string, baseCommitId?: string): Promise<string> {
     if (
       baseCommitId &&

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 
 import express, { type Express } from 'express';
 import open from 'open';
+import * as Diff from 'diff';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -39,6 +40,9 @@ import {
   type DiffCommentThread,
   type DiffResponse,
   type DiffSelection,
+  type DiffFile,
+  type DiffChunk,
+  type DiffLine,
   type GeneratedStatusResponse,
   type RevisionsResponse,
 } from '@/types/diff.js';
@@ -121,6 +125,131 @@ function createResolvedCommentSelection(
 
 function createCommentSessionKey(selection: DiffSelection): string {
   return getDiffSelectionKey(selection);
+}
+
+export function createCommitMessageDiffFile(
+  baseDesc: string,
+  targetDesc: string,
+): DiffFile {
+  const normalizedBase = baseDesc.replace(/\r\n/g, '\n').trimEnd();
+  const normalizedTarget = targetDesc.replace(/\r\n/g, '\n').trimEnd();
+
+  // If both descriptions are identical (or both empty)
+  if (normalizedBase === normalizedTarget) {
+    const textToShow = normalizedTarget || '(no description set)';
+    const lines = textToShow.split('\n');
+    return {
+      path: 'Commit Message',
+      status: 'modified',
+      additions: 0,
+      deletions: 0,
+      chunks: [
+        {
+          header: `@@ -1,${lines.length} +1,${lines.length} @@`,
+          oldStart: 1,
+          oldLines: lines.length,
+          newStart: 1,
+          newLines: lines.length,
+          lines: lines.map((content, idx) => ({
+            type: 'normal',
+            content,
+            oldLineNumber: idx + 1,
+            newLineNumber: idx + 1,
+          })),
+        },
+      ],
+      isGenerated: false,
+    };
+  }
+
+  // If baseDesc is empty (e.g. diffing against parent), show all lines as added
+  if (!normalizedBase) {
+    const lines = normalizedTarget.split('\n');
+    return {
+      path: 'Commit Message',
+      status: 'added',
+      additions: lines.length,
+      deletions: 0,
+      chunks: [
+        {
+          header: `@@ -0,0 +1,${lines.length} @@`,
+          oldStart: 0,
+          oldLines: 0,
+          newStart: 1,
+          newLines: lines.length,
+          lines: lines.map((content, idx) => ({
+            type: 'add',
+            content,
+            newLineNumber: idx + 1,
+          })),
+        },
+      ],
+      isGenerated: false,
+    };
+  }
+
+  // Inter-diff: compute exact patch between base and target
+  const patch = Diff.structuredPatch(
+    'Commit Message',
+    'Commit Message',
+    `${normalizedBase}\n`,
+    `${normalizedTarget}\n`,
+    '',
+    '',
+    { context: 3 },
+  );
+
+  let additions = 0;
+  let deletions = 0;
+
+  const chunks: DiffChunk[] = patch.hunks.map((hunk) => {
+    let oldLineNum = hunk.oldStart;
+    let newLineNum = hunk.newStart;
+    const diffLines: DiffLine[] = hunk.lines.map((rawLine) => {
+      const marker = rawLine[0];
+      const content = rawLine.slice(1);
+      if (marker === '+') {
+        additions++;
+        return {
+          type: 'add',
+          content,
+          newLineNumber: newLineNum++,
+        };
+      } else if (marker === '-') {
+        deletions++;
+        return {
+          type: 'delete',
+          content,
+          oldLineNumber: oldLineNum++,
+        };
+      } else {
+        return {
+          type: 'normal',
+          content,
+          oldLineNumber: oldLineNum++,
+          newLineNumber: newLineNum++,
+        };
+      }
+    });
+
+    return {
+      header: `@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@`,
+      oldStart: hunk.oldStart,
+      oldLines: hunk.oldLines,
+      newStart: hunk.newStart,
+      newLines: hunk.newLines,
+      lines: diffLines,
+    };
+  });
+
+  return {
+    path: 'Commit Message',
+    status: 'modified',
+    additions,
+    deletions,
+    chunks,
+    isGenerated: false,
+  };
 }
 
 export async function startServer(
@@ -493,6 +622,22 @@ export async function startServer(
       }
       const rawDiff = await jjService.getDiff(commitId, baseId);
       const files = parser.parseUnifiedDiff(rawDiff);
+
+      // Prepend virtual Commit Message diff file
+      try {
+        const targetDesc = await jjService.getCommitDescription(commitId);
+        const isInterDiff = Boolean(
+          baseId &&
+          baseId !== 'parent' &&
+          !baseId.endsWith('^') &&
+          !baseId.endsWith('-')
+        );
+        const baseDesc = isInterDiff && baseId ? await jjService.getCommitDescription(baseId) : '';
+        const commitMsgFile = createCommitMessageDiffFile(baseDesc, targetDesc);
+        files.unshift(commitMsgFile);
+      } catch (err) {
+        console.error('Failed to create commit message diff:', err);
+      }
       const isInterDiff = Boolean(
         baseId &&
         baseId !== 'parent' &&
@@ -606,6 +751,10 @@ export async function startServer(
 
   app.get(/^\/api\/line-count\/(.*)$/, async (req, res) => {
     try {
+      if (req.params[0] === 'Commit Message') {
+        res.json({ oldLineCount: 0, newLineCount: 0 });
+        return;
+      }
       if (options.stdinDiff) {
         res.status(404).json({ error: 'Line count not available for stdin diff' });
         return;

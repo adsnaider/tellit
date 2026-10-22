@@ -1,25 +1,17 @@
 import {
   GitCommit,
   GitBranch,
-  MessageSquare,
-  CheckCircle2,
   ChevronDown,
-  Layers,
-  FileDiff,
+  ArrowRight,
   Search,
   X,
 } from 'lucide-react';
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef, useMemo } from 'react';
 
 import { type JjChange, type JjCommit } from '../../types/diff';
 import { useClickOutside } from '../hooks/useClickOutside';
 
-interface JjRevisionSelectorProps {
-  currentCommitId?: string;
-  onSelectDiff: (targetCommitId: string, baseCommitId?: string) => void;
-}
-
-function CommentDot({
+export function CommentDot({
   commentCount,
   unresolvedCommentCount,
 }: {
@@ -44,10 +36,15 @@ function CommentDot({
   );
 }
 
-export function JjRevisionSelector({
+export interface UseJjRevisionsProps {
+  currentCommitId?: string;
+  onSelectDiff: (targetCommitId: string, baseCommitId?: string) => void;
+}
+
+export function useJjRevisions({
   currentCommitId,
   onSelectDiff,
-}: JjRevisionSelectorProps) {
+}: UseJjRevisionsProps) {
   const [changes, setChanges] = useState<JjChange[]>([]);
   const [selectedChangeId, setSelectedChangeId] = useState<string>('');
   const [commits, setCommits] = useState<JjCommit[]>([]);
@@ -59,15 +56,7 @@ export function JjRevisionSelector({
   const [customInput, setCustomInput] = useState('');
   const [customError, setCustomError] = useState<string | null>(null);
 
-  const [isChangeOpen, setIsChangeOpen] = useState(false);
-  const [isCommitOpen, setIsCommitOpen] = useState(false);
-  const changeDropdownRef = useRef<HTMLDivElement>(null);
-  const commitDropdownRef = useRef<HTMLDivElement>(null);
-
-  useClickOutside(changeDropdownRef, () => setIsChangeOpen(false));
-  useClickOutside(commitDropdownRef, () => setIsCommitOpen(false));
-
-  // Load changes (default jj log set)
+  // Load changes
   useEffect(() => {
     let mounted = true;
     fetch('/api/jj/changes')
@@ -78,7 +67,6 @@ export function JjRevisionSelector({
         setChanges(fetchedChanges);
         setLoadingChanges(false);
 
-        // Find change matching currentCommitId or default to working copy
         if (fetchedChanges.length > 0) {
           const match = fetchedChanges.find((c) => c.commitId === currentCommitId || c.isWorkingCopy);
           const initialChange = match || fetchedChanges[0];
@@ -135,7 +123,6 @@ export function JjRevisionSelector({
         setLoadingCommits(false);
 
         if (fetchedCommits.length > 0) {
-          // If currentCommitId is in this change's commits, select it, else newest
           const match = fetchedCommits.find((c) => c.commitId === currentCommitId);
           const selectedTarget = match ? match.commitId : fetchedCommits[fetchedCommits.length - 1].commitId;
           setTargetCommitId(selectedTarget);
@@ -162,219 +149,302 @@ export function JjRevisionSelector({
     onSelectDiff(targetCommitId, newBase === 'parent' ? undefined : newBase);
   };
 
-  const setEntireChangeMode = () => {
-    setBaseCommitId('parent');
-    onSelectDiff(targetCommitId, undefined);
+  return {
+    changes,
+    selectedChangeId,
+    setSelectedChangeId,
+    commits,
+    targetCommitId,
+    baseCommitId,
+    loadingChanges,
+    loadingCommits,
+    isCustomInput,
+    setIsCustomInput,
+    customInput,
+    setCustomInput,
+    customError,
+    setCustomError,
+    handleCustomSubmit,
+    handleTargetChange,
+    handleBaseChange,
   };
+}
 
-  const setInterDiffMode = () => {
-    const currentIndex = commits.findIndex((c) => c.commitId === targetCommitId);
-    if (currentIndex > 0) {
-      const prevCommit = commits[currentIndex - 1];
-      setBaseCommitId(prevCommit.commitId);
-      onSelectDiff(targetCommitId, prevCommit.commitId);
-    }
-  };
+export interface JjChangeSelectorProps {
+  changes: JjChange[];
+  selectedChangeId: string;
+  onSelectChange: (changeId: string) => void;
+  isCustomInput: boolean;
+  setIsCustomInput: (val: boolean) => void;
+  customInput: string;
+  setCustomInput: (val: string) => void;
+  customError: string | null;
+  handleCustomSubmit: (e: React.FormEvent) => void;
+  loading?: boolean;
+}
+
+export function JjChangeSelector({
+  changes,
+  selectedChangeId,
+  onSelectChange,
+  isCustomInput,
+  setIsCustomInput,
+  customInput,
+  setCustomInput,
+  customError,
+  handleCustomSubmit,
+  loading = false,
+}: JjChangeSelectorProps) {
+  const [isOpen, setIsOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+  useClickOutside(dropdownRef, () => setIsOpen(false));
 
   const selectedChange = changes.find((c) => c.changeId === selectedChangeId);
-  const currentTargetIndex = commits.findIndex((c) => c.commitId === targetCommitId);
-  const activeCommit = currentTargetIndex >= 0 ? commits[currentTargetIndex] : null;
-  const isInterDiffActive = baseCommitId !== 'parent';
 
-  if (loadingChanges) {
-    return <div className="text-xs text-github-text-secondary">Loading revisions...</div>;
+  if (loading && changes.length === 0) {
+    return <div className="text-xs text-github-text-secondary">Loading...</div>;
   }
 
-  if (changes.length === 0) {
-    return null;
-  }
+  if (changes.length === 0) return null;
 
   return (
-    <div className="flex flex-wrap items-center gap-2 text-xs">
-      {/* Change ID Selector */}
-      <div className="relative" ref={changeDropdownRef}>
-        <div className="flex items-center gap-1.5 bg-github-bg-tertiary border border-github-border rounded px-2 py-1">
-          <GitBranch size={13} className="text-github-accent shrink-0" />
-          <span className="font-semibold text-github-text-secondary">Change:</span>
-          {isCustomInput ? (
-            <form onSubmit={handleCustomSubmit} className="flex items-center gap-1">
-              <input
-                type="text"
-                value={customInput}
-                onChange={(e) => {
-                  setCustomInput(e.target.value);
-                  setCustomError(null);
-                }}
-                placeholder="e.g. kkmpptxz or @-"
-                className="bg-github-bg-secondary text-github-text-primary text-xs font-mono px-1.5 py-0.5 rounded border border-github-border outline-none w-[150px]"
-                autoFocus
-              />
-              <button
-                type="submit"
-                className="bg-github-accent text-white px-1.5 py-0.5 rounded text-[11px] font-semibold hover:opacity-90 cursor-pointer"
-              >
-                Go
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setIsCustomInput(false);
-                  setCustomError(null);
-                }}
-                className="text-github-text-muted hover:text-github-text-primary px-0.5 cursor-pointer"
-                title="Cancel"
-              >
-                <X size={12} />
-              </button>
-              {customError && (
-                <span className="text-red-400 text-[10px] whitespace-nowrap">{customError}</span>
-              )}
-            </form>
-          ) : (
-            <div className="flex items-center gap-1">
-              <button
-                type="button"
-                onClick={() => setIsChangeOpen((prev) => !prev)}
-                className="flex items-center gap-1.5 text-github-text-primary text-xs font-mono outline-none cursor-pointer max-w-[210px] truncate hover:text-github-accent"
-                title="Select Jujutsu Change"
-              >
-                <span className="truncate">
-                  {selectedChange ? (
-                    <>
-                      {selectedChange.isWorkingCopy ? '@ ' : ''}
-                      {selectedChange.shortChangeId} {selectedChange.description.slice(0, 20)}
-                    </>
-                  ) : (
-                    'Select change...'
-                  )}
-                </span>
-                {selectedChange && (
-                  <CommentDot
-                    commentCount={selectedChange.commentCount}
-                    unresolvedCommentCount={selectedChange.unresolvedCommentCount}
-                  />
-                )}
-                <ChevronDown size={12} className="text-github-text-muted shrink-0" />
-              </button>
-              <button
-                type="button"
-                onClick={() => setIsCustomInput(true)}
-                className="text-github-text-muted hover:text-github-text-primary p-0.5 cursor-pointer"
-                title="Enter specific change ID"
-              >
-                <Search size={12} />
-              </button>
-            </div>
-          )}
-        </div>
-
-        {/* Changes Dropdown Menu */}
-        {isChangeOpen && (
-          <div className="absolute left-0 top-full mt-1 z-50 bg-github-bg-secondary border border-github-border rounded-md shadow-xl py-1 w-80 max-h-72 overflow-y-auto">
-            <div className="px-2.5 py-1 text-[11px] font-semibold text-github-text-muted uppercase tracking-wider border-b border-github-border/50">
-              Changes
-            </div>
-            {changes.map((change) => {
-              const isSelected = change.changeId === selectedChangeId;
-              return (
-                <button
-                  key={change.changeId}
-                  type="button"
-                  onClick={() => {
-                    setSelectedChangeId(change.changeId);
-                    setIsChangeOpen(false);
-                  }}
-                  className={`w-full px-2.5 py-1.5 text-left text-xs font-mono flex items-center justify-between gap-2 transition-colors cursor-pointer ${
-                    isSelected
-                      ? 'bg-github-bg-tertiary text-github-accent font-medium'
-                      : 'text-github-text-primary hover:bg-github-bg-tertiary'
-                  }`}
-                >
-                  <div className="flex items-center gap-1.5 min-w-0 truncate">
-                    <span className="text-github-accent font-bold">
-                      {change.isWorkingCopy ? '@' : '○'}
-                    </span>
-                    <span className="font-semibold text-github-text-primary">
-                      {change.shortChangeId}
-                    </span>
-                    <span className="text-github-text-secondary truncate text-[11px]">
-                      {change.description}
-                    </span>
-                  </div>
-                  <CommentDot
-                    commentCount={change.commentCount}
-                    unresolvedCommentCount={change.unresolvedCommentCount}
-                  />
-                </button>
-              );
-            })}
-            <div className="border-t border-github-border/50 mt-1 pt-1">
-              <button
-                type="button"
-                onClick={() => {
-                  setIsCustomInput(true);
-                  setIsChangeOpen(false);
-                }}
-                className="w-full px-2.5 py-1.5 text-left text-xs text-github-accent hover:bg-github-bg-tertiary flex items-center gap-1.5 cursor-pointer font-sans"
-              >
-                <Search size={12} />
-                <span>Enter Change ID / Rev...</span>
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Target Commit Selector (Chronological) */}
-      <div className="relative" ref={commitDropdownRef}>
-        <div className="flex items-center gap-1.5 bg-github-bg-tertiary border border-github-border rounded px-2 py-1">
-          <GitCommit size={13} className="text-github-text-secondary shrink-0" />
-          <span className="font-semibold text-github-text-secondary">Commit:</span>
-          {loadingCommits ? (
-            <span className="text-github-text-muted">Loading...</span>
-          ) : (
+    <div className="relative" ref={dropdownRef}>
+      <div className="flex items-center gap-1.5 bg-github-bg-tertiary border border-github-border rounded px-2 py-1 text-xs">
+        <GitBranch size={13} className="text-github-accent shrink-0" />
+        <span className="font-semibold text-github-text-secondary">Change:</span>
+        {isCustomInput ? (
+          <form onSubmit={handleCustomSubmit} className="flex items-center gap-1">
+            <input
+              type="text"
+              value={customInput}
+              onChange={(e) => setCustomInput(e.target.value)}
+              placeholder="e.g. kkmpptxz or @-"
+              className="bg-github-bg-secondary text-github-text-primary text-xs font-mono px-1.5 py-0.5 rounded border border-github-border outline-none w-[150px]"
+              autoFocus
+            />
+            <button
+              type="submit"
+              className="bg-github-accent text-white px-1.5 py-0.5 rounded text-[11px] font-semibold hover:opacity-90 cursor-pointer"
+            >
+              Go
+            </button>
             <button
               type="button"
-              onClick={() => setIsCommitOpen((prev) => !prev)}
-              className="flex items-center gap-1.5 text-github-text-primary text-xs font-mono outline-none cursor-pointer max-w-[230px] truncate hover:text-github-accent"
-              title="Select Git Commit (sorted chronologically)"
+              onClick={() => setIsCustomInput(false)}
+              className="text-github-text-muted hover:text-github-text-primary px-0.5 cursor-pointer"
+              title="Cancel"
+            >
+              <X size={12} />
+            </button>
+            {customError && (
+              <span className="text-red-400 text-[10px] whitespace-nowrap">{customError}</span>
+            )}
+          </form>
+        ) : (
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => setIsOpen((prev) => !prev)}
+              className="flex items-center gap-1.5 text-github-text-primary text-xs font-mono outline-none cursor-pointer max-w-[210px] truncate hover:text-github-accent"
+              title="Select Jujutsu Change"
             >
               <span className="truncate">
-                {activeCommit ? (
+                {selectedChange ? (
                   <>
-                    #{currentTargetIndex + 1}: {activeCommit.shortCommitId}
-                    {activeCommit.description ? ` - ${activeCommit.description.slice(0, 16)}` : ''}
+                    {selectedChange.isWorkingCopy ? '@ ' : ''}
+                    {selectedChange.shortChangeId} {selectedChange.description.slice(0, 20)}
                   </>
                 ) : (
-                  'Select commit...'
+                  'Select change...'
                 )}
               </span>
-              {activeCommit && (
+              {selectedChange && (
                 <CommentDot
-                  commentCount={activeCommit.commentCount}
-                  unresolvedCommentCount={activeCommit.unresolvedCommentCount}
+                  commentCount={selectedChange.commentCount}
+                  unresolvedCommentCount={selectedChange.unresolvedCommentCount}
                 />
               )}
               <ChevronDown size={12} className="text-github-text-muted shrink-0" />
             </button>
-          )}
-        </div>
+            <button
+              type="button"
+              onClick={() => setIsCustomInput(true)}
+              className="text-github-text-muted hover:text-github-text-primary p-0.5 cursor-pointer"
+              title="Enter specific change ID"
+            >
+              <Search size={12} />
+            </button>
+          </div>
+        )}
+      </div>
 
-        {/* Commits Dropdown Menu */}
-        {isCommitOpen && !loadingCommits && (
+      {isOpen && (
+        <div className="absolute left-0 top-full mt-1 z-50 bg-github-bg-secondary border border-github-border rounded-md shadow-xl py-1 w-80 max-h-72 overflow-y-auto">
+          <div className="px-2.5 py-1 text-[11px] font-semibold text-github-text-muted uppercase tracking-wider border-b border-github-border/50">
+            Changes
+          </div>
+          {changes.map((change) => {
+            const isSelected = change.changeId === selectedChangeId;
+            return (
+              <button
+                key={change.changeId}
+                type="button"
+                onClick={() => {
+                  onSelectChange(change.changeId);
+                  setIsOpen(false);
+                }}
+                className={`w-full px-2.5 py-1.5 text-left text-xs font-mono flex items-center justify-between gap-2 transition-colors cursor-pointer ${
+                  isSelected
+                    ? 'bg-github-bg-tertiary text-github-accent font-medium'
+                    : 'text-github-text-primary hover:bg-github-bg-tertiary'
+                }`}
+              >
+                <div className="flex items-center gap-1.5 min-w-0 truncate">
+                  <span className="text-github-accent font-bold">
+                    {change.isWorkingCopy ? '@' : '○'}
+                  </span>
+                  <span className="font-semibold text-github-text-primary">
+                    {change.shortChangeId}
+                  </span>
+                  <span className="text-github-text-secondary truncate text-[11px]">
+                    {change.description}
+                  </span>
+                </div>
+                <CommentDot
+                  commentCount={change.commentCount}
+                  unresolvedCommentCount={change.unresolvedCommentCount}
+                />
+              </button>
+            );
+          })}
+          <div className="border-t border-github-border/50 mt-1 pt-1">
+            <button
+              type="button"
+              onClick={() => {
+                setIsCustomInput(true);
+                setIsOpen(false);
+              }}
+              className="w-full px-2.5 py-1.5 text-left text-xs text-github-accent hover:bg-github-bg-tertiary flex items-center gap-1.5 cursor-pointer font-sans"
+            >
+              <Search size={12} />
+              <span>Enter Change ID / Rev...</span>
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export interface JjCommitComparisonSelectorProps {
+  commits: JjCommit[];
+  targetCommitId: string;
+  baseCommitId: string;
+  onSelectTarget: (targetId: string) => void;
+  onSelectBase: (baseId: string) => void;
+  loading?: boolean;
+}
+
+export function JjCommitComparisonSelector({
+  commits,
+  targetCommitId,
+  baseCommitId,
+  onSelectTarget,
+  onSelectBase,
+  loading = false,
+}: JjCommitComparisonSelectorProps) {
+  const [isFromOpen, setIsFromOpen] = useState(false);
+  const [isToOpen, setIsToOpen] = useState(false);
+  const fromDropdownRef = useRef<HTMLDivElement>(null);
+  const toDropdownRef = useRef<HTMLDivElement>(null);
+
+  useClickOutside(fromDropdownRef, () => setIsFromOpen(false));
+  useClickOutside(toDropdownRef, () => setIsToOpen(false));
+
+  // Reverse chronological order for dropdown menus (top is latest commit)
+  const reversedCommits = useMemo(() => {
+    return commits
+      .map((commit, originalIndex) => ({
+        commit,
+        commitNumber: originalIndex + 1,
+      }))
+      .reverse();
+  }, [commits]);
+
+  const activeTargetIndex = commits.findIndex((c) => c.commitId === targetCommitId);
+  const activeTargetCommit = activeTargetIndex >= 0 ? commits[activeTargetIndex] : null;
+
+  const activeBaseIndex = commits.findIndex((c) => c.commitId === baseCommitId);
+  const activeBaseCommit = activeBaseIndex >= 0 ? commits[activeBaseIndex] : null;
+  const isBaseParent = baseCommitId === 'parent';
+
+  if (loading && commits.length === 0) {
+    return <div className="text-xs text-github-text-secondary">Loading commits...</div>;
+  }
+
+  if (commits.length === 0) return null;
+
+  return (
+    <div className="flex items-center gap-1.5 text-xs font-mono">
+      {/* From (Diff Base) Selector */}
+      <div className="relative" ref={fromDropdownRef}>
+        <button
+          type="button"
+          onClick={() => setIsFromOpen((prev) => !prev)}
+          className="flex items-center gap-1.5 bg-github-bg-tertiary border border-github-border rounded px-2 py-1 text-github-text-primary hover:text-github-accent cursor-pointer max-w-[190px] truncate"
+          title="Select diff base revision (From)"
+        >
+          <span className="truncate">
+            {isBaseParent || !activeBaseCommit ? (
+              'Parent'
+            ) : (
+              <>#{activeBaseIndex + 1}: {activeBaseCommit.shortCommitId}</>
+            )}
+          </span>
+          {activeBaseCommit && !isBaseParent && (
+            <CommentDot
+              commentCount={activeBaseCommit.commentCount}
+              unresolvedCommentCount={activeBaseCommit.unresolvedCommentCount}
+            />
+          )}
+          <ChevronDown size={12} className="text-github-text-muted shrink-0" />
+        </button>
+
+        {isFromOpen && (
           <div className="absolute left-0 top-full mt-1 z-50 bg-github-bg-secondary border border-github-border rounded-md shadow-xl py-1 w-84 max-h-72 overflow-y-auto">
             <div className="px-2.5 py-1 text-[11px] font-semibold text-github-text-muted uppercase tracking-wider border-b border-github-border/50">
-              Commits in change ({commits.length})
+              Diff Base (From)
             </div>
-            {commits.map((commit, index) => {
-              const isSelected = commit.commitId === targetCommitId;
+            {/* Parent option */}
+            <button
+              type="button"
+              onClick={() => {
+                onSelectBase('parent');
+                setIsFromOpen(false);
+              }}
+              className={`w-full px-2.5 py-1.5 text-left text-xs font-mono flex items-center justify-between gap-2 transition-colors cursor-pointer ${
+                isBaseParent
+                  ? 'bg-github-bg-tertiary text-github-accent font-medium'
+                  : 'text-github-text-primary hover:bg-github-bg-tertiary'
+              }`}
+            >
+              <div className="flex items-center gap-1.5 min-w-0">
+                <span className="font-semibold text-github-text-primary">Parent</span>
+                <span className="text-github-text-secondary text-[11px]">(Entire Change)</span>
+              </div>
+            </button>
+
+            {/* Commits in reverse chronological order */}
+            {reversedCommits.map(({ commit, commitNumber }) => {
+              const isSelected = !isBaseParent && commit.commitId === baseCommitId;
+              const isTarget = commit.commitId === targetCommitId;
               return (
                 <button
                   key={commit.commitId}
                   type="button"
                   onClick={() => {
-                    handleTargetChange(commit.commitId);
-                    setIsCommitOpen(false);
+                    onSelectBase(commit.commitId);
+                    setIsFromOpen(false);
                   }}
                   className={`w-full px-2.5 py-1.5 text-left text-xs font-mono flex items-center justify-between gap-2 transition-colors cursor-pointer ${
                     isSelected
@@ -384,7 +454,90 @@ export function JjRevisionSelector({
                 >
                   <div className="flex items-center gap-1.5 min-w-0 truncate">
                     <span className="text-github-text-muted shrink-0 text-[10px]">
-                      #{index + 1}
+                      #{commitNumber}
+                    </span>
+                    <span className="font-semibold text-github-text-primary shrink-0">
+                      {commit.shortCommitId}
+                    </span>
+                    {commit.timestamp && (
+                      <span className="text-github-text-muted shrink-0 text-[10px]">
+                        [{commit.timestamp.slice(5, 16)}]
+                      </span>
+                    )}
+                    <span className="text-github-text-secondary truncate text-[11px]">
+                      {commit.description}
+                    </span>
+                    {isTarget && (
+                      <span className="text-[10px] text-github-text-muted italic shrink-0">(head)</span>
+                    )}
+                  </div>
+                  <CommentDot
+                    commentCount={commit.commentCount}
+                    unresolvedCommentCount={commit.unresolvedCommentCount}
+                  />
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Right Arrow */}
+      <ArrowRight size={13} className="text-github-text-muted shrink-0" />
+
+      {/* To (Diff Head / Target) Selector */}
+      <div className="relative" ref={toDropdownRef}>
+        <button
+          type="button"
+          onClick={() => setIsToOpen((prev) => !prev)}
+          className="flex items-center gap-1.5 bg-github-bg-tertiary border border-github-border rounded px-2 py-1 text-github-text-primary hover:text-github-accent cursor-pointer max-w-[240px] truncate"
+          title="Select diff head revision (To)"
+        >
+          <GitCommit size={13} className="text-github-text-secondary shrink-0" />
+          <span className="truncate">
+            {activeTargetCommit ? (
+              <>
+                #{activeTargetIndex + 1}: {activeTargetCommit.shortCommitId}
+                {activeTargetCommit.description ? ` - ${activeTargetCommit.description.slice(0, 16)}` : ''}
+              </>
+            ) : (
+              'Select commit...'
+            )}
+          </span>
+          {activeTargetCommit && (
+            <CommentDot
+              commentCount={activeTargetCommit.commentCount}
+              unresolvedCommentCount={activeTargetCommit.unresolvedCommentCount}
+            />
+          )}
+          <ChevronDown size={12} className="text-github-text-muted shrink-0" />
+        </button>
+
+        {isToOpen && (
+          <div className="absolute right-0 top-full mt-1 z-50 bg-github-bg-secondary border border-github-border rounded-md shadow-xl py-1 w-84 max-h-72 overflow-y-auto">
+            <div className="px-2.5 py-1 text-[11px] font-semibold text-github-text-muted uppercase tracking-wider border-b border-github-border/50">
+              Diff Head / Commits ({commits.length})
+            </div>
+            {/* Commits in reverse chronological order */}
+            {reversedCommits.map(({ commit, commitNumber }) => {
+              const isSelected = commit.commitId === targetCommitId;
+              return (
+                <button
+                  key={commit.commitId}
+                  type="button"
+                  onClick={() => {
+                    onSelectTarget(commit.commitId);
+                    setIsToOpen(false);
+                  }}
+                  className={`w-full px-2.5 py-1.5 text-left text-xs font-mono flex items-center justify-between gap-2 transition-colors cursor-pointer ${
+                    isSelected
+                      ? 'bg-github-bg-tertiary text-github-accent font-medium'
+                      : 'text-github-text-primary hover:bg-github-bg-tertiary'
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5 min-w-0 truncate">
+                    <span className="text-github-text-muted shrink-0 text-[10px]">
+                      #{commitNumber}
                     </span>
                     <span className="font-semibold text-github-text-primary shrink-0">
                       {commit.shortCommitId}
@@ -408,92 +561,41 @@ export function JjRevisionSelector({
           </div>
         )}
       </div>
+    </div>
+  );
+}
 
-      {/* Compare Mode Presets: Entire Change vs Inter-Diff */}
-      {commits.length > 1 && (
-        <div className="flex items-center bg-github-bg-tertiary border border-github-border rounded p-0.5">
-          <button
-            type="button"
-            onClick={setEntireChangeMode}
-            className={`px-2 py-0.5 rounded text-xs transition-colors flex items-center gap-1 cursor-pointer ${
-              !isInterDiffActive
-                ? 'bg-github-bg-primary text-github-text-primary font-medium shadow-sm'
-                : 'text-github-text-secondary hover:text-github-text-primary'
-            }`}
-            title="View entire change against parent revision"
-          >
-            <Layers size={12} />
-            <span>Entire Change</span>
-          </button>
-          <button
-            type="button"
-            onClick={setInterDiffMode}
-            disabled={currentTargetIndex <= 0}
-            className={`px-2 py-0.5 rounded text-xs transition-colors flex items-center gap-1 ${
-              isInterDiffActive
-                ? 'bg-github-bg-primary text-github-accent font-medium shadow-sm cursor-pointer'
-                : currentTargetIndex > 0
-                  ? 'text-github-text-secondary hover:text-github-text-primary cursor-pointer'
-                  : 'text-github-text-muted opacity-50 cursor-not-allowed'
-            }`}
-            title={currentTargetIndex > 0 ? 'View diff between this commit and previous update' : 'First commit in change (no prior update)'}
-          >
-            <FileDiff size={12} />
-            <span>Update Diff</span>
-          </button>
-        </div>
-      )}
+export function JjRevisionSelector({
+  currentCommitId,
+  onSelectDiff,
+}: {
+  currentCommitId?: string;
+  onSelectDiff: (targetCommitId: string, baseCommitId?: string) => void;
+}) {
+  const revisions = useJjRevisions({ currentCommitId, onSelectDiff });
 
-      {/* Base / Compare Against Selector (When multiple commits exist) */}
-      {commits.length > 1 && (
-        <div className="flex items-center gap-1 bg-github-bg-tertiary border border-github-border rounded px-2 py-1">
-          <span className="font-semibold text-github-text-secondary">vs:</span>
-          <select
-            value={baseCommitId}
-            onChange={(e) => handleBaseChange(e.target.value)}
-            className="bg-transparent text-github-text-primary text-xs font-mono outline-none cursor-pointer max-w-[170px] truncate"
-            title="Compare against base revision"
-          >
-            <option value="parent" className="bg-github-bg-secondary text-github-text-primary">
-              Parent (Entire Change)
-            </option>
-            {commits
-              .filter((c) => c.commitId !== targetCommitId)
-              .map((commit, index) => (
-                <option key={commit.commitId} value={commit.commitId} className="bg-github-bg-secondary text-github-text-primary font-mono">
-                  #{index + 1}: {commit.shortCommitId} {commit.timestamp ? `[${commit.timestamp.slice(5, 16)}]` : ''}
-                </option>
-              ))}
-          </select>
-        </div>
-      )}
-
-      {/* Commit Comment Indicator Badge */}
-      {(() => {
-        if (!activeCommit || activeCommit.commentCount === 0) return null;
-        return (
-          <div
-            className={`flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium border ${
-              activeCommit.unresolvedCommentCount > 0
-                ? 'bg-yellow-500/10 text-yellow-400 border-yellow-500/30'
-                : 'bg-zinc-500/10 text-zinc-400 border-zinc-500/30'
-            }`}
-            title={`${activeCommit.commentCount} total comments, ${activeCommit.unresolvedCommentCount} unresolved`}
-          >
-            {activeCommit.unresolvedCommentCount > 0 ? (
-              <>
-                <MessageSquare size={11} />
-                <span>{activeCommit.unresolvedCommentCount} open</span>
-              </>
-            ) : (
-              <>
-                <CheckCircle2 size={11} />
-                <span>All resolved</span>
-              </>
-            )}
-          </div>
-        );
-      })()}
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <JjChangeSelector
+        changes={revisions.changes}
+        selectedChangeId={revisions.selectedChangeId}
+        onSelectChange={revisions.setSelectedChangeId}
+        isCustomInput={revisions.isCustomInput}
+        setIsCustomInput={revisions.setIsCustomInput}
+        customInput={revisions.customInput}
+        setCustomInput={revisions.setCustomInput}
+        customError={revisions.customError}
+        handleCustomSubmit={revisions.handleCustomSubmit}
+        loading={revisions.loadingChanges}
+      />
+      <JjCommitComparisonSelector
+        commits={revisions.commits}
+        targetCommitId={revisions.targetCommitId}
+        baseCommitId={revisions.baseCommitId}
+        onSelectTarget={revisions.handleTargetChange}
+        onSelectBase={revisions.handleBaseChange}
+        loading={revisions.loadingCommits}
+      />
     </div>
   );
 }

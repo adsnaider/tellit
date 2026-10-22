@@ -7,6 +7,7 @@ import {
   FilePen,
   FilePlus,
   FileX,
+  GitCommit,
   Square,
 } from 'lucide-react';
 import { useState } from 'react';
@@ -25,7 +26,10 @@ interface DiffViewerHeaderProps {
   onToggleReviewed: (path: string) => void;
 }
 
-const getFileIcon = (status: DiffFile['status']) => {
+const getFileIcon = (path: string, status: DiffFile['status']) => {
+  if (path === 'Commit Message') {
+    return <GitCommit size={16} className="text-github-accent" />;
+  }
   switch (status) {
     case 'added':
       return <FilePlus size={16} className="text-github-accent" />;
@@ -75,7 +79,7 @@ export const DiffViewerHeader = ({
         >
           {isCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
         </button>
-        {getFileIcon(file.status)}
+        {getFileIcon(file.path, file.status)}
         <h2 className="text-sm font-mono text-github-text-primary m-0 overflow-hidden text-ellipsis whitespace-nowrap">
           {file.path}
         </h2>

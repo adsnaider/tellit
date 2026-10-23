@@ -5,3 +5,4 @@ frontend/dist/
 frontend/public/site-data/
 .comments/
 .tellit/
+.envrc

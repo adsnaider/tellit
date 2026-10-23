@@ -61,6 +61,9 @@ export interface DiffResponse {
   repositoryId?: string;
   commentImports?: CommentImport[];
   commentImportId?: string;
+  isRebaseDiff?: boolean;
+  rebaseIgnored?: boolean;
+  rebaseConflict?: boolean;
 }
 
 export interface GeneratedStatusResponse {

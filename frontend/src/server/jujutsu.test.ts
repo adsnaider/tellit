@@ -200,4 +200,106 @@ describe('JujutsuService comment aggregation', () => {
       expect(addLine?.content).toBe('feat: updated commit message');
     });
   });
+
+  describe('JujutsuService rebase diff isolation', () => {
+    it('returns standard diff for commit vs parent', async () => {
+      vi.spyOn(jjService, 'runJj').mockResolvedValue('diff --git a/test.txt b/test.txt\n...');
+      const res = await jjService.getDiff('commit-target');
+      expect(res.rawDiff).toContain('diff --git');
+      expect(res.isRebaseDiff).toBe(false);
+      expect(res.rebaseIgnored).toBe(false);
+    });
+
+    it('isolates upstream rebase changes using 3-way git merge-tree when parents differ within same change', async () => {
+      const c1 = '1111111111111111111111111111111111111111';
+      const c2 = '2222222222222222222222222222222222222222';
+      const p1 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+      const p2 = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+      const changeId = 'cccccccccccccccccccccccccccccccc';
+
+      const logOutput = `${c1}\t${changeId}\t${p1}\n${c2}\t${changeId}\t${p2}\n`;
+
+      vi.spyOn(jjService, 'runJj').mockImplementation(async (args) => {
+        if (args.includes('log')) {
+          return logOutput;
+        }
+        return 'fallback diff';
+      });
+
+      const virtualTreeOid = '3333333333333333333333333333333333333333';
+      const gitSpy = vi.spyOn(jjService, 'runGit').mockImplementation(async (args) => {
+        if (args[0] === 'merge-tree') {
+          expect(args).toEqual(['merge-tree', '--write-tree', '--merge-base', p1, p2, c1]);
+          return { stdout: `${virtualTreeOid}\n`, stderr: '', exitCode: 0 };
+        }
+        if (args[0] === 'diff') {
+          expect(args).toEqual(['diff', '--no-color', '--no-ext-diff', virtualTreeOid, c2]);
+          return { stdout: 'diff --git a/only-author.txt b/only-author.txt\n', stderr: '', exitCode: 0 };
+        }
+        return { stdout: '', stderr: '', exitCode: 1 };
+      });
+
+      const res = await jjService.getDiff(c2, c1, true);
+      expect(gitSpy).toHaveBeenCalledTimes(2);
+      expect(res.isRebaseDiff).toBe(true);
+      expect(res.rebaseIgnored).toBe(true);
+      expect(res.rebaseConflict).toBe(false);
+      expect(res.rawDiff).toContain('only-author.txt');
+    });
+
+    it('falls back gracefully to direct diff when merge-tree encounters a rebase conflict', async () => {
+      const c1 = '1111111111111111111111111111111111111111';
+      const c2 = '2222222222222222222222222222222222222222';
+      const p1 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+      const p2 = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+      const changeId = 'cccccccccccccccccccccccccccccccc';
+
+      const logOutput = `${c1}\t${changeId}\t${p1}\n${c2}\t${changeId}\t${p2}\n`;
+
+      vi.spyOn(jjService, 'runJj').mockImplementation(async (args) => {
+        if (args.includes('log')) {
+          return logOutput;
+        }
+        return 'direct diff with rebase conflicts';
+      });
+
+      vi.spyOn(jjService, 'runGit').mockResolvedValue({
+        stdout: 'conflict info',
+        stderr: 'conflict',
+        exitCode: 1,
+      });
+
+      const res = await jjService.getDiff(c2, c1, true);
+      expect(res.isRebaseDiff).toBe(true);
+      expect(res.rebaseIgnored).toBe(false);
+      expect(res.rebaseConflict).toBe(true);
+      expect(res.rawDiff).toBe('direct diff with rebase conflicts');
+    });
+
+    it('honors ignoreRebase=false to show the full direct diff including rebase changes', async () => {
+      const c1 = '1111111111111111111111111111111111111111';
+      const c2 = '2222222222222222222222222222222222222222';
+      const p1 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+      const p2 = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+      const changeId = 'cccccccccccccccccccccccccccccccc';
+
+      const logOutput = `${c1}\t${changeId}\t${p1}\n${c2}\t${changeId}\t${p2}\n`;
+
+      vi.spyOn(jjService, 'runJj').mockImplementation(async (args) => {
+        if (args.includes('log')) {
+          return logOutput;
+        }
+        return 'full direct diff with upstream';
+      });
+
+      const gitSpy = vi.spyOn(jjService, 'runGit');
+
+      const res = await jjService.getDiff(c2, c1, false);
+      expect(res.isRebaseDiff).toBe(true);
+      expect(res.rebaseIgnored).toBe(false);
+      expect(res.rebaseConflict).toBe(false);
+      expect(res.rawDiff).toBe('full direct diff with upstream');
+      expect(gitSpy).not.toHaveBeenCalled();
+    });
+  });
 });

@@ -6,6 +6,9 @@ import {
   Search,
   X,
   CheckCircle2,
+  Check,
+  GitMerge,
+  AlertTriangle,
 } from 'lucide-react';
 import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react';
 
@@ -57,7 +60,7 @@ export function CommentDot({
 
 export interface UseJjRevisionsProps {
   currentCommitId?: string;
-  onSelectDiff: (targetCommitId: string, baseCommitId?: string) => void;
+  onSelectDiff: (targetCommitId: string, baseCommitId?: string, ignoreRebase?: boolean) => void;
 }
 
 export function useJjRevisions({
@@ -69,6 +72,7 @@ export function useJjRevisions({
   const [commits, setCommits] = useState<JjCommit[]>([]);
   const [targetCommitId, setTargetCommitId] = useState<string>('');
   const [baseCommitId, setBaseCommitId] = useState<string>('parent');
+  const [ignoreRebase, setIgnoreRebase] = useState<boolean>(true);
   const [loadingChanges, setLoadingChanges] = useState(true);
   const [loadingCommits, setLoadingCommits] = useState(false);
   const [isCustomInput, setIsCustomInput] = useState(false);
@@ -185,12 +189,18 @@ export function useJjRevisions({
 
   const handleTargetChange = (newTarget: string) => {
     setTargetCommitId(newTarget);
-    onSelectDiff(newTarget, baseCommitId === 'parent' ? undefined : baseCommitId);
+    onSelectDiff(newTarget, baseCommitId === 'parent' ? undefined : baseCommitId, ignoreRebase);
   };
 
   const handleBaseChange = (newBase: string) => {
     setBaseCommitId(newBase);
-    onSelectDiff(targetCommitId, newBase === 'parent' ? undefined : newBase);
+    onSelectDiff(targetCommitId, newBase === 'parent' ? undefined : newBase, ignoreRebase);
+  };
+
+  const handleToggleIgnoreRebase = () => {
+    const nextVal = !ignoreRebase;
+    setIgnoreRebase(nextVal);
+    onSelectDiff(targetCommitId, baseCommitId === 'parent' ? undefined : baseCommitId, nextVal);
   };
 
   const handleToggleApprove = async (commitId: string, currentApproved: boolean) => {
@@ -216,6 +226,7 @@ export function useJjRevisions({
     commits,
     targetCommitId,
     baseCommitId,
+    ignoreRebase,
     loadingChanges,
     loadingCommits,
     isCustomInput,
@@ -227,6 +238,7 @@ export function useJjRevisions({
     handleCustomSubmit,
     handleTargetChange,
     handleBaseChange,
+    handleToggleIgnoreRebase,
     handleToggleApprove,
   };
 }
@@ -406,6 +418,11 @@ export interface JjCommitComparisonSelectorProps {
   onSelectTarget: (targetId: string) => void;
   onSelectBase: (baseId: string) => void;
   onToggleApprove?: (commitId: string, currentApproved: boolean) => void;
+  isRebaseDiff?: boolean;
+  rebaseIgnored?: boolean;
+  rebaseConflict?: boolean;
+  ignoreRebase?: boolean;
+  onToggleIgnoreRebase?: () => void;
   loading?: boolean;
 }
 
@@ -416,6 +433,11 @@ export function JjCommitComparisonSelector({
   onSelectTarget,
   onSelectBase,
   onToggleApprove,
+  isRebaseDiff,
+  rebaseIgnored,
+  rebaseConflict,
+  ignoreRebase = true,
+  onToggleIgnoreRebase,
   loading = false,
 }: JjCommitComparisonSelectorProps) {
   const [isFromOpen, setIsFromOpen] = useState(false);
@@ -630,6 +652,45 @@ export function JjCommitComparisonSelector({
           </div>
         )}
       </div>
+
+      {/* Rebase Diff Filter Toggle */}
+      {isRebaseDiff && onToggleIgnoreRebase && (
+        <button
+          type="button"
+          onClick={onToggleIgnoreRebase}
+          className={`flex items-center gap-1 px-2 py-1 rounded text-xs font-sans font-medium border transition-colors cursor-pointer ${
+            rebaseConflict
+              ? 'bg-yellow-500/15 text-yellow-400 border-yellow-500/30 hover:bg-yellow-500/25'
+              : rebaseIgnored
+              ? 'bg-blue-500/15 text-blue-400 border-blue-500/30 hover:bg-blue-500/25'
+              : 'bg-github-bg-tertiary text-github-text-secondary border-github-border hover:text-github-text-primary'
+          }`}
+          title={
+            rebaseConflict
+              ? 'Rebase conflict detected — showing full diff including upstream changes.'
+              : rebaseIgnored
+              ? 'Upstream rebase/squash changes are hidden. Click to show full diff.'
+              : 'Showing full diff including upstream changes. Click to hide rebase changes.'
+          }
+        >
+          {rebaseConflict ? (
+            <>
+              <AlertTriangle size={12} className="text-yellow-400 shrink-0" />
+              <span>Rebase conflict</span>
+            </>
+          ) : rebaseIgnored ? (
+            <>
+              <Check size={12} className="text-blue-400 shrink-0" />
+              <span>Rebase hidden</span>
+            </>
+          ) : (
+            <>
+              <GitMerge size={12} className="text-github-text-secondary shrink-0" />
+              <span>Show rebase</span>
+            </>
+          )}
+        </button>
+      )}
 
       {/* Approve Button */}
       {onToggleApprove && activeTargetCommit && (

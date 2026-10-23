@@ -634,11 +634,13 @@ export async function startServer(
     try {
       const commitId = (req.query.target || req.query.commit) as string;
       const baseId = req.query.base as string | undefined;
+      const ignoreRebase = req.query.ignoreRebase !== 'false';
       if (!commitId) {
         res.status(400).json({ error: 'Commit ID is required' });
         return;
       }
-      const rawDiff = await jjService.getDiff(commitId, baseId);
+      const diffResult = await jjService.getDiff(commitId, baseId, ignoreRebase);
+      const rawDiff = diffResult.rawDiff;
       const files = parser.parseUnifiedDiff(rawDiff);
 
       // Prepend virtual Commit Message diff file
@@ -674,6 +676,9 @@ export async function startServer(
         requestedTargetCommitish: commitId,
         openInEditorAvailable: true,
         repositoryId,
+        isRebaseDiff: diffResult.isRebaseDiff,
+        rebaseIgnored: diffResult.rebaseIgnored,
+        rebaseConflict: diffResult.rebaseConflict,
       });
     } catch (error) {
       console.error('Error getting jj diff:', error);

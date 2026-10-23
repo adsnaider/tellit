@@ -1,4 +1,4 @@
-import { Columns, AlignLeft, Settings, PanelLeftClose, PanelLeft, Keyboard, MessageSquare } from 'lucide-react';
+import { Columns, AlignLeft, Settings, PanelLeftClose, PanelLeft, Keyboard, MessageSquare, AlertTriangle } from 'lucide-react';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 
 import {
@@ -1184,15 +1184,19 @@ function App() {
   }, [diffData?.baseCommitish, diffData?.targetCommitish, refreshJjComments]);
 
   const handleJjDiffChange = useCallback(
-    async (targetCommitId: string, baseCommitId?: string) => {
+    async (targetCommitId: string, baseCommitId?: string, ignoreRebase = true) => {
       setJjCommitId(targetCommitId);
       setJjBaseCommitId(baseCommitId);
       try {
-        const url =
-          baseCommitId && baseCommitId !== 'parent'
-            ? `/api/jj/diff?target=${encodeURIComponent(targetCommitId)}&base=${encodeURIComponent(baseCommitId)}`
-            : `/api/jj/diff?commit=${encodeURIComponent(targetCommitId)}`;
-        const diffRes = await fetch(url);
+        const queryParams = new URLSearchParams();
+        queryParams.set('target', targetCommitId);
+        if (baseCommitId && baseCommitId !== 'parent') {
+          queryParams.set('base', baseCommitId);
+        }
+        if (ignoreRebase !== undefined) {
+          queryParams.set('ignoreRebase', String(ignoreRebase));
+        }
+        const diffRes = await fetch(`/api/jj/diff?${queryParams.toString()}`);
         if (diffRes.ok) {
           const newDiff = (await diffRes.json()) as DiffResponse;
           setDiffData(newDiff);
@@ -1612,6 +1616,11 @@ function App() {
                   onSelectTarget={jjRevisions.handleTargetChange}
                   onSelectBase={jjRevisions.handleBaseChange}
                   onToggleApprove={jjRevisions.handleToggleApprove}
+                  isRebaseDiff={diffData?.isRebaseDiff}
+                  rebaseIgnored={diffData?.rebaseIgnored}
+                  rebaseConflict={diffData?.rebaseConflict}
+                  ignoreRebase={jjRevisions.ignoreRebase}
+                  onToggleIgnoreRebase={jjRevisions.handleToggleIgnoreRebase}
                   loading={jjRevisions.loadingCommits}
                 />
               ) : revisionOptions ? (
@@ -1644,6 +1653,12 @@ function App() {
             </div>
           </div>
         </header>
+        {diffData?.rebaseConflict && (
+          <div className="bg-yellow-500/10 border-b border-yellow-500/30 px-4 py-2 text-xs text-yellow-300 flex items-center gap-2">
+            <AlertTriangle size={14} className="shrink-0 text-yellow-400" />
+            <span>Rebase conflict detected between patchsets — displaying full diff including upstream changes.</span>
+          </div>
+        )}
         {revisionOptions && (
           <RevisionDetailModal
             key={isRevisionModalOpen ? getDiffSelectionKey(selectedRevision) : 'closed'}

@@ -41,6 +41,13 @@ export interface CommenterThreadInfo {
   side?: 'old' | 'new';
 }
 
+export interface JjDiffResult {
+  rawDiff: string;
+  isRebaseDiff: boolean;
+  rebaseIgnored: boolean;
+  rebaseConflict: boolean;
+}
+
 export class JujutsuService {
   private repoDir: string;
   private jjBin: string = 'jj-for-agents';
@@ -86,6 +93,22 @@ export class JujutsuService {
   async runTellit(args: string[]): Promise<string> {
     const { stdout } = await execFileAsync(this.tellitBin, ['comment', ...args], { cwd: this.repoDir });
     return stdout.trim();
+  }
+
+  async runGit(args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    try {
+      const { stdout, stderr } = await execFileAsync('git', args, {
+        cwd: this.repoDir,
+        maxBuffer: 20 * 1024 * 1024,
+      });
+      return { stdout: stdout.toString(), stderr: stderr.toString(), exitCode: 0 };
+    } catch (error: any) {
+      return {
+        stdout: error.stdout?.toString() || '',
+        stderr: error.stderr?.toString() || '',
+        exitCode: typeof error.code === 'number' ? error.code : 1,
+      };
+    }
   }
 
   async isJjRepo(): Promise<boolean> {
@@ -338,20 +361,143 @@ export class JujutsuService {
     }
   }
 
-  async getDiff(targetCommitId: string, baseCommitId?: string): Promise<string> {
-    if (
+  async getDiff(
+    targetCommitId: string,
+    baseCommitId?: string,
+    ignoreRebase = true,
+  ): Promise<JjDiffResult> {
+    const isInterDiff = Boolean(
       baseCommitId &&
       baseCommitId !== 'parent' &&
       baseCommitId !== `${targetCommitId}-` &&
       baseCommitId !== `${targetCommitId}^`
-    ) {
-      return await this.runJj(['diff', '--from', baseCommitId, '--to', targetCommitId, '--git']);
+    );
+
+    if (!isInterDiff || !baseCommitId) {
+      const rawDiff = await this.runJj(['diff', '-r', targetCommitId, '--git']);
+      return {
+        rawDiff,
+        isRebaseDiff: false,
+        rebaseIgnored: false,
+        rebaseConflict: false,
+      };
     }
-    return await this.runJj(['diff', '-r', targetCommitId, '--git']);
+
+    // Check if baseCommitId and targetCommitId belong to the same change
+    try {
+      const template = 'commit_id ++ "\t" ++ change_id ++ "\t" ++ parents.map(|p| p.commit_id()).join(",") ++ "\n"';
+      const logOutput = await this.runJj([
+        'log',
+        '-r',
+        `${baseCommitId} | ${targetCommitId}`,
+        '--no-graph',
+        '-T',
+        template,
+      ]);
+
+      const lines = logOutput.trim().split('\n').filter((l) => l.trim().length > 0);
+      const commitInfoMap = new Map<string, { changeId: string; parents: string[] }>();
+      for (const line of lines) {
+        const [cid, chid, parentsRaw] = line.split('\t');
+        if (cid && chid) {
+          commitInfoMap.set(cid, {
+            changeId: chid,
+            parents: parentsRaw ? parentsRaw.split(',').filter(Boolean) : [],
+          });
+        }
+      }
+
+      // Find matching base and target by prefix or exact match
+      const baseEntry = Array.from(commitInfoMap.entries()).find(
+        ([cid]) => cid === baseCommitId || cid.startsWith(baseCommitId) || baseCommitId.startsWith(cid),
+      );
+      const targetEntry = Array.from(commitInfoMap.entries()).find(
+        ([cid]) => cid === targetCommitId || cid.startsWith(targetCommitId) || targetCommitId.startsWith(cid),
+      );
+
+      if (baseEntry && targetEntry && baseEntry[1].changeId === targetEntry[1].changeId) {
+        const baseParents = baseEntry[1].parents;
+        const targetParents = targetEntry[1].parents;
+
+        // If both have single parents and those parents are different -> rebase occurred!
+        if (
+          baseParents.length === 1 &&
+          targetParents.length === 1 &&
+          baseParents[0] !== targetParents[0]
+        ) {
+          if (ignoreRebase) {
+            const p1 = baseParents[0];
+            const p2 = targetParents[0];
+            const c1 = baseEntry[0];
+            const c2 = targetEntry[0];
+
+            // In-memory 3-way merge: rebase c1 onto p2 using merge-base p1
+            const mergeResult = await this.runGit([
+              'merge-tree',
+              '--write-tree',
+              '--merge-base',
+              p1,
+              p2,
+              c1,
+            ]);
+
+            if (mergeResult.exitCode === 0) {
+              const treeOid = mergeResult.stdout.trim().split('\n')[0].trim();
+              if (treeOid.length === 40 || treeOid.length === 64) {
+                const diffResult = await this.runGit([
+                  'diff',
+                  '--no-color',
+                  '--no-ext-diff',
+                  treeOid,
+                  c2,
+                ]);
+                if (diffResult.exitCode === 0) {
+                  return {
+                    rawDiff: diffResult.stdout,
+                    isRebaseDiff: true,
+                    rebaseIgnored: true,
+                    rebaseConflict: false,
+                  };
+                }
+              }
+            }
+
+            // Conflict occurred during merge-tree! Fall back to direct diff
+            const rawDiff = await this.runJj(['diff', '--from', baseCommitId, '--to', targetCommitId, '--git']);
+            return {
+              rawDiff,
+              isRebaseDiff: true,
+              rebaseIgnored: false,
+              rebaseConflict: true,
+            };
+          } else {
+            // User toggled off ignoreRebase
+            const rawDiff = await this.runJj(['diff', '--from', baseCommitId, '--to', targetCommitId, '--git']);
+            return {
+              rawDiff,
+              isRebaseDiff: true,
+              rebaseIgnored: false,
+              rebaseConflict: false,
+            };
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to detect rebase in inter-diff, falling back to direct diff:', err);
+    }
+
+    const rawDiff = await this.runJj(['diff', '--from', baseCommitId, '--to', targetCommitId, '--git']);
+    return {
+      rawDiff,
+      isRebaseDiff: false,
+      rebaseIgnored: false,
+      rebaseConflict: false,
+    };
   }
 
   async getDiffForCommit(commitId: string): Promise<string> {
-    return await this.getDiff(commitId);
+    const res = await this.getDiff(commitId);
+    return res.rawDiff;
   }
 
   async getComments(commitId: string): Promise<CommenterThreadInfo[]> {

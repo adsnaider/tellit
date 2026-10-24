@@ -654,7 +654,15 @@ export function JjCommitComparisonSelector({
       </div>
 
       {/* Rebase Diff Filter Toggle */}
-      {isRebaseDiff && onToggleIgnoreRebase && (
+      {isBaseParent ? (
+        <span
+          className="flex items-center gap-1 px-2 py-1 rounded text-xs font-sans text-github-text-muted/60 border border-github-border/40 bg-github-bg-secondary/40 cursor-not-allowed select-none"
+          title="Upstream rebase filtering is available when comparing two patchsets (select an earlier commit in 'From')"
+        >
+          <GitMerge size={12} className="text-github-text-muted/50 shrink-0" />
+          <span>Rebase filter (interdiff only)</span>
+        </span>
+      ) : isRebaseDiff && onToggleIgnoreRebase ? (
         <button
           type="button"
           onClick={onToggleIgnoreRebase}
@@ -690,6 +698,14 @@ export function JjCommitComparisonSelector({
             </>
           )}
         </button>
+      ) : (
+        <span
+          className="flex items-center gap-1 px-2 py-1 rounded text-xs font-sans font-medium text-github-text-muted border border-github-border/50 bg-github-bg-tertiary/50 cursor-not-allowed select-none"
+          title={`Patchsets #${activeBaseIndex + 1} and #${activeTargetIndex + 1} share the same parent commit — no upstream rebase changes to hide.`}
+        >
+          <GitMerge size={12} className="text-github-text-muted shrink-0 opacity-70" />
+          <span>No rebase (same base)</span>
+        </span>
       )}
 
       {/* Approve Button */}
@@ -724,7 +740,7 @@ export function JjRevisionSelector({
   onSelectDiff,
 }: {
   currentCommitId?: string;
-  onSelectDiff: (targetCommitId: string, baseCommitId?: string) => void;
+  onSelectDiff: (targetCommitId: string, baseCommitId?: string, ignoreRebase?: boolean) => void;
 }) {
   const revisions = useJjRevisions({ currentCommitId, onSelectDiff });
 
@@ -749,6 +765,8 @@ export function JjRevisionSelector({
         onSelectTarget={revisions.handleTargetChange}
         onSelectBase={revisions.handleBaseChange}
         onToggleApprove={revisions.handleToggleApprove}
+        ignoreRebase={revisions.ignoreRebase}
+        onToggleIgnoreRebase={revisions.handleToggleIgnoreRebase}
         loading={revisions.loadingCommits}
       />
     </div>

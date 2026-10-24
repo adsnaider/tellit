@@ -302,4 +302,125 @@ describe('JujutsuService comment aggregation', () => {
       expect(gitSpy).not.toHaveBeenCalled();
     });
   });
+
+  describe('Clean Rebase Approval Propagation', () => {
+    it('marks later commit as cleanRebaseApproved when 3-way virtual tree matches target commit', async () => {
+      const c1 = '1111111111111111111111111111111111111111';
+      const c2 = '2222222222222222222222222222222222222222';
+      const p1 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+      const p2 = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+      const changeId = 'cccccccccccccccccccccccccccccccc';
+
+      // c1 was approved, c2 is unapproved
+      const evologOutput = [
+        `${c1}\t2026-10-23 10:00:00\t0\tInitial commit\t${p1}`,
+        `${c2}\t2026-10-23 11:00:00\t1\tRebased commit\t${p2}`,
+      ].join('\n');
+
+      vi.spyOn(jjService, 'runJj').mockResolvedValue(evologOutput);
+      vi.spyOn(jjService, 'getChangeThreads').mockResolvedValue([]);
+      vi.spyOn(jjService, 'getCommitDetails').mockImplementation(async (commitId) => {
+        if (commitId === c1) {
+          return { threads: [], approval: true };
+        }
+        return { threads: [], approval: false };
+      });
+
+      const virtualTreeOid = '9999999999999999999999999999999999999999';
+      vi.spyOn(jjService, 'runGit').mockImplementation(async (args) => {
+        if (args[0] === 'merge-tree') {
+          return { stdout: `${virtualTreeOid}\n`, stderr: '', exitCode: 0 };
+        }
+        if (args[0] === 'diff') {
+          // Zero diff between virtual tree and c2 -> clean rebase!
+          return { stdout: '', stderr: '', exitCode: 0 };
+        }
+        return { stdout: '', stderr: '', exitCode: 1 };
+      });
+
+      const commits = await jjService.getCommitsForChange(changeId);
+      expect(commits).toHaveLength(2);
+      expect(commits[0].approved).toBe(true);
+      expect(commits[0].cleanRebaseApproved).toBeUndefined();
+
+      expect(commits[1].approved).toBe(false);
+      expect(commits[1].cleanRebaseApproved).toBe(true);
+      expect(commits[1].cleanRebaseSourceCommitId).toBe(c1);
+      expect(commits[1].cleanRebaseSourceCommitNumber).toBe(1);
+    });
+
+    it('does not mark later commit as cleanRebaseApproved if author made additional code changes', async () => {
+      const c1 = '1111111111111111111111111111111111111111';
+      const c2 = '2222222222222222222222222222222222222222';
+      const p1 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+      const p2 = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+      const changeId = 'cccccccccccccccccccccccccccccccc';
+
+      const evologOutput = [
+        `${c1}\t2026-10-23 10:00:00\t0\tInitial commit\t${p1}`,
+        `${c2}\t2026-10-23 11:00:00\t1\tRebased and edited\t${p2}`,
+      ].join('\n');
+
+      vi.spyOn(jjService, 'runJj').mockResolvedValue(evologOutput);
+      vi.spyOn(jjService, 'getChangeThreads').mockResolvedValue([]);
+      vi.spyOn(jjService, 'getCommitDetails').mockImplementation(async (commitId) => {
+        if (commitId === c1) {
+          return { threads: [], approval: true };
+        }
+        return { threads: [], approval: false };
+      });
+
+      const virtualTreeOid = '9999999999999999999999999999999999999999';
+      vi.spyOn(jjService, 'runGit').mockImplementation(async (args) => {
+        if (args[0] === 'merge-tree') {
+          return { stdout: `${virtualTreeOid}\n`, stderr: '', exitCode: 0 };
+        }
+        if (args[0] === 'diff') {
+          // Author made additional edits!
+          return { stdout: 'diff --git a/new.txt b/new.txt\n+new line', stderr: '', exitCode: 0 };
+        }
+        return { stdout: '', stderr: '', exitCode: 1 };
+      });
+
+      const commits = await jjService.getCommitsForChange(changeId);
+      expect(commits).toHaveLength(2);
+      expect(commits[0].approved).toBe(true);
+      expect(commits[1].approved).toBe(false);
+      expect(commits[1].cleanRebaseApproved).toBeUndefined();
+    });
+
+    it('does not mark later commit as cleanRebaseApproved if merge-tree encountered a conflict', async () => {
+      const c1 = '1111111111111111111111111111111111111111';
+      const c2 = '2222222222222222222222222222222222222222';
+      const p1 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+      const p2 = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+      const changeId = 'cccccccccccccccccccccccccccccccc';
+
+      const evologOutput = [
+        `${c1}\t2026-10-23 10:00:00\t0\tInitial commit\t${p1}`,
+        `${c2}\t2026-10-23 11:00:00\t1\tRebased with conflict\t${p2}`,
+      ].join('\n');
+
+      vi.spyOn(jjService, 'runJj').mockResolvedValue(evologOutput);
+      vi.spyOn(jjService, 'getChangeThreads').mockResolvedValue([]);
+      vi.spyOn(jjService, 'getCommitDetails').mockImplementation(async (commitId) => {
+        if (commitId === c1) {
+          return { threads: [], approval: true };
+        }
+        return { threads: [], approval: false };
+      });
+
+      vi.spyOn(jjService, 'runGit').mockResolvedValue({
+        stdout: 'conflict',
+        stderr: 'conflict',
+        exitCode: 1,
+      });
+
+      const commits = await jjService.getCommitsForChange(changeId);
+      expect(commits).toHaveLength(2);
+      expect(commits[0].approved).toBe(true);
+      expect(commits[1].approved).toBe(false);
+      expect(commits[1].cleanRebaseApproved).toBeUndefined();
+    });
+  });
 });

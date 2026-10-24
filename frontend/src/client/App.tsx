@@ -1,4 +1,4 @@
-import { Columns, AlignLeft, Settings, PanelLeftClose, PanelLeft, Keyboard, MessageSquare, AlertTriangle } from 'lucide-react';
+import { Columns, AlignLeft, Settings, PanelLeftClose, PanelLeft, Keyboard, MessageSquare, AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 
 import {
@@ -1659,6 +1659,21 @@ function App() {
             <span>Rebase conflict detected between patchsets — displaying full diff including upstream changes.</span>
           </div>
         )}
+        {(() => {
+          const activeJjCommit = isJjRepo ? jjRevisions.commits.find((c) => c.commitId === jjRevisions.targetCommitId) : undefined;
+          if (activeJjCommit?.cleanRebaseApproved && !activeJjCommit?.approved) {
+            const commitIndex = jjRevisions.commits.indexOf(activeJjCommit);
+            return (
+              <div className="bg-emerald-500/10 border-b border-emerald-500/30 px-4 py-2 text-xs text-emerald-300 flex items-center gap-2">
+                <CheckCircle2 size={14} className="shrink-0 text-emerald-400" />
+                <span>
+                  Revision #{commitIndex + 1} contains no code changes compared to approved revision #{activeJjCommit.cleanRebaseSourceCommitNumber || 'earlier'} (clean rebase onto upstream).
+                </span>
+              </div>
+            );
+          }
+          return null;
+        })()}
         {revisionOptions && (
           <RevisionDetailModal
             key={isRevisionModalOpen ? getDiffSelectionKey(selectedRevision) : 'closed'}

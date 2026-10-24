@@ -19,10 +19,14 @@ export function CommentDot({
   commentCount,
   unresolvedCommentCount,
   approved,
+  cleanRebaseApproved,
+  cleanRebaseSourceNumber,
 }: {
   commentCount?: number;
   unresolvedCommentCount?: number;
   approved?: boolean;
+  cleanRebaseApproved?: boolean;
+  cleanRebaseSourceNumber?: number;
 }) {
   const count = commentCount ?? 0;
   const unresolved = unresolvedCommentCount ?? 0;
@@ -42,6 +46,19 @@ export function CommentDot({
       <span
         className="inline-block w-2 h-2 rounded-full shrink-0 bg-green-500 shadow-sm"
         title={count > 0 ? 'Approved (all comments resolved)' : 'Approved'}
+      />
+    );
+  }
+
+  if (cleanRebaseApproved) {
+    return (
+      <span
+        className="inline-block w-2.5 h-2.5 rounded-full shrink-0 bg-emerald-400 border border-emerald-200/60 shadow-sm"
+        title={
+          cleanRebaseSourceNumber
+            ? `Approved (Clean Rebase from #${cleanRebaseSourceNumber})`
+            : 'Approved (Clean Rebase)'
+        }
       />
     );
   }
@@ -336,6 +353,7 @@ export function JjChangeSelector({
                   commentCount={selectedChange.commentCount}
                   unresolvedCommentCount={selectedChange.unresolvedCommentCount}
                   approved={selectedChange.approved}
+                  cleanRebaseApproved={selectedChange.cleanRebaseApproved}
                 />
               )}
               <ChevronDown size={12} className="text-github-text-muted shrink-0" />
@@ -388,6 +406,7 @@ export function JjChangeSelector({
                   commentCount={change.commentCount}
                   unresolvedCommentCount={change.unresolvedCommentCount}
                   approved={change.approved}
+                  cleanRebaseApproved={change.cleanRebaseApproved}
                 />
               </button>
             );
@@ -493,6 +512,8 @@ export function JjCommitComparisonSelector({
               commentCount={activeBaseCommit.commentCount}
               unresolvedCommentCount={activeBaseCommit.unresolvedCommentCount}
               approved={activeBaseCommit.approved}
+              cleanRebaseApproved={activeBaseCommit.cleanRebaseApproved}
+              cleanRebaseSourceNumber={activeBaseCommit.cleanRebaseSourceCommitNumber}
             />
           )}
           <ChevronDown size={12} className="text-github-text-muted shrink-0" />
@@ -563,6 +584,8 @@ export function JjCommitComparisonSelector({
                     commentCount={commit.commentCount}
                     unresolvedCommentCount={commit.unresolvedCommentCount}
                     approved={commit.approved}
+                    cleanRebaseApproved={commit.cleanRebaseApproved}
+                    cleanRebaseSourceNumber={commit.cleanRebaseSourceCommitNumber}
                   />
                 </button>
               );
@@ -598,6 +621,8 @@ export function JjCommitComparisonSelector({
               commentCount={activeTargetCommit.commentCount}
               unresolvedCommentCount={activeTargetCommit.unresolvedCommentCount}
               approved={activeTargetCommit.approved}
+              cleanRebaseApproved={activeTargetCommit.cleanRebaseApproved}
+              cleanRebaseSourceNumber={activeTargetCommit.cleanRebaseSourceCommitNumber}
             />
           )}
           <ChevronDown size={12} className="text-github-text-muted shrink-0" />
@@ -645,6 +670,8 @@ export function JjCommitComparisonSelector({
                     commentCount={commit.commentCount}
                     unresolvedCommentCount={commit.unresolvedCommentCount}
                     approved={commit.approved}
+                    cleanRebaseApproved={commit.cleanRebaseApproved}
+                    cleanRebaseSourceNumber={commit.cleanRebaseSourceCommitNumber}
                   />
                 </button>
               );
@@ -712,23 +739,46 @@ export function JjCommitComparisonSelector({
       {onToggleApprove && activeTargetCommit && (
         <button
           type="button"
-          onClick={() => onToggleApprove(targetCommitId, Boolean(activeTargetCommit.approved))}
+          onClick={() => {
+            if (activeTargetCommit.cleanRebaseApproved && !activeTargetCommit.approved) {
+              // Direct reapproval upgrade
+              onToggleApprove(targetCommitId, false);
+            } else {
+              onToggleApprove(targetCommitId, Boolean(activeTargetCommit.approved));
+            }
+          }}
           className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium border transition-all cursor-pointer ${
             activeTargetCommit.approved
               ? 'bg-green-500/15 text-green-400 border-green-500/40 hover:bg-green-500/25'
+              : activeTargetCommit.cleanRebaseApproved
+              ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/40 hover:bg-emerald-500/25'
               : 'bg-github-bg-tertiary text-github-text-secondary border-github-border hover:text-github-text-primary hover:border-github-accent'
           }`}
           title={
             activeTargetCommit.approved
               ? 'Approved - click to revoke approval'
+              : activeTargetCommit.cleanRebaseApproved
+              ? `Approved (Clean Rebase from #${activeTargetCommit.cleanRebaseSourceCommitNumber || ''}) - click to upgrade to direct approval`
               : 'Approve this revision'
           }
         >
           <CheckCircle2
             size={13}
-            className={activeTargetCommit.approved ? 'text-green-400' : 'text-github-text-muted'}
+            className={
+              activeTargetCommit.approved
+                ? 'text-green-400'
+                : activeTargetCommit.cleanRebaseApproved
+                ? 'text-emerald-400'
+                : 'text-github-text-muted'
+            }
           />
-          <span>{activeTargetCommit.approved ? 'Approved' : 'Approve'}</span>
+          <span>
+            {activeTargetCommit.approved
+              ? 'Approved'
+              : activeTargetCommit.cleanRebaseApproved
+              ? 'Approved (Clean Rebase)'
+              : 'Approve'}
+          </span>
         </button>
       )}
     </div>

@@ -138,6 +138,7 @@ export interface JjChange {
   commentCount: number;
   unresolvedCommentCount: number;
   approved?: boolean;
+  cleanRebaseApproved?: boolean;
 }
 
 export interface JjCommit {
@@ -149,6 +150,9 @@ export interface JjCommit {
   commentCount: number;
   unresolvedCommentCount: number;
   approved?: boolean;
+  cleanRebaseApproved?: boolean;
+  cleanRebaseSourceCommitId?: string;
+  cleanRebaseSourceCommitNumber?: number;
 }
 
 interface CommentImportBase {
@@ -239,6 +243,7 @@ export interface JjChange {
   commentCount: number;
   unresolvedCommentCount: number;
   approved?: boolean;
+  cleanRebaseApproved?: boolean;
 }
 
 export interface JjCommit {
@@ -250,6 +255,9 @@ export interface JjCommit {
   commentCount: number;
   unresolvedCommentCount: number;
   approved?: boolean;
+  cleanRebaseApproved?: boolean;
+  cleanRebaseSourceCommitId?: string;
+  cleanRebaseSourceCommitNumber?: number;
 }
 
 // Revision selector types

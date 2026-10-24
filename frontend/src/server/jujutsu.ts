@@ -16,6 +16,7 @@ export interface JjChange {
   commentCount: number;
   unresolvedCommentCount: number;
   approved?: boolean;
+  cleanRebaseApproved?: boolean;
 }
 
 export interface JjCommit {
@@ -27,6 +28,9 @@ export interface JjCommit {
   commentCount: number;
   unresolvedCommentCount: number;
   approved?: boolean;
+  cleanRebaseApproved?: boolean;
+  cleanRebaseSourceCommitId?: string;
+  cleanRebaseSourceCommitNumber?: number;
 }
 
 export interface CommenterThreadInfo {
@@ -246,7 +250,7 @@ export class JujutsuService {
   async getCommitsForChange(changeId: string): Promise<JjCommit[]> {
     // 1. Get all commits for the change using Jujutsu evolution log (evolog)
     const evologTemplate =
-      'commit.commit_id() ++ "\t" ++ commit.committer().timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ (if(commit.current_working_copy(), "1", "0")) ++ "\t" ++ commit.description().first_line() ++ "\n"';
+      'commit.commit_id() ++ "\t" ++ commit.committer().timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ (if(commit.current_working_copy(), "1", "0")) ++ "\t" ++ commit.description().first_line() ++ "\t" ++ commit.parents().map(|p| p.commit_id()).join(",") ++ "\n"';
     let jjCommitsRaw = '';
     try {
       jjCommitsRaw = await this.runJj([
@@ -272,7 +276,7 @@ export class JujutsuService {
       } catch {
         // Fallback to standard jj log if evolog fails
         const fallbackTemplate =
-          'commit_id ++ "\t" ++ committer.timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ (if(current_working_copy, "1", "0")) ++ "\t" ++ description.first_line() ++ "\n"';
+          'commit_id ++ "\t" ++ committer.timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ (if(current_working_copy, "1", "0")) ++ "\t" ++ description.first_line() ++ "\t" ++ parents.map(|p| p.commit_id()).join(",") ++ "\n"';
         try {
           jjCommitsRaw = await this.runJj([
             'log',
@@ -290,10 +294,14 @@ export class JujutsuService {
     }
 
     const commitMap = new Map<string, JjCommit>();
+    const commitParentsMap = new Map<string, string[]>();
     for (const line of jjCommitsRaw.split('\n').filter(l => l.trim().length > 0)) {
       const parts = line.split('\t');
       if (parts.length < 4) continue;
-      const [commitId, timestamp, isWorkingCopy, description] = parts;
+      const [commitId, timestamp, isWorkingCopy, description, parentsRaw] = parts;
+      if (parentsRaw) {
+        commitParentsMap.set(commitId, parentsRaw.split(',').filter(Boolean));
+      }
       commitMap.set(commitId, {
         commitId,
         shortCommitId: commitId.slice(0, 8),
@@ -349,6 +357,86 @@ export class JujutsuService {
         c.approved = details.approval;
       }),
     );
+
+    // 5. Detect clean rebase approvals chronologically
+    for (let i = 0; i < result.length; i++) {
+      const current = result[i];
+      if (current.approved) {
+        continue;
+      }
+      let currentParents = commitParentsMap.get(current.commitId);
+      if (!currentParents) {
+        try {
+          const pOut = await this.runJj(['log', '-r', current.commitId, '--no-graph', '-T', 'parents.map(|p| p.commit_id()).join(",")']);
+          currentParents = pOut.trim().split(',').filter(Boolean);
+          commitParentsMap.set(current.commitId, currentParents);
+        } catch {
+          currentParents = [];
+        }
+      }
+      if (currentParents.length !== 1) {
+        continue;
+      }
+      const pi = currentParents[0];
+
+      // Check against earlier approved commits (starting from most recent approved)
+      for (let j = i - 1; j >= 0; j--) {
+        const earlier = result[j];
+        if (!earlier.approved && !earlier.cleanRebaseApproved) {
+          continue;
+        }
+        let earlierParents = commitParentsMap.get(earlier.commitId);
+        if (!earlierParents) {
+          try {
+            const pOut = await this.runJj(['log', '-r', earlier.commitId, '--no-graph', '-T', 'parents.map(|p| p.commit_id()).join(",")']);
+            earlierParents = pOut.trim().split(',').filter(Boolean);
+            commitParentsMap.set(earlier.commitId, earlierParents);
+          } catch {
+            earlierParents = [];
+          }
+        }
+        if (earlierParents.length !== 1) {
+          continue;
+        }
+        const pj = earlierParents[0];
+        if (pj === pi) {
+          continue;
+        }
+
+        try {
+          const mergeResult = await this.runGit([
+            'merge-tree',
+            '--write-tree',
+            '--merge-base',
+            pj,
+            pi,
+            earlier.commitId,
+          ]);
+          if (mergeResult.exitCode === 0) {
+            const virtualTreeOid = mergeResult.stdout.trim().split('\n')[0].trim();
+            if (virtualTreeOid.length === 40 || virtualTreeOid.length === 64) {
+              const diffResult = await this.runGit([
+                'diff',
+                '--no-color',
+                '--no-ext-diff',
+                virtualTreeOid,
+                current.commitId,
+              ]);
+              if (diffResult.exitCode === 0 && diffResult.stdout.trim().length === 0) {
+                current.cleanRebaseApproved = true;
+                current.cleanRebaseSourceCommitId =
+                  earlier.cleanRebaseSourceCommitId || earlier.commitId;
+                current.cleanRebaseSourceCommitNumber =
+                  earlier.cleanRebaseSourceCommitNumber || (j + 1);
+                break;
+              }
+            }
+          }
+        } catch (err) {
+          console.warn('Failed to evaluate clean rebase approval:', err);
+        }
+      }
+    }
 
     return result;
   }

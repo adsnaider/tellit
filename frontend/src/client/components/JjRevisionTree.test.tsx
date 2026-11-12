@@ -402,4 +402,86 @@ describe('JjRevisionTreePanel', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Go' }));
     expect(handleCustomSubmit).toHaveBeenCalledTimes(1);
   });
+
+  it('shows green status dots for approved and clean-rebase-approved changes even with resolved comments', () => {
+    const approvedResolved = makeChange({
+      changeId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      shortChangeId: 'aaaaaaaa',
+      commitId: '1111111111111111111111111111111111111111',
+      description: 'Approved after resolving comments',
+      commentCount: 2,
+      unresolvedCommentCount: 0,
+      approved: true,
+    });
+    const cleanRebaseResolved = makeChange({
+      changeId: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      shortChangeId: 'bbbbbbbb',
+      commitId: '2222222222222222222222222222222222222222',
+      description: 'Clean rebased after approval',
+      commentCount: 1,
+      unresolvedCommentCount: 0,
+      approved: false,
+      cleanRebaseApproved: true,
+    });
+    const unapprovedResolved = makeChange({
+      changeId: 'cccccccccccccccccccccccccccccccc',
+      shortChangeId: 'cccccccc',
+      commitId: '3333333333333333333333333333333333333333',
+      description: 'Resolved without approval',
+      commentCount: 2,
+      unresolvedCommentCount: 0,
+      approved: false,
+      cleanRebaseApproved: false,
+    });
+    const approvedUnresolved = makeChange({
+      changeId: 'dddddddddddddddddddddddddddddddd',
+      shortChangeId: 'dddddddd',
+      commitId: '4444444444444444444444444444444444444444',
+      description: 'Approved with open comment',
+      commentCount: 1,
+      unresolvedCommentCount: 1,
+      approved: true,
+    });
+
+    const changes = [
+      approvedResolved,
+      cleanRebaseResolved,
+      unapprovedResolved,
+      approvedUnresolved,
+    ];
+    const graphRows: JjGraphRow[] = changes.map((change, idx) => ({
+      type: 'commit',
+      key: change.commitId,
+      graphCols: ['○'],
+      downCols: idx < changes.length - 1 ? [0] : [],
+      change,
+    }));
+
+    render(
+      <JjRevisionTreePanel
+        changes={changes}
+        graphRows={graphRows}
+        selectedChangeId={approvedResolved.changeId}
+        onSelectChange={vi.fn()}
+        isCustomInput={false}
+        setIsCustomInput={vi.fn()}
+        customInput=""
+        setCustomInput={vi.fn()}
+        customError={null}
+        handleCustomSubmit={vi.fn()}
+      />,
+    );
+
+    const approvedDot = screen.getByTitle('Approved (all comments resolved)');
+    expect(approvedDot.className).toContain('bg-green-500');
+
+    const cleanRebaseDot = screen.getByTitle('Approved (Clean Rebase)');
+    expect(cleanRebaseDot.className).toContain('bg-emerald-400');
+
+    const grayDot = screen.getByTitle('All comments resolved');
+    expect(grayDot.className).toContain('bg-gray-400');
+
+    const yellowDot = screen.getByTitle('1 unresolved comment');
+    expect(yellowDot.className).toContain('bg-yellow-400');
+  });
 });

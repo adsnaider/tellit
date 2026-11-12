@@ -100,12 +100,16 @@ pub struct CommitIdsGetResponse {
 pub struct ChangeThreadsGetResponse {
     pub threads: Vec<ThreadInfo>,
     pub approval: bool,
+    #[serde(default)]
+    pub approved_commits: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeCommitsGetResponse {
     pub commits: Vec<String>,
     pub approval: bool,
+    #[serde(default)]
+    pub approved_commits: Vec<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -732,7 +736,7 @@ pub fn get_thread(store: &Path, thread_id_query: &str) -> Result<ThreadInfo> {
     })
 }
 
-pub fn get_change_commits(store: &Path, change_query: &str) -> Result<Vec<String>> {
+fn matched_change_dirs(store: &Path, change_query: &str) -> Result<Vec<PathBuf>> {
     if !store.exists() {
         return Ok(Vec::new());
     }
@@ -743,16 +747,72 @@ pub fn get_change_commits(store: &Path, change_query: &str) -> Result<Vec<String
         if entry.file_type()?.is_dir() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name == change_query {
-                matched_dirs = vec![entry.path()];
-                break;
-            } else if name.starts_with(change_query) {
+                return Ok(vec![entry.path()]);
+            }
+            if name.starts_with(change_query)
+                || (name.len() >= 6 && change_query.starts_with(&name))
+            {
                 matched_dirs.push(entry.path());
             }
         }
     }
+    Ok(matched_dirs)
+}
 
+fn is_approval_file_approved(approval_file: &Path) -> bool {
+    if !approval_file.is_file() {
+        return false;
+    }
+    if let Ok(bytes) = std::fs::read(approval_file) {
+        if let Ok(data) = serde_json::from_slice::<ApprovalData>(&bytes) {
+            return data.approved;
+        }
+    }
+    // Non-JSON marker files represent legacy unrevoked approvals.
+    true
+}
+
+/// Returns sorted, deduplicated commit IDs approved under changes matching `change_query`.
+///
+/// Returns an empty list if `store` does not exist.
+///
+/// # Errors
+///
+/// Returns an error if reading the store directory or any matching change directory fails.
+///
+/// # Examples
+///
+/// ```
+/// let dir = tempfile::tempdir()?;
+/// let commit_dir = dir.path().join("change123").join("commit456");
+/// std::fs::create_dir_all(&commit_dir)?;
+/// std::fs::write(
+///     commit_dir.join("approval.json"),
+///     r#"{"approved":true,"timestamp":"2026-01-01T00:00:00Z"}"#,
+/// )?;
+///
+/// let approved = tellit_cli::get_change_approved_commits(dir.path(), "change123")?;
+/// assert_eq!(approved, vec!["commit456"]);
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn get_change_approved_commits(store: &Path, change_query: &str) -> Result<Vec<String>> {
+    let mut approved_commits = Vec::new();
+    for change_dir in matched_change_dirs(store, change_query)? {
+        for entry in std::fs::read_dir(&change_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() && is_approval_file_approved(&entry.path().join("approval.json")) {
+                approved_commits.push(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+    }
+    approved_commits.sort();
+    approved_commits.dedup();
+    Ok(approved_commits)
+}
+
+pub fn get_change_commits(store: &Path, change_query: &str) -> Result<Vec<String>> {
     let mut commit_hashes = Vec::new();
-    for change_dir in matched_dirs {
+    for change_dir in matched_change_dirs(store, change_query)? {
         for entry in std::fs::read_dir(&change_dir)? {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
@@ -808,26 +868,8 @@ pub fn get_commit_threads(store: &Path, commit_query: &str) -> Result<Vec<String
 }
 
 pub fn get_change_threads(store: &Path, change_query: &str) -> Result<Vec<ThreadInfo>> {
-    if !store.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut matched_dirs = Vec::new();
-    for entry in std::fs::read_dir(store)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name == change_query {
-                matched_dirs = vec![entry.path()];
-                break;
-            } else if name.starts_with(change_query) {
-                matched_dirs.push(entry.path());
-            }
-        }
-    }
-
     let mut threads = Vec::new();
-    for change_dir in matched_dirs {
+    for change_dir in matched_change_dirs(store, change_query)? {
         let change_id = change_dir
             .file_name()
             .unwrap_or_default()
@@ -993,13 +1035,8 @@ pub fn is_commit_approved(store: &Path, commit_query: &str) -> bool {
                 || (commit_name.len() >= 6 && commit_query.starts_with(&*commit_name))
             {
                 let approval_file = entry.path().join("approval.json");
-                if approval_file.exists() {
-                    if let Ok(bytes) = std::fs::read(&approval_file) {
-                        if let Ok(data) = serde_json::from_slice::<ApprovalData>(&bytes) {
-                            return data.approved;
-                        }
-                    }
-                    return true;
+                if approval_file.is_file() {
+                    return is_approval_file_approved(&approval_file);
                 }
             }
         }
@@ -1008,38 +1045,34 @@ pub fn is_commit_approved(store: &Path, commit_query: &str) -> bool {
 }
 
 pub fn is_change_approved(store: &Path, change_query: &str) -> bool {
-    // 1. Ask Jujutsu for the latest commit of the change
-    let latest_commit = match run_jj(&[
+    let head_commits = match run_jj(&[
         "log",
         "-r",
-        &format!("change_id({})", change_query),
-        "-n",
-        "1",
+        &format!("change_id({change_query})"),
         "--no-graph",
         "-T",
-        "commit_id",
+        "commit_id ++ \"\\n\"",
     ]) {
-        Ok(out) if !out.trim().is_empty() => Some(out.trim().to_string()),
+        Ok(out) if !out.trim().is_empty() => Some(out),
         _ => match run_jj(&[
             "log",
             "-r",
             change_query,
-            "-n",
-            "1",
             "--no-graph",
             "-T",
-            "commit_id",
+            "commit_id ++ \"\\n\"",
         ]) {
-            Ok(out) if !out.trim().is_empty() => Some(out.trim().to_string()),
+            Ok(out) if !out.trim().is_empty() => Some(out),
             _ => None,
         },
     };
 
-    if let Some(commit_id) = latest_commit {
-        return is_commit_approved(store, &commit_id);
-    }
-
-    false
+    head_commits.is_some_and(|out| {
+        out.lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .any(|cid| is_commit_approved(store, cid))
+    })
 }
 
 pub fn set_commit_approval(
@@ -1220,12 +1253,22 @@ mod tests {
 
         // Test approval operations
         assert!(!is_commit_approved(&store, commit_hash));
+        assert!(get_change_approved_commits(&store, "change123").unwrap().is_empty());
         set_commit_approval(&store, Some(commit_hash), false).unwrap();
         assert!(is_commit_approved(&store, commit_hash));
+        assert_eq!(
+            get_change_approved_commits(&store, "change123").unwrap(),
+            vec![commit_hash.to_string()]
+        );
+        assert_eq!(
+            get_change_approved_commits(&store, "change").unwrap(),
+            vec![commit_hash.to_string()]
+        );
 
         // Test disapprove
         set_commit_approval(&store, Some(commit_hash), true).unwrap();
         assert!(!is_commit_approved(&store, commit_hash));
+        assert!(get_change_approved_commits(&store, "change123").unwrap().is_empty());
     }
 
     #[test]

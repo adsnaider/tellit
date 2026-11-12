@@ -1,7 +1,7 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { existsSync } from 'fs';
-import { resolve, join } from 'path';
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'fs';
+import { dirname, join, resolve } from 'path';
 import { type JjChange, type JjCommit, type JjGraphRow } from '../types/diff.js';
 
 export type { JjChange, JjCommit, JjGraphRow };
@@ -215,10 +215,21 @@ export interface JjDiffResult {
   rebaseConflict: boolean;
 }
 
+export interface ChangeDetails {
+  threads: CommenterThreadInfo[];
+  approval: boolean;
+  approvedCommits?: string[];
+}
+
+function commitMatches(a: string, b: string): boolean {
+  return a === b || (a.length >= 6 && b.length >= 6 && (a.startsWith(b) || b.startsWith(a)));
+}
+
 export class JujutsuService {
   private repoDir: string;
   private jjBin: string = 'jj-for-agents';
   private tellitBin: string;
+  private cachedGitDir: string | null | undefined = undefined;
 
   constructor(repoDir = process.cwd()) {
     this.repoDir = resolve(repoDir);
@@ -282,18 +293,180 @@ export class JujutsuService {
     }
   }
 
+  private resolveJjRepoPaths(): { mainRepoRoot: string; jjRepoDir: string } | null {
+    let cur = this.repoDir;
+    while (true) {
+      const jjDir = join(cur, '.jj');
+      const jjRepoPath = join(jjDir, 'repo');
+      if (existsSync(jjRepoPath)) {
+        try {
+          const st = statSync(jjRepoPath);
+          if (st.isFile()) {
+            const target = readFileSync(jjRepoPath, 'utf8').trim();
+            if (!target) return null;
+            const resolvedRepo = resolve(jjDir, target);
+            const canonicalRepo = existsSync(resolvedRepo) ? realpathSync(resolvedRepo) : resolvedRepo;
+            return {
+              jjRepoDir: canonicalRepo,
+              mainRepoRoot: dirname(dirname(canonicalRepo)),
+            };
+          }
+          if (st.isDirectory()) {
+            return {
+              jjRepoDir: jjRepoPath,
+              mainRepoRoot: cur,
+            };
+          }
+        } catch {
+          return null;
+        }
+      }
+      const parent = dirname(cur);
+      if (parent === cur) break;
+      cur = parent;
+    }
+    return null;
+  }
+
+  private resolveGitDir(): string | null {
+    if (this.cachedGitDir !== undefined) {
+      return this.cachedGitDir;
+    }
+
+    let cur = this.repoDir;
+    while (true) {
+      if (existsSync(join(cur, '.git'))) {
+        this.cachedGitDir = null;
+        return null;
+      }
+      const parent = dirname(cur);
+      if (parent === cur) break;
+      cur = parent;
+    }
+
+    const jjPaths = this.resolveJjRepoPaths();
+    if (jjPaths) {
+      const storeDir = join(jjPaths.jjRepoDir, 'store');
+      const directGit = join(storeDir, 'git');
+      if (existsSync(directGit)) {
+        this.cachedGitDir = directGit;
+        return directGit;
+      }
+      const gitTargetFile = join(storeDir, 'git_target');
+      if (existsSync(gitTargetFile)) {
+        try {
+          const target = readFileSync(gitTargetFile, 'utf8').trim();
+          if (target) {
+            const resolvedGit = resolve(storeDir, target);
+            if (existsSync(resolvedGit)) {
+              this.cachedGitDir = resolvedGit;
+              return resolvedGit;
+            }
+          }
+        } catch {
+          // Ignore unreadable git_target
+        }
+      }
+    }
+
+    this.cachedGitDir = null;
+    return null;
+  }
+
+  private isApprovalFileApproved(approvalFile: string): boolean {
+    if (!existsSync(approvalFile)) {
+      return false;
+    }
+    try {
+      if (!statSync(approvalFile).isFile()) {
+        return false;
+      }
+      const raw = readFileSync(approvalFile, 'utf8');
+      try {
+        const parsed: unknown = JSON.parse(raw);
+        if (typeof parsed === 'object' && parsed !== null && 'approved' in parsed) {
+          return Boolean((parsed as { approved?: unknown }).approved);
+        }
+        return true;
+      } catch {
+        // Non-JSON marker files represent legacy unrevoked approvals.
+        return true;
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  private readStoreApprovedCommits(changeId: string): string[] {
+    const jjPaths = this.resolveJjRepoPaths();
+    const candidateRoots = jjPaths?.mainRepoRoot
+      ? [join(jjPaths.mainRepoRoot, '.tellit'), join(this.repoDir, '.tellit')]
+      : [join(this.repoDir, '.tellit')];
+    const storeDir = candidateRoots.find((dir) => existsSync(dir));
+    if (!storeDir) {
+      return [];
+    }
+
+    let matchedChangeDirs: string[] = [];
+    try {
+      const entries = readdirSync(storeDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const name = entry.name;
+        if (name === changeId) {
+          matchedChangeDirs = [join(storeDir, name)];
+          break;
+        }
+        if (
+          name.startsWith(changeId) ||
+          (name.length >= 6 && changeId.startsWith(name))
+        ) {
+          matchedChangeDirs.push(join(storeDir, name));
+        }
+      }
+    } catch {
+      return [];
+    }
+
+    const approved = new Set<string>();
+    for (const changeDir of matchedChangeDirs) {
+      try {
+        const commitEntries = readdirSync(changeDir, { withFileTypes: true });
+        for (const commitEntry of commitEntries) {
+          if (!commitEntry.isDirectory()) continue;
+          const approvalFile = join(changeDir, commitEntry.name, 'approval.json');
+          if (this.isApprovalFileApproved(approvalFile)) {
+            approved.add(commitEntry.name);
+          }
+        }
+      } catch {
+        // Ignore unreadable change directory
+      }
+    }
+
+    return Array.from(approved).sort();
+  }
+
   async runGit(args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    const gitDir = this.resolveGitDir();
     try {
       const { stdout, stderr } = await execFileAsync('git', args, {
         cwd: this.repoDir,
         maxBuffer: 20 * 1024 * 1024,
+        ...(gitDir ? { env: { ...process.env, GIT_DIR: gitDir } } : {}),
       });
       return { stdout: stdout.toString(), stderr: stderr.toString(), exitCode: 0 };
-    } catch (error: any) {
+    } catch (error: unknown) {
+      const errObj =
+        typeof error === 'object' && error !== null
+          ? (error as { stdout?: unknown; stderr?: unknown; code?: unknown })
+          : {};
+      const toStr = (val: unknown) =>
+        typeof val === 'string' ? val : Buffer.isBuffer(val) ? val.toString('utf8') : '';
       return {
-        stdout: error.stdout?.toString() || '',
-        stderr: error.stderr?.toString() || '',
-        exitCode: typeof error.code === 'number' ? error.code : 1,
+        stdout: toStr(errObj.stdout),
+        stderr: toStr(errObj.stderr),
+        exitCode: typeof errObj.code === 'number' ? errObj.code : 1,
       };
     }
   }
@@ -311,14 +484,175 @@ export class JujutsuService {
     return await this.runJj(['root']);
   }
 
+  private async getParentsForCommit(
+    commitId: string,
+    parentCache?: Map<string, Promise<string[]>>,
+  ): Promise<string[]> {
+    const loadParents = async (): Promise<string[]> => {
+      try {
+        const pOut = await this.runJj([
+          'log',
+          '-r',
+          commitId,
+          '--no-graph',
+          '-T',
+          'parents.map(|p| p.commit_id()).join(",")',
+        ]);
+        return pOut.trim().split(',').filter(Boolean);
+      } catch {
+        return [];
+      }
+    };
+
+    if (!parentCache) {
+      return loadParents();
+    }
+    let pending = parentCache.get(commitId);
+    if (!pending) {
+      pending = loadParents();
+      parentCache.set(commitId, pending);
+    }
+    return pending;
+  }
+
+  private async isCleanRebaseBetweenCommits(params: {
+    earlierCommitId: string;
+    earlierParentId: string;
+    targetCommitId: string;
+    targetParentId: string;
+    earlierDescription?: string;
+    targetDescription?: string;
+  }): Promise<boolean> {
+    const {
+      earlierCommitId,
+      earlierParentId,
+      targetCommitId,
+      targetParentId,
+      earlierDescription,
+      targetDescription,
+    } = params;
+
+    try {
+      if (earlierParentId !== targetParentId) {
+        const mergeResult = await this.runGit([
+          'merge-tree',
+          '--write-tree',
+          '--merge-base',
+          earlierParentId,
+          targetParentId,
+          earlierCommitId,
+        ]);
+        if (mergeResult.exitCode !== 0) {
+          return false;
+        }
+        const virtualTreeOid = mergeResult.stdout.trim().split('\n')[0]?.trim() ?? '';
+        if (virtualTreeOid.length !== 40 && virtualTreeOid.length !== 64) {
+          return false;
+        }
+        const diffResult = await this.runGit([
+          'diff',
+          '--no-color',
+          '--no-ext-diff',
+          virtualTreeOid,
+          targetCommitId,
+        ]);
+        return diffResult.exitCode === 0 && diffResult.stdout.trim().length === 0;
+      }
+
+      const diffResult = await this.runGit([
+        'diff',
+        '--no-color',
+        '--no-ext-diff',
+        earlierCommitId,
+        targetCommitId,
+      ]);
+      if (diffResult.exitCode !== 0 || diffResult.stdout.trim().length !== 0) {
+        return false;
+      }
+      const [earlierDesc, targetDesc] = await Promise.all([
+        earlierDescription !== undefined
+          ? Promise.resolve(earlierDescription)
+          : this.getCommitDescription(earlierCommitId),
+        targetDescription !== undefined
+          ? Promise.resolve(targetDescription)
+          : this.getCommitDescription(targetCommitId),
+      ]);
+      return earlierDesc === targetDesc;
+    } catch (err) {
+      console.warn('Failed to evaluate clean rebase approval:', err);
+      return false;
+    }
+  }
+
+  private async populateChangeReviewState(
+    change: JjChange,
+    details: ChangeDetails,
+    parentCache?: Map<string, Promise<string[]>>,
+  ): Promise<void> {
+    change.commentCount = details.threads.length;
+    change.unresolvedCommentCount = details.threads.filter((t) => !t.resolved).length;
+
+    const approvedCommits =
+      details.approvedCommits !== undefined
+        ? details.approvedCommits
+        : this.readStoreApprovedCommits(change.changeId);
+
+    if (approvedCommits.some((id) => commitMatches(id, change.commitId))) {
+      change.approved = true;
+      return;
+    }
+
+    if (details.approvedCommits === undefined && approvedCommits.length === 0 && details.approval) {
+      change.approved = true;
+      return;
+    }
+
+    change.approved = false;
+
+    if (approvedCommits.length === 0) {
+      return;
+    }
+
+    const targetParents =
+      change.parentCommitIds !== undefined
+        ? change.parentCommitIds
+        : await this.getParentsForCommit(change.commitId, parentCache);
+    if (targetParents.length !== 1) {
+      return;
+    }
+    const targetParentId = targetParents[0];
+    if (!targetParentId) {
+      return;
+    }
+
+    for (const earlierCommitId of [...approvedCommits].reverse()) {
+      const earlierParents = await this.getParentsForCommit(earlierCommitId, parentCache);
+      if (earlierParents.length !== 1) {
+        continue;
+      }
+      const earlierParentId = earlierParents[0];
+      if (!earlierParentId) {
+        continue;
+      }
+      if (
+        await this.isCleanRebaseBetweenCommits({
+          earlierCommitId,
+          earlierParentId,
+          targetCommitId: change.commitId,
+          targetParentId,
+        })
+      ) {
+        change.cleanRebaseApproved = true;
+        return;
+      }
+    }
+  }
+
   async getChangesGraph(): Promise<{ changes: JjChange[]; graphRows: JjGraphRow[] }> {
     const output = await this.runJj(['log', '--color=never', '-T', JJ_GRAPH_LOG_TEMPLATE]);
     const { changes, graphRows } = parseJjLogGraph(output);
 
-    const detailsByChangeId = new Map<
-      string,
-      Promise<{ threads: CommenterThreadInfo[]; approval: boolean }>
-    >();
+    const detailsByChangeId = new Map<string, Promise<ChangeDetails>>();
     const getDetails = (changeId: string) => {
       let pending = detailsByChangeId.get(changeId);
       if (!pending) {
@@ -328,12 +662,11 @@ export class JujutsuService {
       return pending;
     };
 
+    const parentCache = new Map<string, Promise<string[]>>();
     await Promise.all(
       changes.map(async (c) => {
         const details = await getDetails(c.changeId);
-        c.commentCount = details.threads.length;
-        c.unresolvedCommentCount = details.threads.filter((t) => !t.resolved).length;
-        c.approved = details.approval;
+        await this.populateChangeReviewState(c, details, parentCache);
       }),
     );
 
@@ -364,9 +697,7 @@ export class JujutsuService {
     if (!parsed) return null;
     const { change } = parsed;
     const details = await this.getChangeDetails(change.changeId);
-    change.commentCount = details.threads.length;
-    change.unresolvedCommentCount = details.threads.filter((t) => !t.resolved).length;
-    change.approved = details.approval;
+    await this.populateChangeReviewState(change, details);
     return change;
   }
 
@@ -453,18 +784,37 @@ export class JujutsuService {
     return commitish;
   }
 
-  async getChangeDetails(changeId: string): Promise<{ threads: CommenterThreadInfo[]; approval: boolean }> {
+  private parseDetailsOutput(output: string): ChangeDetails {
+    if (!output) return { threads: [], approval: false };
+    const parsed: unknown = JSON.parse(output);
+    if (Array.isArray(parsed)) {
+      return { threads: parsed as CommenterThreadInfo[], approval: false };
+    }
+    const obj =
+      typeof parsed === 'object' && parsed !== null
+        ? (parsed as {
+            threads?: unknown;
+            approval?: unknown;
+            approved_commits?: unknown;
+          })
+        : {};
+    return {
+      threads: Array.isArray(obj.threads) ? (obj.threads as CommenterThreadInfo[]) : [],
+      approval: Boolean(obj.approval),
+      ...(Array.isArray(obj.approved_commits)
+        ? {
+            approvedCommits: obj.approved_commits.filter(
+              (s: unknown): s is string => typeof s === 'string',
+            ),
+          }
+        : {}),
+    };
+  }
+
+  async getChangeDetails(changeId: string): Promise<ChangeDetails> {
     try {
       const output = await this.runTellit(['get', 'change', changeId, '--threads', '--json']);
-      if (!output) return { threads: [], approval: false };
-      const parsed = JSON.parse(output);
-      if (Array.isArray(parsed)) {
-        return { threads: parsed, approval: false };
-      }
-      return {
-        threads: parsed.threads || [],
-        approval: Boolean(parsed.approval),
-      };
+      return this.parseDetailsOutput(output);
     } catch {
       return { threads: [], approval: false };
     }
@@ -478,15 +828,8 @@ export class JujutsuService {
   async getCommitDetails(commitId: string): Promise<{ threads: CommenterThreadInfo[]; approval: boolean }> {
     try {
       const output = await this.runTellit(['get', 'commit', commitId, '--threads', '--json']);
-      if (!output) return { threads: [], approval: false };
-      const parsed = JSON.parse(output);
-      if (Array.isArray(parsed)) {
-        return { threads: parsed, approval: false };
-      }
-      return {
-        threads: parsed.threads || [],
-        approval: Boolean(parsed.approval),
-      };
+      const { threads, approval } = this.parseDetailsOutput(output);
+      return { threads, approval };
     } catch {
       return { threads: [], approval: false };
     }
@@ -544,13 +887,13 @@ export class JujutsuService {
     }
 
     const commitMap = new Map<string, JjCommit>();
-    const commitParentsMap = new Map<string, string[]>();
+    const commitParentsCache = new Map<string, Promise<string[]>>();
     for (const line of jjCommitsRaw.split('\n').filter(l => l.trim().length > 0)) {
       const parts = line.split('\t');
       if (parts.length < 4) continue;
       const [commitId, timestamp, isWorkingCopy, description, parentsRaw] = parts;
       if (parentsRaw) {
-        commitParentsMap.set(commitId, parentsRaw.split(',').filter(Boolean));
+        commitParentsCache.set(commitId, Promise.resolve(parentsRaw.split(',').filter(Boolean)));
       }
       commitMap.set(commitId, {
         commitId,
@@ -611,79 +954,47 @@ export class JujutsuService {
     // 5. Detect clean rebase approvals chronologically
     for (let i = 0; i < result.length; i++) {
       const current = result[i];
-      if (current.approved) {
+      if (!current || current.approved) {
         continue;
       }
-      let currentParents = commitParentsMap.get(current.commitId);
-      if (!currentParents) {
-        try {
-          const pOut = await this.runJj(['log', '-r', current.commitId, '--no-graph', '-T', 'parents.map(|p| p.commit_id()).join(",")']);
-          currentParents = pOut.trim().split(',').filter(Boolean);
-          commitParentsMap.set(current.commitId, currentParents);
-        } catch {
-          currentParents = [];
-        }
-      }
+      const currentParents = await this.getParentsForCommit(current.commitId, commitParentsCache);
       if (currentParents.length !== 1) {
         continue;
       }
       const pi = currentParents[0];
+      if (!pi) {
+        continue;
+      }
 
       // Check against earlier approved commits (starting from most recent approved)
       for (let j = i - 1; j >= 0; j--) {
         const earlier = result[j];
-        if (!earlier.approved && !earlier.cleanRebaseApproved) {
+        if (!earlier || (!earlier.approved && !earlier.cleanRebaseApproved)) {
           continue;
         }
-        let earlierParents = commitParentsMap.get(earlier.commitId);
-        if (!earlierParents) {
-          try {
-            const pOut = await this.runJj(['log', '-r', earlier.commitId, '--no-graph', '-T', 'parents.map(|p| p.commit_id()).join(",")']);
-            earlierParents = pOut.trim().split(',').filter(Boolean);
-            commitParentsMap.set(earlier.commitId, earlierParents);
-          } catch {
-            earlierParents = [];
-          }
-        }
+        const earlierParents = await this.getParentsForCommit(earlier.commitId, commitParentsCache);
         if (earlierParents.length !== 1) {
           continue;
         }
         const pj = earlierParents[0];
-        if (pj === pi) {
+        if (!pj) {
           continue;
         }
 
-        try {
-          const mergeResult = await this.runGit([
-            'merge-tree',
-            '--write-tree',
-            '--merge-base',
-            pj,
-            pi,
-            earlier.commitId,
-          ]);
-          if (mergeResult.exitCode === 0) {
-            const virtualTreeOid = mergeResult.stdout.trim().split('\n')[0].trim();
-            if (virtualTreeOid.length === 40 || virtualTreeOid.length === 64) {
-              const diffResult = await this.runGit([
-                'diff',
-                '--no-color',
-                '--no-ext-diff',
-                virtualTreeOid,
-                current.commitId,
-              ]);
-              if (diffResult.exitCode === 0 && diffResult.stdout.trim().length === 0) {
-                current.cleanRebaseApproved = true;
-                current.cleanRebaseSourceCommitId =
-                  earlier.cleanRebaseSourceCommitId || earlier.commitId;
-                current.cleanRebaseSourceCommitNumber =
-                  earlier.cleanRebaseSourceCommitNumber || (j + 1);
-                break;
-              }
-            }
-          }
-        } catch (err) {
-          console.warn('Failed to evaluate clean rebase approval:', err);
+        if (
+          await this.isCleanRebaseBetweenCommits({
+            earlierCommitId: earlier.commitId,
+            earlierParentId: pj,
+            targetCommitId: current.commitId,
+            targetParentId: pi,
+          })
+        ) {
+          current.cleanRebaseApproved = true;
+          current.cleanRebaseSourceCommitId =
+            earlier.cleanRebaseSourceCommitId || earlier.commitId;
+          current.cleanRebaseSourceCommitNumber =
+            earlier.cleanRebaseSourceCommitNumber || (j + 1);
+          break;
         }
       }
     }
@@ -866,15 +1177,13 @@ export class JujutsuService {
     // If we have changeId, get all threads in change
     const allChangeThreads = changeId ? await this.getChangeThreads(changeId) : [];
 
-    const commitMatches = (a: string, b: string) =>
-      a === b || (a.length >= 6 && b.length >= 6 && (a.startsWith(b) || b.startsWith(a)));
-
     // 1. If diffing against base commit (Requirement 3):
     // All comments on baseCommit (resolved or unresolved) get side: 'old'
     if (baseCommitId) {
+      const resolvedBaseId = baseCommitId;
       const baseThreads = allChangeThreads.length > 0
-        ? allChangeThreads.filter(t => commitMatches(t.commit_id, baseCommitId!))
-        : await this.getCommitThreads(baseCommitId);
+        ? allChangeThreads.filter((t) => commitMatches(t.commit_id, resolvedBaseId))
+        : await this.getCommitThreads(resolvedBaseId);
 
       for (const t of baseThreads) {
         resultMap.set(t.thread_id, { ...t, side: 'old' });

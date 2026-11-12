@@ -2,11 +2,12 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use tellit_cli::{
-    add_comment, get_all_threads, get_change_commits, get_change_threads, get_commit_thread_infos,
-    get_commit_threads, get_thread, get_workspace_root, is_change_approved, is_commit_approved,
-    locate_web_cli, reply_comment, resolve_comment, resolve_store, set_commit_approval,
-    ChangeCommitsGetResponse, ChangeThreadsGetResponse, Cli, Command, CommentAction,
-    CommitGetResponse, CommitIdsGetResponse, GetTarget,
+    add_comment, get_all_threads, get_change_approved_commits, get_change_commits,
+    get_change_threads, get_commit_thread_infos, get_commit_threads, get_thread,
+    get_workspace_root, is_change_approved, is_commit_approved, locate_web_cli, reply_comment,
+    resolve_comment, resolve_store, set_commit_approval, ChangeCommitsGetResponse,
+    ChangeThreadsGetResponse, Cli, Command, CommentAction, CommitGetResponse,
+    CommitIdsGetResponse, GetTarget,
 };
 
 fn locate_node() -> std::path::PathBuf {
@@ -154,14 +155,23 @@ fn run() -> anyhow::Result<()> {
                     }
                     GetTarget::Change(c) => {
                         let approval = is_change_approved(&store, &c.change_id);
+                        let approved_commits = get_change_approved_commits(&store, &c.change_id)?;
                         if c.threads {
                             let threads = get_change_threads(&store, &c.change_id)?;
-                            let resp = ChangeThreadsGetResponse { threads, approval };
+                            let resp = ChangeThreadsGetResponse {
+                                threads,
+                                approval,
+                                approved_commits,
+                            };
                             println!("{}", serde_json::to_string_pretty(&resp)?);
                         } else {
                             let commits = get_change_commits(&store, &c.change_id)?;
                             if c.json {
-                                let resp = ChangeCommitsGetResponse { commits, approval };
+                                let resp = ChangeCommitsGetResponse {
+                                    commits,
+                                    approval,
+                                    approved_commits,
+                                };
                                 println!("{}", serde_json::to_string_pretty(&resp)?);
                             } else {
                                 for commit in &commits {

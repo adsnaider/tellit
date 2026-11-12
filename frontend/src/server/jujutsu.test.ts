@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -854,6 +854,273 @@ describe('JujutsuService comment aggregation', () => {
       );
       await expect(jjService.resolveInitialTargetCommit('missing-ref')).resolves.toBe('missing-ref');
       expect(runJjSpy).toHaveBeenCalled();
+    });
+  });
+
+  describe('getChangesGraph approval and clean rebase status', () => {
+    const buildGraphRow = (params: {
+      changeId: string;
+      commitId: string;
+      parentId: string;
+      description?: string;
+    }) =>
+      [
+        `○  ${JJ_LOG_NODE_MARKER}\t${params.changeId}\t${params.changeId.slice(0, 2)}\t${params.commitId}\t0\t0\t0\t0\t0\t\t${params.parentId}\t2026-11-12 22:00:00\t${params.description ?? 'Change'}`,
+        `│  ${JJ_LOG_EDGE_MARKER}`,
+      ].join('\n');
+
+    it('matches per-row commitId against details.approvedCommits including divergent rows', async () => {
+      const changeId = 'dddddddddddddddddddddddddddddddd';
+      const approvedCommit = '1111111111111111111111111111111111111111';
+      const unapprovedDivergentCommit = '2222222222222222222222222222222222222222';
+      const parentId = '9999999999999999999999999999999999999999';
+
+      vi.spyOn(jjService, 'runJj').mockImplementation(async (args) => {
+        if (args.some((a) => a.includes(JJ_LOG_NODE_MARKER))) {
+          return [
+            buildGraphRow({ changeId, commitId: approvedCommit, parentId, description: 'Divergent A' }),
+            buildGraphRow({
+              changeId,
+              commitId: unapprovedDivergentCommit,
+              parentId,
+              description: 'Divergent B',
+            }),
+          ].join('\n');
+        }
+        if (args.includes(approvedCommit)) {
+          return parentId;
+        }
+        return '';
+      });
+      vi.spyOn(jjService, 'runGit').mockResolvedValue({
+        stdout: 'diff --git a/x b/x\n+divergent change\n',
+        stderr: '',
+        exitCode: 0,
+      });
+      const detailsSpy = vi.spyOn(jjService, 'getChangeDetails').mockResolvedValue({
+        threads: [
+          {
+            thread_id: 't-1',
+            change_id: changeId,
+            commit_id: approvedCommit,
+            git_commit_hash: approvedCommit,
+            filepath: 'src/lib.rs',
+            comments: ['Looks good'],
+            resolved: true,
+          },
+        ],
+        approval: true,
+        approvedCommits: [approvedCommit],
+      });
+
+      const { changes } = await jjService.getChangesGraph();
+      expect(detailsSpy).toHaveBeenCalledTimes(1);
+      expect(changes).toHaveLength(2);
+      expect(changes[0]).toMatchObject({
+        commitId: approvedCommit,
+        approved: true,
+        commentCount: 1,
+        unresolvedCommentCount: 0,
+      });
+      expect(changes[1]).toMatchObject({
+        commitId: unapprovedDivergentCommit,
+        approved: false,
+      });
+      expect(changes[1]?.cleanRebaseApproved).toBeUndefined();
+    });
+
+    it('marks cleanly rebased changes with cleanRebaseApproved when an earlier commit was approved', async () => {
+      const changeId = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+      const earlierCommit = '1111111111111111111111111111111111111111';
+      const currentCommit = '2222222222222222222222222222222222222222';
+      const earlierParent = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+      const currentParent = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+
+      vi.spyOn(jjService, 'runJj').mockImplementation(async (args) => {
+        if (args.includes(JJ_LOG_NODE_MARKER) || args.some((a) => a.includes(JJ_LOG_NODE_MARKER))) {
+          return buildGraphRow({
+            changeId,
+            commitId: currentCommit,
+            parentId: currentParent,
+            description: 'Rebased change',
+          });
+        }
+        if (args.includes(earlierCommit)) {
+          return earlierParent;
+        }
+        return '';
+      });
+      vi.spyOn(jjService, 'getChangeDetails').mockResolvedValue({
+        threads: [
+          {
+            thread_id: 't-resolved',
+            change_id: changeId,
+            commit_id: earlierCommit,
+            git_commit_hash: earlierCommit,
+            filepath: 'src/lib.rs',
+            comments: ['Fixed'],
+            resolved: true,
+          },
+        ],
+        approval: false,
+        approvedCommits: [earlierCommit],
+      });
+      const virtualTreeOid = '7777777777777777777777777777777777777777';
+      vi.spyOn(jjService, 'runGit').mockImplementation(async (args) => {
+        if (args[0] === 'merge-tree') {
+          expect(args).toEqual([
+            'merge-tree',
+            '--write-tree',
+            '--merge-base',
+            earlierParent,
+            currentParent,
+            earlierCommit,
+          ]);
+          return { stdout: `${virtualTreeOid}\n`, stderr: '', exitCode: 0 };
+        }
+        if (args[0] === 'diff') {
+          return { stdout: '', stderr: '', exitCode: 0 };
+        }
+        return { stdout: '', stderr: '', exitCode: 1 };
+      });
+
+      const { changes } = await jjService.getChangesGraph();
+      expect(changes).toHaveLength(1);
+      expect(changes[0]).toMatchObject({
+        commitId: currentCommit,
+        approved: false,
+        cleanRebaseApproved: true,
+        commentCount: 1,
+        unresolvedCommentCount: 0,
+      });
+    });
+
+    it('clears both approved and cleanRebaseApproved when diff against virtual merge tree is non-empty', async () => {
+      const changeId = 'ffffffffffffffffffffffffffffffff';
+      const earlierCommit = '1111111111111111111111111111111111111111';
+      const currentCommit = '2222222222222222222222222222222222222222';
+      const earlierParent = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+      const currentParent = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+
+      vi.spyOn(jjService, 'runJj').mockImplementation(async (args) => {
+        if (args.some((a) => a.includes(JJ_LOG_NODE_MARKER))) {
+          return buildGraphRow({
+            changeId,
+            commitId: currentCommit,
+            parentId: currentParent,
+            description: 'Modified after approval',
+          });
+        }
+        if (args.includes(earlierCommit)) {
+          return earlierParent;
+        }
+        return '';
+      });
+      vi.spyOn(jjService, 'getChangeDetails').mockResolvedValue({
+        threads: [],
+        approval: false,
+        approvedCommits: [earlierCommit],
+      });
+      const virtualTreeOid = '7777777777777777777777777777777777777777';
+      vi.spyOn(jjService, 'runGit').mockImplementation(async (args) => {
+        if (args[0] === 'merge-tree') {
+          return { stdout: `${virtualTreeOid}\n`, stderr: '', exitCode: 0 };
+        }
+        if (args[0] === 'diff') {
+          return { stdout: 'diff --git a/file b/file\n+extra edit\n', stderr: '', exitCode: 0 };
+        }
+        return { stdout: '', stderr: '', exitCode: 1 };
+      });
+
+      const { changes } = await jjService.getChangesGraph();
+      expect(changes).toHaveLength(1);
+      expect(changes[0]).toMatchObject({
+        commitId: currentCommit,
+        approved: false,
+      });
+      expect(changes[0]?.cleanRebaseApproved).toBeUndefined();
+    });
+
+    it('falls back to .tellit store via .jj/repo indirection and sets GIT_DIR from .jj/repo/store/git', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'tellit-ws-fallback-'));
+      const originalPath = process.env.PATH;
+      try {
+        const mainRepo = join(tempDir, 'main-repo');
+        const secondaryWs = join(tempDir, 'secondary-ws');
+        const gitStoreDir = join(mainRepo, '.jj', 'repo', 'store', 'git');
+        mkdirSync(gitStoreDir, { recursive: true });
+        mkdirSync(join(secondaryWs, '.jj'), { recursive: true });
+        writeFileSync(join(secondaryWs, '.jj', 'repo'), '../../main-repo/.jj/repo\n');
+
+        const changeId = 'abababababababababababababababab';
+        const earlierCommit = '1111111111111111111111111111111111111111';
+        const currentCommit = '2222222222222222222222222222222222222222';
+        const earlierParent = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+        const currentParent = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+
+        const approvalDir = join(mainRepo, '.tellit', changeId, earlierCommit);
+        mkdirSync(approvalDir, { recursive: true });
+        writeFileSync(
+          join(approvalDir, 'approval.json'),
+          JSON.stringify({ approved: true, timestamp: '2026-11-12T22:00:00Z' }),
+        );
+
+        const canonicalGitDir = realpathSync(gitStoreDir);
+        const mockBinDir = join(tempDir, 'bin');
+        mkdirSync(mockBinDir, { recursive: true });
+        writeFileSync(
+          join(mockBinDir, 'git'),
+          [
+            '#!/bin/sh',
+            `if [ "$GIT_DIR" != "${canonicalGitDir}" ]; then`,
+            '  printf "unexpected GIT_DIR=%s\\n" "$GIT_DIR" >&2',
+            '  exit 2',
+            'fi',
+            'if [ "$1" = "merge-tree" ]; then',
+            '  printf "8888888888888888888888888888888888888888\\n"',
+            '  exit 0',
+            'fi',
+            'if [ "$1" = "diff" ]; then',
+            '  exit 0',
+            'fi',
+            'exit 1',
+            '',
+          ].join('\n'),
+          { mode: 0o755 },
+        );
+        process.env.PATH = `${mockBinDir}:${originalPath ?? ''}`;
+
+        const wsService = new JujutsuService(secondaryWs);
+        vi.spyOn(wsService, 'runJj').mockImplementation(async (args) => {
+          if (args.some((a) => a.includes(JJ_LOG_NODE_MARKER))) {
+            return buildGraphRow({
+              changeId,
+              commitId: currentCommit,
+              parentId: currentParent,
+              description: 'Secondary workspace change',
+            });
+          }
+          if (args.includes(earlierCommit)) {
+            return earlierParent;
+          }
+          return '';
+        });
+        vi.spyOn(wsService, 'getChangeDetails').mockResolvedValue({
+          threads: [],
+          approval: false,
+        });
+
+        const { changes } = await wsService.getChangesGraph();
+        expect(changes).toHaveLength(1);
+        expect(changes[0]).toMatchObject({
+          commitId: currentCommit,
+          approved: false,
+          cleanRebaseApproved: true,
+        });
+      } finally {
+        process.env.PATH = originalPath;
+        rmSync(tempDir, { recursive: true, force: true });
+      }
     });
   });
 });

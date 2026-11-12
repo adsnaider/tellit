@@ -40,6 +40,7 @@ import { DiffViewer } from './components/DiffViewer';
 import { FileList } from './components/FileList';
 import { HelpModal } from './components/HelpModal';
 import {
+  commitIdsMatch,
   useJjRevisions,
   JjChangeSelector,
   JjCommitComparisonSelector,
@@ -633,8 +634,13 @@ function App() {
   } | null>(null);
   const fetchDiffDataRef = useRef<((selection?: DiffSelection) => Promise<void>) | null>(null);
   const reloadJjRevisionsRef = useRef<(() => Promise<void>) | null>(null);
+  const refreshJjCommentsRef = useRef<(() => Promise<void>) | null>(null);
   const handleWatchReload = useCallback(async () => {
-    await Promise.all([fetchDiffDataRef.current?.(), reloadJjRevisionsRef.current?.()]);
+    await Promise.all([
+      fetchDiffDataRef.current?.(),
+      reloadJjRevisionsRef.current?.(),
+      refreshJjCommentsRef.current?.(),
+    ]);
   }, []);
   const handleCommentsChanged = useCallback(async () => {
     try {
@@ -644,6 +650,10 @@ function App() {
       if (commentsContextKey) {
         setBootstrappedCommentsKey(commentsContextKey);
       }
+      await Promise.all([
+        reloadJjRevisionsRef.current?.(),
+        refreshJjCommentsRef.current?.(),
+      ]);
     } catch (commentsError) {
       console.error('Failed to refresh comments from server:', commentsError);
     }
@@ -1240,9 +1250,12 @@ function App() {
     currentCommitId: jjCommitId || diffData?.targetCommitish,
     onSelectDiff: handleJjDiffChange,
   });
+  const { reloadRevisions: reloadJjRevisions } = jjRevisions;
   useEffect(() => {
-    reloadJjRevisionsRef.current = isJjRepo ? jjRevisions.reloadRevisions : null;
-  }, [isJjRepo, jjRevisions.reloadRevisions]);
+    reloadJjRevisionsRef.current = isJjRepo ? reloadJjRevisions : null;
+    refreshJjCommentsRef.current =
+      isJjRepo && jjCommitId ? () => refreshJjComments(jjCommitId, jjBaseCommitId) : null;
+  }, [isJjRepo, jjBaseCommitId, jjCommitId, refreshJjComments, reloadJjRevisions]);
 
   const handleAddComment = useCallback(
     async (
@@ -1280,7 +1293,7 @@ function App() {
           throw new Error(msg);
         }
         setCommentError(null);
-        await refreshJjComments(jjCommitId, jjBaseCommitId);
+        await Promise.all([refreshJjComments(jjCommitId, jjBaseCommitId), reloadJjRevisions()]);
         return;
       }
       addThread({
@@ -1298,7 +1311,7 @@ function App() {
       });
       return Promise.resolve();
     },
-    [addThread, isJjRepo, jjBaseCommitId, jjCommitId, refreshJjComments],
+    [addThread, isJjRepo, jjBaseCommitId, jjCommitId, refreshJjComments, reloadJjRevisions],
   );
 
   const handleReplyToThread = useCallback(
@@ -1323,13 +1336,13 @@ function App() {
           throw new Error(msg);
         }
         setCommentError(null);
-        await refreshJjComments(jjCommitId, jjBaseCommitId);
+        await Promise.all([refreshJjComments(jjCommitId, jjBaseCommitId), reloadJjRevisions()]);
         return;
       }
       replyToThread({ threadId, body });
       return Promise.resolve();
     },
-    [isJjRepo, jjBaseCommitId, jjCommitId, refreshJjComments, replyToThread],
+    [isJjRepo, jjBaseCommitId, jjCommitId, refreshJjComments, reloadJjRevisions, replyToThread],
   );
 
   const handleToggleResolve = useCallback(
@@ -1353,7 +1366,7 @@ function App() {
             return;
           }
           setCommentError(null);
-          await refreshJjComments(jjCommitId, jjBaseCommitId);
+          await Promise.all([refreshJjComments(jjCommitId, jjBaseCommitId), reloadJjRevisions()]);
         } catch (err) {
           const msg =
             err instanceof Error && err.message
@@ -1367,7 +1380,7 @@ function App() {
       }
       removeThread(threadId);
     },
-    [isJjRepo, jjBaseCommitId, jjCommitId, refreshJjComments, removeThread, threads],
+    [isJjRepo, jjBaseCommitId, jjCommitId, refreshJjComments, reloadJjRevisions, removeThread, threads],
   );
 
   const handleCopyAllComments = async () => {
@@ -1757,7 +1770,9 @@ function App() {
           </div>
         )}
         {(() => {
-          const activeJjCommit = isJjRepo ? jjRevisions.commits.find((c) => c.commitId === jjRevisions.targetCommitId) : undefined;
+          const activeJjCommit = isJjRepo
+            ? jjRevisions.commits.find((c) => commitIdsMatch(c.commitId, jjRevisions.targetCommitId))
+            : undefined;
           if (activeJjCommit?.cleanRebaseApproved && !activeJjCommit?.approved) {
             const commitIndex = jjRevisions.commits.indexOf(activeJjCommit);
             return (

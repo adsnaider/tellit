@@ -2,35 +2,198 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { existsSync } from 'fs';
 import { resolve, join } from 'path';
+import { type JjChange, type JjCommit, type JjGraphRow } from '../types/diff.js';
+
+export type { JjChange, JjCommit, JjGraphRow };
 
 const execFileAsync = promisify(execFile);
 
-export interface JjChange {
-  changeId: string;
-  shortChangeId: string;
-  commitId: string;
-  shortCommitId: string;
-  isWorkingCopy: boolean;
-  timestamp: string;
-  description: string;
-  commentCount: number;
-  unresolvedCommentCount: number;
-  approved?: boolean;
-  cleanRebaseApproved?: boolean;
+export const JJ_LOG_NODE_MARKER = '__TELLIT_NODE__';
+export const JJ_LOG_EDGE_MARKER = '__TELLIT_EDGE__';
+
+const ROOT_CHANGE_ID = '00000000000000000000000000000000';
+const VERTICAL_EDGE_PREFIX_RE = /^[│|: ]*$/;
+const PURE_SPACER_LINE_RE = /^[│|: ]+$/;
+const ELIDED_REVISIONS_SUFFIX_RE = /\s*\(elided revisions\).*$/;
+const TRAILING_SPACES_RE = /\s+$/;
+const TRAILING_NEWLINES_RE = /[\r\n]+$/;
+const LINE_SPLIT_RE = /\r?\n/;
+const UPWARD_CONNECTING_GLYPHS = '│|:╯┘\'╰└`├┤┴┼+';
+
+const JJ_CHANGE_FIELDS_TEMPLATE =
+  `change_id ++ "\t" ++ change_id.shortest() ++ "\t" ++ commit_id ++ "\t" ++ ` +
+  `if(current_working_copy, "1", "0") ++ "\t" ++ if(empty, "1", "0") ++ "\t" ++ ` +
+  `if(immutable, "1", "0") ++ "\t" ++ if(conflict, "1", "0") ++ "\t" ++ if(root, "1", "0") ++ "\t" ++ ` +
+  `bookmarks.map(|b| b.name()).join(",") ++ "\t" ++ parents.map(|p| p.commit_id()).join(",") ++ "\t" ++ ` +
+  `committer.timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ description.first_line()`;
+
+const JJ_GRAPH_LOG_TEMPLATE =
+  `"${JJ_LOG_NODE_MARKER}\t" ++ ${JJ_CHANGE_FIELDS_TEMPLATE} ++ "\n${JJ_LOG_EDGE_MARKER}\n"`;
+
+function parseJjChangeFields(parts: string[]): { change: JjChange; isRoot: boolean } | null {
+  if (parts.length < 11) {
+    return null;
+  }
+  const changeId = parts[0] ?? '';
+  const shortestChangeId = parts[1] ?? '';
+  const commitId = parts[2] ?? '';
+  const isWorkingCopyRaw = parts[3] ?? '0';
+  const isEmptyRaw = parts[4] ?? '0';
+  const isImmutableRaw = parts[5] ?? '0';
+  const isConflictRaw = parts[6] ?? '0';
+  const isRootRaw = parts[7] ?? '0';
+  const bookmarksRaw = parts[8] ?? '';
+  const parentCommitIdsRaw = parts[9] ?? '';
+  const timestamp = parts[10] ?? '';
+  const rawDescription = parts.slice(11).join('\t').trim();
+
+  if (!changeId || !commitId) {
+    return null;
+  }
+
+  const isRoot = isRootRaw === '1' || changeId === ROOT_CHANGE_ID;
+  const change: JjChange = {
+    changeId,
+    shortChangeId: changeId.slice(0, 8),
+    shortestChangeId: shortestChangeId || changeId.slice(0, 1),
+    commitId,
+    shortCommitId: commitId.slice(0, 8),
+    isWorkingCopy: isWorkingCopyRaw === '1',
+    isEmpty: isEmptyRaw === '1',
+    hasDescription: rawDescription.length > 0,
+    isImmutable: isImmutableRaw === '1',
+    isConflict: isConflictRaw === '1',
+    bookmarks: bookmarksRaw ? bookmarksRaw.split(',').filter(Boolean) : [],
+    parentCommitIds: parentCommitIdsRaw ? parentCommitIdsRaw.split(',').filter(Boolean) : [],
+    timestamp,
+    description: rawDescription || '(no description set)',
+    commentCount: 0,
+    unresolvedCommentCount: 0,
+  };
+
+  return { change, isRoot };
 }
 
-export interface JjCommit {
-  commitId: string;
-  shortCommitId: string;
-  timestamp: string;
-  description: string;
-  isWorkingCopy: boolean;
-  commentCount: number;
-  unresolvedCommentCount: number;
-  approved?: boolean;
-  cleanRebaseApproved?: boolean;
-  cleanRebaseSourceCommitId?: string;
-  cleanRebaseSourceCommitNumber?: number;
+/**
+ * Parses `jj log` graph output emitted with `JJ_GRAPH_LOG_TEMPLATE` into
+ * ordered change entries and graph rows with downward stem columns.
+ */
+export function parseJjLogGraph(rawOutput: string): {
+  changes: JjChange[];
+  graphRows: JjGraphRow[];
+} {
+  const lines = rawOutput.split(LINE_SPLIT_RE);
+  const changes: JjChange[] = [];
+  const graphRows: JjGraphRow[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line || line.trim().length === 0) {
+      continue;
+    }
+
+    const nodeIdx = line.indexOf(JJ_LOG_NODE_MARKER);
+    if (nodeIdx !== -1) {
+      const rawPrefix = line.slice(0, nodeIdx);
+      const graphCols = Array.from(rawPrefix.replace(TRAILING_SPACES_RE, ''));
+      const parts = line.slice(nodeIdx).split('\t').slice(1);
+      const parsed = parseJjChangeFields(parts);
+
+      const nextLine = lines[i + 1] ?? '';
+      const edgeIdx = nextLine.indexOf(JJ_LOG_EDGE_MARKER);
+
+      if (!parsed || parsed.isRoot) {
+        if (edgeIdx !== -1) {
+          i++;
+        }
+        continue;
+      }
+
+      const { change } = parsed;
+      changes.push(change);
+
+      const downCols: number[] = [];
+      let edgeConnectorCols: string[] | null = null;
+
+      if (edgeIdx !== -1) {
+        i++;
+        const edgePrefix = nextLine.slice(0, edgeIdx).replace(TRAILING_SPACES_RE, '');
+        const edgeChars = Array.from(edgePrefix);
+        if (VERTICAL_EDGE_PREFIX_RE.test(edgePrefix)) {
+          for (let col = 0; col < edgeChars.length; col++) {
+            const ch = edgeChars[col];
+            if (ch === '│' || ch === '|' || ch === ':') {
+              downCols.push(col);
+            }
+          }
+        } else {
+          for (let col = 0; col < edgeChars.length; col++) {
+            const ch = edgeChars[col];
+            if (ch && UPWARD_CONNECTING_GLYPHS.includes(ch)) {
+              downCols.push(col);
+            }
+          }
+          edgeConnectorCols = edgeChars;
+        }
+      }
+
+      graphRows.push({
+        type: 'commit',
+        key: change.commitId,
+        graphCols,
+        downCols,
+        change,
+      });
+
+      if (edgeConnectorCols) {
+        graphRows.push({
+          type: 'connector',
+          key: `connector-${graphRows.length}`,
+          graphCols: edgeConnectorCols,
+          isElided: false,
+          bridgesElided: false,
+        });
+      }
+      continue;
+    }
+
+    if (line.includes(JJ_LOG_EDGE_MARKER)) {
+      continue;
+    }
+
+    const bridgesElided = line.includes('(elided revisions)');
+    const trimmedRight = line
+      .replace(ELIDED_REVISIONS_SUFFIX_RE, '')
+      .replace(TRAILING_SPACES_RE, '');
+    if (!trimmedRight || (!bridgesElided && PURE_SPACER_LINE_RE.test(trimmedRight))) {
+      continue;
+    }
+
+    graphRows.push({
+      type: 'connector',
+      key: `connector-${graphRows.length}`,
+      graphCols: Array.from(trimmedRight),
+      isElided: trimmedRight.includes('~'),
+      bridgesElided,
+    });
+  }
+
+  // Filter downward stems that have no connecting glyph in the next row
+  // (e.g. when the root commit or trailing spacer lines were dropped).
+  for (let r = 0; r < graphRows.length; r++) {
+    const row = graphRows[r];
+    if (!row || row.type !== 'commit') {
+      continue;
+    }
+    if (r === graphRows.length - 1) {
+      row.downCols = [];
+      continue;
+    }
+    const nextRow = graphRows[r + 1];
+    row.downCols = row.downCols.filter((col) => (nextRow?.graphCols[col] ?? ' ') !== ' ');
+  }
+
+  return { changes, graphRows };
 }
 
 export interface CommenterThreadInfo {
@@ -84,13 +247,16 @@ export class JujutsuService {
     const effectiveArgs = args.includes('--ignore-working-copy')
       ? args
       : ['--ignore-working-copy', ...args];
+    const preserveLeading = args.includes('log') && !args.includes('--no-graph');
+    const cleanOutput = (stdout: string) =>
+      preserveLeading ? stdout.replace(TRAILING_NEWLINES_RE, '') : stdout.trim();
     try {
       const { stdout } = await execFileAsync(this.jjBin, effectiveArgs, { cwd: this.repoDir });
-      return stdout.trim();
+      return cleanOutput(stdout);
     } catch {
       // Fallback to raw jj if jj-for-agents is not in PATH
       const { stdout } = await execFileAsync('jj', ['--no-pager', ...effectiveArgs], { cwd: this.repoDir });
-      return stdout.trim();
+      return cleanOutput(stdout);
     }
   }
 
@@ -145,48 +311,42 @@ export class JujutsuService {
     return await this.runJj(['root']);
   }
 
-  async getChanges(): Promise<JjChange[]> {
-    const template = 'change_id ++ "\t" ++ commit_id ++ "\t" ++ (if(current_working_copy, "1", "0")) ++ "\t" ++ committer.timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ description.first_line() ++ "\n"';
-    // Run default jj log to match the active working stack/revisions
-    const output = await this.runJj(['log', '--no-graph', '-T', template]);
-    const lines = output.split('\n').filter(line => line.trim().length > 0);
-    const seenChanges = new Set<string>();
-    const changes: JjChange[] = [];
+  async getChangesGraph(): Promise<{ changes: JjChange[]; graphRows: JjGraphRow[] }> {
+    const output = await this.runJj(['log', '--color=never', '-T', JJ_GRAPH_LOG_TEMPLATE]);
+    const { changes, graphRows } = parseJjLogGraph(output);
 
-    for (const line of lines) {
-      const parts = line.split('\t');
-      if (parts.length < 5) continue;
-      const [changeId, commitId, isWorkingCopy, timestamp, description] = parts;
-      if (seenChanges.has(changeId) || changeId === '00000000000000000000000000000000') continue;
-      seenChanges.add(changeId);
-
-      changes.push({
-        changeId,
-        shortChangeId: changeId.slice(0, 8),
-        commitId,
-        shortCommitId: commitId.slice(0, 8),
-        isWorkingCopy: isWorkingCopy === '1',
-        timestamp,
-        description: description || '(no description set)',
-        commentCount: 0,
-        unresolvedCommentCount: 0,
-      });
-    }
+    const detailsByChangeId = new Map<
+      string,
+      Promise<{ threads: CommenterThreadInfo[]; approval: boolean }>
+    >();
+    const getDetails = (changeId: string) => {
+      let pending = detailsByChangeId.get(changeId);
+      if (!pending) {
+        pending = this.getChangeDetails(changeId);
+        detailsByChangeId.set(changeId, pending);
+      }
+      return pending;
+    };
 
     await Promise.all(
       changes.map(async (c) => {
-        const details = await this.getChangeDetails(c.changeId);
+        const details = await getDetails(c.changeId);
         c.commentCount = details.threads.length;
         c.unresolvedCommentCount = details.threads.filter((t) => !t.resolved).length;
         c.approved = details.approval;
       }),
     );
 
+    return { changes, graphRows };
+  }
+
+  async getChanges(): Promise<JjChange[]> {
+    const { changes } = await this.getChangesGraph();
     return changes;
   }
 
   async getChange(query: string): Promise<JjChange | null> {
-    const template = 'change_id ++ "\t" ++ commit_id ++ "\t" ++ (if(current_working_copy, "1", "0")) ++ "\t" ++ committer.timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ description.first_line() ++ "\n"';
+    const template = `${JJ_CHANGE_FIELDS_TEMPLATE} ++ "\n"`;
     let output = '';
     try {
       output = await this.runJj(['log', '-r', `change_id(${query})`, '-n', '1', '--no-graph', '-T', template]);
@@ -197,27 +357,100 @@ export class JujutsuService {
         return null;
       }
     }
-    const lines = output.split('\n').filter(l => l.trim().length > 0);
-    if (lines.length === 0) return null;
-    const parts = lines[0].split('\t');
-    if (parts.length < 5) return null;
-    const [changeId, commitId, isWorkingCopy, timestamp, description] = parts;
-    const change: JjChange = {
-      changeId,
-      shortChangeId: changeId.slice(0, 8),
-      commitId,
-      shortCommitId: commitId.slice(0, 8),
-      isWorkingCopy: isWorkingCopy === '1',
-      timestamp,
-      description: description || '(no description set)',
-      commentCount: 0,
-      unresolvedCommentCount: 0,
-    };
-    const details = await this.getChangeDetails(changeId);
+    const lines = output.split(LINE_SPLIT_RE).filter((l) => l.trim().length > 0);
+    const firstLine = lines[0];
+    if (!firstLine) return null;
+    const parsed = parseJjChangeFields(firstLine.split('\t'));
+    if (!parsed) return null;
+    const { change } = parsed;
+    const details = await this.getChangeDetails(change.changeId);
     change.commentCount = details.threads.length;
     change.unresolvedCommentCount = details.threads.filter((t) => !t.resolved).length;
     change.approved = details.approval;
     return change;
+  }
+
+  /**
+   * Resolves the initial target commit ID for CLI launch. When given `HEAD` or
+   * `@`, skips empty undescribed commits with no review comments so launching
+   * from a fresh working copy lands on the latest meaningful change.
+   */
+  async resolveInitialTargetCommit(commitish: string): Promise<string> {
+    if (commitish === 'HEAD' || commitish === '@') {
+      const template =
+        'commit_id ++ "\t" ++ change_id ++ "\t" ++ if(empty, "1", "0") ++ "\t" ++ if(root, "1", "0") ++ "\t" ++ description.first_line() ++ "\n"';
+      try {
+        const output = await this.runJj(['log', '-r', 'ancestors(@, 20)', '--no-graph', '-T', template]);
+        const lines = output.split(LINE_SPLIT_RE).filter((l) => l.trim().length > 0);
+        let firstNonRootCommitId: string | undefined;
+
+        for (const line of lines) {
+          const parts = line.split('\t');
+          if (parts.length < 4) continue;
+          const commitId = parts[0] ?? '';
+          const changeId = parts[1] ?? '';
+          const isEmpty = parts[2] ?? '0';
+          const isRoot = parts[3] ?? '0';
+          const rawDescription = parts.slice(4).join('\t').trim();
+
+          if (!commitId || !changeId || isRoot === '1' || changeId === ROOT_CHANGE_ID) {
+            continue;
+          }
+          if (!firstNonRootCommitId) {
+            firstNonRootCommitId = commitId;
+          }
+          if (!(isEmpty === '1' && rawDescription === '')) {
+            return commitId;
+          }
+          const details = await this.getChangeDetails(changeId);
+          if (details.threads.length > 0) {
+            return commitId;
+          }
+        }
+
+        return firstNonRootCommitId || commitish;
+      } catch {
+        return commitish;
+      }
+    }
+
+    try {
+      const byChangeId = await this.runJj([
+        'log',
+        '-r',
+        `change_id(${commitish})`,
+        '-n',
+        '1',
+        '--no-graph',
+        '-T',
+        'commit_id',
+      ]);
+      if (byChangeId.trim()) {
+        return byChangeId.trim();
+      }
+    } catch {
+      // Fall back to direct revset lookup
+    }
+
+    try {
+      const direct = await this.runJj([
+        'log',
+        '-r',
+        commitish,
+        '-n',
+        '1',
+        '--no-graph',
+        '-T',
+        'commit_id',
+      ]);
+      if (direct.trim()) {
+        return direct.trim();
+      }
+    } catch {
+      // Fall back to original commitish
+    }
+
+    return commitish;
   }
 
   async getChangeDetails(changeId: string): Promise<{ threads: CommenterThreadInfo[]; approval: boolean }> {

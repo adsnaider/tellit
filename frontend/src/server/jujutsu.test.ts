@@ -2,7 +2,13 @@ import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { JujutsuService, type CommenterThreadInfo } from './jujutsu';
+import {
+  JJ_LOG_EDGE_MARKER,
+  JJ_LOG_NODE_MARKER,
+  JujutsuService,
+  parseJjLogGraph,
+  type CommenterThreadInfo,
+} from './jujutsu';
 import { createCommitMessageDiffFile } from './server';
 
 describe('JujutsuService comment aggregation', () => {
@@ -506,6 +512,348 @@ describe('JujutsuService comment aggregation', () => {
       );
 
       await expect(service.runTellit(['empty-err'])).rejects.toThrow(/Command failed/);
+    });
+  });
+
+  describe('parseJjLogGraph', () => {
+    const makeNodeLine = (
+      prefix: string,
+      opts: {
+        changeId: string;
+        shortestChangeId?: string;
+        commitId: string;
+        isWorkingCopy?: boolean;
+        isEmpty?: boolean;
+        isImmutable?: boolean;
+        isConflict?: boolean;
+        isRoot?: boolean;
+        bookmarks?: string[];
+        parents?: string[];
+        timestamp?: string;
+        description?: string;
+      },
+    ) => {
+      const fields = [
+        JJ_LOG_NODE_MARKER,
+        opts.changeId,
+        opts.shortestChangeId ?? opts.changeId.slice(0, 1),
+        opts.commitId,
+        opts.isWorkingCopy ? '1' : '0',
+        opts.isEmpty ? '1' : '0',
+        opts.isImmutable ? '1' : '0',
+        opts.isConflict ? '1' : '0',
+        opts.isRoot ? '1' : '0',
+        (opts.bookmarks ?? []).join(','),
+        (opts.parents ?? []).join(','),
+        opts.timestamp ?? '2026-11-12 13:59:09',
+      ];
+      if (opts.description !== undefined && opts.description.length > 0) {
+        fields.push(opts.description);
+      }
+      return `${prefix}${fields.join('\t')}`;
+    };
+
+    it('parses a linear stack with empty undescribed @, immutable main, root skipping, and trailing elision', () => {
+      const raw = [
+        makeNodeLine('@  ', {
+          changeId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          shortestChangeId: 'a',
+          commitId: '1111111111111111111111111111111111111111',
+          isWorkingCopy: true,
+          isEmpty: true,
+          parents: ['2222222222222222222222222222222222222222'],
+        }),
+        `│  ${JJ_LOG_EDGE_MARKER}`,
+        makeNodeLine('◆  ', {
+          changeId: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          shortestChangeId: 'b',
+          commitId: '2222222222222222222222222222222222222222',
+          isImmutable: true,
+          bookmarks: ['main'],
+          parents: ['0000000000000000000000000000000000000000'],
+          description: 'Initial commit',
+        }),
+        `│  ${JJ_LOG_EDGE_MARKER}`,
+        '│',
+        '~',
+      ].join('\n');
+
+      const { changes, graphRows } = parseJjLogGraph(raw);
+
+      expect(changes).toHaveLength(2);
+      expect(changes[0]).toMatchObject({
+        changeId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        shortestChangeId: 'a',
+        isWorkingCopy: true,
+        isEmpty: true,
+        hasDescription: false,
+        description: '(no description set)',
+        bookmarks: [],
+        parentCommitIds: ['2222222222222222222222222222222222222222'],
+      });
+      expect(changes[1]).toMatchObject({
+        changeId: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        isImmutable: true,
+        hasDescription: true,
+        description: 'Initial commit',
+        bookmarks: ['main'],
+      });
+
+      expect(graphRows).toHaveLength(3);
+      expect(graphRows[0]).toMatchObject({
+        type: 'commit',
+        key: '1111111111111111111111111111111111111111',
+        graphCols: ['@'],
+        downCols: [0],
+      });
+      expect(graphRows[1]).toMatchObject({
+        type: 'commit',
+        key: '2222222222222222222222222222222222222222',
+        graphCols: ['◆'],
+        downCols: [0],
+      });
+      expect(graphRows[2]).toMatchObject({
+        type: 'connector',
+        graphCols: ['~'],
+        isElided: true,
+        bridgesElided: false,
+      });
+    });
+
+    it('drops root commits and clears dangling downward stems on the preceding row', () => {
+      const raw = [
+        makeNodeLine('@  ', {
+          changeId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          commitId: '1111111111111111111111111111111111111111',
+          isWorkingCopy: true,
+          description: 'Top commit',
+        }),
+        `│  ${JJ_LOG_EDGE_MARKER}`,
+        makeNodeLine('◆  ', {
+          changeId: '00000000000000000000000000000000',
+          commitId: '0000000000000000000000000000000000000000',
+          isRoot: true,
+          isImmutable: true,
+        }),
+        `   ${JJ_LOG_EDGE_MARKER}`,
+      ].join('\n');
+
+      const { changes, graphRows } = parseJjLogGraph(raw);
+      expect(changes).toHaveLength(1);
+      expect(graphRows).toHaveLength(1);
+      expect(graphRows[0]?.type).toBe('commit');
+      if (graphRows[0]?.type === 'commit') {
+        expect(graphRows[0].downCols).toEqual([]);
+      }
+    });
+
+    it('parses branched histories, 2-parent merge edges, bridging elisions, and leading spaces on row 0', () => {
+      const raw = [
+        makeNodeLine('  @  ', {
+          changeId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          commitId: '1111111111111111111111111111111111111111',
+          isWorkingCopy: true,
+          description: 'Indented head commit',
+        }),
+        `  │  ${JJ_LOG_EDGE_MARKER}`,
+        makeNodeLine('○ │  ', {
+          changeId: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          commitId: '2222222222222222222222222222222222222222',
+          parents: [
+            '3333333333333333333333333333333333333333',
+            '4444444444444444444444444444444444444444',
+          ],
+          description: 'Merge commit',
+        }),
+        `├─╮ │  ${JJ_LOG_EDGE_MARKER}`,
+        makeNodeLine('│ ○ │  ', {
+          changeId: 'cccccccccccccccccccccccccccccccc',
+          commitId: '4444444444444444444444444444444444444444',
+          description: 'Side branch',
+        }),
+        `│ │ │  ${JJ_LOG_EDGE_MARKER}`,
+        '├─╯ │',
+        '│ ~  (elided revisions)',
+        makeNodeLine('◆  ', {
+          changeId: 'dddddddddddddddddddddddddddddddd',
+          commitId: '3333333333333333333333333333333333333333',
+          isImmutable: true,
+          bookmarks: ['main'],
+          description: 'Base',
+        }),
+        `   ${JJ_LOG_EDGE_MARKER}`,
+      ].join('\n');
+
+      const { changes, graphRows } = parseJjLogGraph(raw);
+      expect(changes).toHaveLength(4);
+
+      expect(graphRows[0]).toMatchObject({
+        type: 'commit',
+        graphCols: [' ', ' ', '@'],
+        downCols: [2],
+      });
+
+      // Merge commit emits downCols for upward-connecting glyphs and a connector row for ├─╮ │
+      expect(graphRows[1]).toMatchObject({
+        type: 'commit',
+        graphCols: ['○', ' ', '│'],
+        downCols: [0, 4],
+      });
+      expect(graphRows[2]).toMatchObject({
+        type: 'connector',
+        graphCols: ['├', '─', '╮', ' ', '│'],
+        isElided: false,
+        bridgesElided: false,
+      });
+
+      // Side branch commit & merge-back connector & bridging elision
+      expect(graphRows[3]).toMatchObject({
+        type: 'commit',
+        graphCols: ['│', ' ', '○', ' ', '│'],
+        downCols: [0, 2, 4],
+      });
+      expect(graphRows[4]).toMatchObject({
+        type: 'connector',
+        graphCols: ['├', '─', '╯', ' ', '│'],
+        isElided: false,
+        bridgesElided: false,
+      });
+      expect(graphRows[5]).toMatchObject({
+        type: 'connector',
+        graphCols: ['│', ' ', '~'],
+        isElided: true,
+        bridgesElided: true,
+      });
+      expect(graphRows[6]).toMatchObject({
+        type: 'commit',
+        graphCols: ['◆'],
+        downCols: [],
+      });
+    });
+
+    it('preserves leading spaces on row 0 in runJj for graph log calls', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'tellit-jj-run-'));
+      const originalPath = process.env.PATH;
+      try {
+        const mockJj = join(tempDir, 'jj-for-agents');
+        writeFileSync(
+          mockJj,
+          [
+            '#!/bin/sh',
+            'printf "  @  __TELLIT_NODE__\\tabc\\n  │  __TELLIT_EDGE__\\n"',
+            '',
+          ].join('\n'),
+          { mode: 0o755 },
+        );
+        process.env.PATH = `${tempDir}:${originalPath ?? ''}`;
+
+        const service = new JujutsuService(tempDir);
+        const graphOut = await service.runJj(['log', '--color=never', '-T', 'x']);
+        expect(graphOut).toBe('  @  __TELLIT_NODE__\tabc\n  │  __TELLIT_EDGE__');
+
+        const noGraphOut = await service.runJj(['log', '--no-graph', '-T', 'x']);
+        expect(noGraphOut).toBe('@  __TELLIT_NODE__\tabc\n  │  __TELLIT_EDGE__');
+      } finally {
+        process.env.PATH = originalPath;
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('resolveInitialTargetCommit', () => {
+    it('skips empty undescribed @ with zero comments and lands on @-', async () => {
+      const atCommit = '1111111111111111111111111111111111111111';
+      const parentCommit = '2222222222222222222222222222222222222222';
+      vi.spyOn(jjService, 'runJj').mockResolvedValue(
+        [
+          `${atCommit}\taaaaaaaa\t1\t0\t`,
+          `${parentCommit}\tbbbbbbbb\t0\t0\tImplement feature`,
+        ].join('\n'),
+      );
+      const detailsSpy = vi
+        .spyOn(jjService, 'getChangeDetails')
+        .mockResolvedValue({ threads: [], approval: false });
+
+      const resolved = await jjService.resolveInitialTargetCommit('HEAD');
+      expect(resolved).toBe(parentCommit);
+      expect(detailsSpy).toHaveBeenCalledWith('aaaaaaaa');
+    });
+
+    it('keeps @ when it is non-empty, even without a description', async () => {
+      const atCommit = '1111111111111111111111111111111111111111';
+      const parentCommit = '2222222222222222222222222222222222222222';
+      vi.spyOn(jjService, 'runJj').mockResolvedValue(
+        [
+          `${atCommit}\taaaaaaaa\t0\t0`,
+          `${parentCommit}\tbbbbbbbb\t0\t0\tParent`,
+        ].join('\n'),
+      );
+      const detailsSpy = vi.spyOn(jjService, 'getChangeDetails');
+
+      const resolved = await jjService.resolveInitialTargetCommit('@');
+      expect(resolved).toBe(atCommit);
+      expect(detailsSpy).not.toHaveBeenCalled();
+    });
+
+    it('keeps @ when it has a description, even if empty', async () => {
+      const atCommit = '1111111111111111111111111111111111111111';
+      vi.spyOn(jjService, 'runJj').mockResolvedValue(`${atCommit}\taaaaaaaa\t1\t0\tWIP: planned work`);
+
+      const resolved = await jjService.resolveInitialTargetCommit('HEAD');
+      expect(resolved).toBe(atCommit);
+    });
+
+    it('keeps empty undescribed @ when it already has review comments', async () => {
+      const atCommit = '1111111111111111111111111111111111111111';
+      const parentCommit = '2222222222222222222222222222222222222222';
+      vi.spyOn(jjService, 'runJj').mockResolvedValue(
+        [
+          `${atCommit}\taaaaaaaa\t1\t0\t`,
+          `${parentCommit}\tbbbbbbbb\t0\t0\tParent`,
+        ].join('\n'),
+      );
+      vi.spyOn(jjService, 'getChangeDetails').mockResolvedValue({
+        threads: [
+          {
+            thread_id: 't-1',
+            change_id: 'aaaaaaaa',
+            commit_id: atCommit,
+            git_commit_hash: atCommit,
+            filepath: 'README.md',
+            comments: ['Comment on empty change'],
+            resolved: false,
+          },
+        ],
+        approval: false,
+      });
+
+      const resolved = await jjService.resolveInitialTargetCommit('HEAD');
+      expect(resolved).toBe(atCommit);
+    });
+
+    it('resolves explicit change IDs and falls back to direct revset lookup', async () => {
+      const targetCommit = '3333333333333333333333333333333333333333';
+      const runJjSpy = vi.spyOn(jjService, 'runJj').mockImplementation(async (args) => {
+        const revIdx = args.indexOf('-r');
+        const rev = revIdx !== -1 ? args[revIdx + 1] : '';
+        if (rev === 'change_id(kzvq)') {
+          return targetCommit;
+        }
+        if (rev === 'change_id(main)') {
+          throw new Error('invalid change id');
+        }
+        if (rev === 'main') {
+          return '4444444444444444444444444444444444444444';
+        }
+        throw new Error('not found');
+      });
+
+      await expect(jjService.resolveInitialTargetCommit('kzvq')).resolves.toBe(targetCommit);
+      await expect(jjService.resolveInitialTargetCommit('main')).resolves.toBe(
+        '4444444444444444444444444444444444444444',
+      );
+      await expect(jjService.resolveInitialTargetCommit('missing-ref')).resolves.toBe('missing-ref');
+      expect(runJjSpy).toHaveBeenCalled();
     });
   });
 });

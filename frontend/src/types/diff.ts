@@ -130,9 +130,16 @@ export interface DiffCommentThread {
 export interface JjChange {
   changeId: string;
   shortChangeId: string;
+  shortestChangeId?: string;
   commitId: string;
   shortCommitId: string;
   isWorkingCopy: boolean;
+  isEmpty?: boolean;
+  hasDescription?: boolean;
+  isImmutable?: boolean;
+  isConflict?: boolean;
+  bookmarks?: string[];
+  parentCommitIds?: string[];
   timestamp: string;
   description: string;
   commentCount: number;
@@ -154,6 +161,22 @@ export interface JjCommit {
   cleanRebaseSourceCommitId?: string;
   cleanRebaseSourceCommitNumber?: number;
 }
+
+export type JjGraphRow =
+  | {
+      type: 'commit';
+      key: string;
+      graphCols: string[];
+      downCols: number[];
+      change: JjChange;
+    }
+  | {
+      type: 'connector';
+      key: string;
+      graphCols: string[];
+      isElided?: boolean;
+      bridgesElided?: boolean;
+    };
 
 interface CommentImportBase {
   id?: string;
@@ -230,34 +253,6 @@ export interface CommentThread {
   isOutdated?: boolean;
   messages: DiffCommentMessage[];
   resolved?: boolean;
-}
-
-export interface JjChange {
-  changeId: string;
-  shortChangeId: string;
-  commitId: string;
-  shortCommitId: string;
-  isWorkingCopy: boolean;
-  timestamp: string;
-  description: string;
-  commentCount: number;
-  unresolvedCommentCount: number;
-  approved?: boolean;
-  cleanRebaseApproved?: boolean;
-}
-
-export interface JjCommit {
-  commitId: string;
-  shortCommitId: string;
-  timestamp: string;
-  description: string;
-  isWorkingCopy: boolean;
-  commentCount: number;
-  unresolvedCommentCount: number;
-  approved?: boolean;
-  cleanRebaseApproved?: boolean;
-  cleanRebaseSourceCommitId?: string;
-  cleanRebaseSourceCommitNumber?: number;
 }
 
 // Revision selector types

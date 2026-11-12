@@ -259,14 +259,11 @@ program
       let repoPath: string | undefined;
       const jjService = new JujutsuService();
       const isJj = await jjService.isJjRepo();
-      if (isJj && commitish === 'HEAD') {
+      if (isJj && !isSpecialArg(commitish)) {
         try {
-          const jjCommit = await jjService.runJj(['log', '-r', '@', '--no-graph', '-T', 'commit_id']);
-          if (jjCommit) {
-            commitish = jjCommit;
-          }
+          commitish = await jjService.resolveInitialTargetCommit(commitish);
         } catch {
-          // ignore
+          // Fall back to original commitish
         }
       }
       try {

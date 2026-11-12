@@ -609,11 +609,24 @@ export async function startServer(
       const query = req.query.query as string | undefined;
       if (query && query.trim()) {
         const change = await jjService.getChange(query.trim());
-        res.json({ changes: change ? [change] : [] });
+        res.json({
+          changes: change ? [change] : [],
+          graphRows: change
+            ? [
+                {
+                  type: 'commit',
+                  key: change.commitId,
+                  graphCols: [change.isWorkingCopy ? '@' : change.isImmutable ? '◆' : '○'],
+                  downCols: [],
+                  change,
+                },
+              ]
+            : [],
+        });
         return;
       }
-      const changes = await jjService.getChanges();
-      res.json({ changes });
+      const { changes, graphRows } = await jjService.getChangesGraph();
+      res.json({ changes, graphRows });
     } catch (error) {
       console.error('Error fetching jj changes:', error);
       res.status(500).json({ error: 'Failed to fetch jj changes' });

@@ -382,17 +382,39 @@ fn effective_jj_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
     effective
 }
 
+const MAX_ETXTBSY_RETRIES: u32 = 10;
+
+/// Spawns `jj_bin` with `args`, retrying transient `ExecutableFileBusy` errors.
+///
+/// On Unix, concurrent `Command::output` calls can briefly duplicate a freshly
+/// written script's file descriptor across `fork` and `execvp`, triggering
+/// `ETXTBSY` even after the writer closed its handle. Retrying with bounded
+/// backoff gives the child process time to close the inherited descriptor.
+fn spawn_jj_output(jj_bin: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    let mut attempt = 0u32;
+    loop {
+        match std::process::Command::new(jj_bin).args(args).output() {
+            Ok(output) => return Ok(output),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempt < MAX_ETXTBSY_RETRIES =>
+            {
+                std::thread::sleep(core::time::Duration::from_millis(1u64 << attempt.min(5)));
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 fn run_jj_with_bin(jj_bin: &Path, args: &[&str]) -> Result<String> {
     let effective_args = effective_jj_args(args);
-    let output = std::process::Command::new(jj_bin)
-        .args(&effective_args)
-        .output()
-        .with_context(|| {
-            format!(
-                "Failed to execute '{}'. Is jj installed and available in PATH?",
-                jj_bin.display()
-            )
-        })?;
+    let output = spawn_jj_output(jj_bin, &effective_args).with_context(|| {
+        format!(
+            "Failed to execute '{}'. Is jj installed and available in PATH?",
+            jj_bin.display()
+        )
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("jj error: {}", stderr.trim());
@@ -1264,11 +1286,24 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn test_run_jj_with_bin() {
+    fn write_mock_jj_script(path: &Path, script: &str) {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
 
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o755)
+            .open(path)
+            .unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_jj_with_bin() {
         let dir = tempdir().unwrap();
         let script_path = dir.path().join("mock-jj");
         let script = "\
@@ -1300,18 +1335,7 @@ case \"$3\" in
         ;;
 esac
 ";
-
-        {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .mode(0o755)
-                .open(&script_path)
-                .unwrap();
-            file.write_all(script.as_bytes()).unwrap();
-            file.sync_all().unwrap();
-        }
+        write_mock_jj_script(&script_path, script);
 
         let stdout = run_jj_with_bin(&script_path, &["root"]).unwrap();
         assert_eq!(stdout, "/tmp/mock-workspace");
@@ -1327,5 +1351,64 @@ esac
 
         let missing_err = run_jj_with_bin(&dir.path().join("missing-jj"), &["root"]).unwrap_err();
         assert!(missing_err.to_string().contains("Failed to execute"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_jj_with_bin_retries_executable_file_busy() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempdir().unwrap();
+        let simple_script = "#!/bin/sh\nprintf '/tmp/mock-workspace\\n'\n";
+
+        // (a) Deterministic transient ETXTBSY recovery while another handle briefly holds write access.
+        let transient_path = dir.path().join("mock-jj-transient");
+        write_mock_jj_script(&transient_path, simple_script);
+        let hold_write = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transient_path)
+            .unwrap();
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                std::thread::sleep(core::time::Duration::from_millis(5));
+                drop(hold_write);
+            });
+            let stdout = run_jj_with_bin(&transient_path, &["root"]).unwrap();
+            assert_eq!(stdout, "/tmp/mock-workspace");
+        });
+
+        // (b) Bounded retry exhaustion when write access stays held across all attempts.
+        #[cfg(target_os = "linux")]
+        {
+            let busy_path = dir.path().join("mock-jj-busy");
+            write_mock_jj_script(&busy_path, simple_script);
+            let _held = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&busy_path)
+                .unwrap();
+            let err = run_jj_with_bin(&busy_path, &["root"]).unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+                Some(std::io::ErrorKind::ExecutableFileBusy)
+            );
+        }
+
+        // (c) Concurrent missing-binary spawn race while creating and running fresh scripts.
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = run_jj_with_bin(Path::new("tellit-missing-jj-race-probe"), &["root"]);
+                }
+            });
+
+            for i in 0..20 {
+                let path = dir.path().join(format!("mock-jj-{i}"));
+                write_mock_jj_script(&path, simple_script);
+                let stdout = run_jj_with_bin(&path, &["root"]).unwrap();
+                assert_eq!(stdout, "/tmp/mock-workspace");
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
     }
 }

@@ -1,4 +1,15 @@
-import { Columns, AlignLeft, Settings, PanelLeftClose, PanelLeft, Keyboard, MessageSquare, AlertTriangle, CheckCircle2 } from 'lucide-react';
+import {
+  Columns,
+  AlignLeft,
+  Settings,
+  PanelLeftClose,
+  PanelLeft,
+  Keyboard,
+  MessageSquare,
+  AlertTriangle,
+  CheckCircle2,
+  X,
+} from 'lucide-react';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 
 import {
@@ -158,6 +169,19 @@ const getStoredSidebarOpen = (): boolean | null => {
 
 const getInitialFileTreeOpen = () => getStoredSidebarOpen() ?? true;
 
+const readApiErrorMessage = async (res: Response, fallbackMessage: string): Promise<string> => {
+  try {
+    const payload = (await res.json()) as { error?: unknown };
+    if (typeof payload.error === 'string' && payload.error.trim()) {
+      return payload.error.trim();
+    }
+  } catch {
+    // Fall through to HTTP status details when the body is not JSON.
+  }
+  const statusSuffix = res.statusText ? `${res.status} ${res.statusText}` : `${res.status}`;
+  return `${fallbackMessage} (${statusSuffix})`;
+};
+
 function App() {
   const [diffData, setDiffData] = useState<DiffResponse | null>(null);
   const [diffDataVersion, setDiffDataVersion] = useState(0);
@@ -165,6 +189,7 @@ function App() {
   const [ignoreWhitespace, setIgnoreWhitespace] = useState(true);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [commentError, setCommentError] = useState<string | null>(null);
   const [isCopiedAll, setIsCopiedAll] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(getInitialSidebarWidth);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -1227,16 +1252,29 @@ function App() {
           side === 'old' && jjBaseCommitId && jjBaseCommitId !== 'parent'
             ? jjBaseCommitId
             : jjCommitId;
-        await fetch('/api/jj/comments', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            commitId: targetCommit,
-            filePath: file,
-            line: typeof line === 'number' ? line : { start: line[0], end: line[1] },
-            content: body,
-          }),
-        });
+        let res: Response;
+        try {
+          res = await fetch('/api/jj/comments', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              commitId: targetCommit,
+              filePath: file,
+              line: typeof line === 'number' ? line : { start: line[0], end: line[1] },
+              content: body,
+            }),
+          });
+        } catch (err) {
+          const msg = err instanceof Error && err.message ? err.message : 'Failed to add comment';
+          setCommentError(msg);
+          throw new Error(msg, { cause: err });
+        }
+        if (!res.ok) {
+          const msg = await readApiErrorMessage(res, 'Failed to add comment');
+          setCommentError(msg);
+          throw new Error(msg);
+        }
+        setCommentError(null);
         await refreshJjComments(jjCommitId, jjBaseCommitId);
         return;
       }
@@ -1261,11 +1299,25 @@ function App() {
   const handleReplyToThread = useCallback(
     async (threadId: string, body: string): Promise<void> => {
       if (isJjRepo && jjCommitId) {
-        await fetch(`/api/jj/comments/${encodeURIComponent(threadId)}/reply`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: body }),
-        });
+        let res: Response;
+        try {
+          res = await fetch(`/api/jj/comments/${encodeURIComponent(threadId)}/reply`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: body }),
+          });
+        } catch (err) {
+          const msg =
+            err instanceof Error && err.message ? err.message : 'Failed to reply to comment';
+          setCommentError(msg);
+          throw new Error(msg, { cause: err });
+        }
+        if (!res.ok) {
+          const msg = await readApiErrorMessage(res, 'Failed to reply to comment');
+          setCommentError(msg);
+          throw new Error(msg);
+        }
+        setCommentError(null);
         await refreshJjComments(jjCommitId, jjBaseCommitId);
         return;
       }
@@ -1281,12 +1333,31 @@ function App() {
         const thread = threads.find((t) => t.id === threadId);
         const isResolved =
           currentResolved !== undefined ? currentResolved : Boolean(thread?.resolved);
-        await fetch(`/api/jj/comments/${encodeURIComponent(threadId)}/resolve`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ unresolve: isResolved }),
-        });
-        await refreshJjComments(jjCommitId, jjBaseCommitId);
+        try {
+          const res = await fetch(`/api/jj/comments/${encodeURIComponent(threadId)}/resolve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ unresolve: isResolved }),
+          });
+          if (!res.ok) {
+            const msg = await readApiErrorMessage(
+              res,
+              isResolved ? 'Failed to unresolve comment' : 'Failed to resolve comment',
+            );
+            setCommentError(msg);
+            return;
+          }
+          setCommentError(null);
+          await refreshJjComments(jjCommitId, jjBaseCommitId);
+        } catch (err) {
+          const msg =
+            err instanceof Error && err.message
+              ? err.message
+              : isResolved
+                ? 'Failed to unresolve comment'
+                : 'Failed to resolve comment';
+          setCommentError(msg);
+        }
         return;
       }
       removeThread(threadId);
@@ -1653,6 +1724,26 @@ function App() {
             </div>
           </div>
         </header>
+        {commentError && (
+          <div
+            role="alert"
+            className="bg-red-500/10 border-b border-red-500/30 px-4 py-2 text-xs text-red-300 flex items-center justify-between gap-2"
+          >
+            <div className="flex items-center gap-2 min-w-0">
+              <AlertTriangle size={14} className="shrink-0 text-red-400" />
+              <span className="break-words">{commentError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setCommentError(null)}
+              aria-label="Dismiss comment error"
+              title="Dismiss"
+              className="shrink-0 rounded p-0.5 text-red-300 hover:bg-red-500/20 hover:text-red-200 transition-colors"
+            >
+              <X size={14} />
+            </button>
+          </div>
+        )}
         {diffData?.rebaseConflict && (
           <div className="bg-yellow-500/10 border-b border-yellow-500/30 px-4 py-2 text-xs text-yellow-300 flex items-center gap-2">
             <AlertTriangle size={14} className="shrink-0 text-yellow-400" />

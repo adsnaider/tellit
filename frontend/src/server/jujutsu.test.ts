@@ -1,5 +1,8 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { JujutsuService, CommenterThreadInfo } from './jujutsu';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { JujutsuService, type CommenterThreadInfo } from './jujutsu';
 import { createCommitMessageDiffFile } from './server';
 
 describe('JujutsuService comment aggregation', () => {
@@ -158,7 +161,10 @@ describe('JujutsuService comment aggregation', () => {
 
   describe('createCommitMessageDiffFile', () => {
     it('creates an added virtual file when base description is empty', () => {
-      const file = createCommitMessageDiffFile('', 'feat: add user login\n\nFirst line\nSecond line');
+      const file = createCommitMessageDiffFile(
+        '',
+        'feat: add user login\n\nFirst line\nSecond line',
+      );
       expect(file.path).toBe('Commit Message');
       expect(file.status).toBe('added');
       expect(file.additions).toBe(4);
@@ -234,7 +240,11 @@ describe('JujutsuService comment aggregation', () => {
         }
         if (args[0] === 'diff') {
           expect(args).toEqual(['diff', '--no-color', '--no-ext-diff', virtualTreeOid, c2]);
-          return { stdout: 'diff --git a/only-author.txt b/only-author.txt\n', stderr: '', exitCode: 0 };
+          return {
+            stdout: 'diff --git a/only-author.txt b/only-author.txt\n',
+            stderr: '',
+            exitCode: 0,
+          };
         }
         return { stdout: '', stderr: '', exitCode: 1 };
       });
@@ -421,6 +431,81 @@ describe('JujutsuService comment aggregation', () => {
       expect(commits[0].approved).toBe(true);
       expect(commits[1].approved).toBe(false);
       expect(commits[1].cleanRebaseApproved).toBeUndefined();
+    });
+  });
+
+  describe('runTellit error formatting', () => {
+    let tempDir: string;
+    let originalTellitBin: string | undefined;
+
+    beforeEach(() => {
+      tempDir = mkdtempSync(join(tmpdir(), 'tellit-test-'));
+      originalTellitBin = process.env.TELLIT_BIN;
+    });
+
+    afterEach(() => {
+      if (originalTellitBin === undefined) {
+        delete process.env.TELLIT_BIN;
+      } else {
+        process.env.TELLIT_BIN = originalTellitBin;
+      }
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it('extracts trimmed stderr without leaking the command line or draft content', async () => {
+      const mockBin = join(tempDir, 'mock-tellit');
+      writeFileSync(
+        mockBin,
+        [
+          '#!/bin/sh',
+          'case "$2" in',
+          '  add)',
+          '    printf "  Error: jj error: The working copy is stale  \\n" >&2',
+          '    exit 1',
+          '    ;;',
+          '  reply)',
+          '    printf "  Store directory does not exist  \\n" >&2',
+          '    exit 1',
+          '    ;;',
+          '  empty-err)',
+          '    exit 1',
+          '    ;;',
+          '  ok)',
+          '    printf "  thread-uuid-123  \\n"',
+          '    exit 0',
+          '    ;;',
+          'esac',
+          '',
+        ].join('\n'),
+        { mode: 0o755 },
+      );
+      process.env.TELLIT_BIN = mockBin;
+
+      const service = new JujutsuService(tempDir);
+
+      await expect(service.runTellit(['ok'])).resolves.toBe('thread-uuid-123');
+
+      let addErr: Error | undefined;
+      try {
+        await service.addComment({
+          commitId: 'abc123',
+          filePath: 'src/lib.rs',
+          lineRange: 10,
+          content: 'Sensitive draft comment body',
+        });
+      } catch (err) {
+        addErr = err as Error;
+      }
+      expect(addErr).toBeInstanceOf(Error);
+      expect(addErr?.message).toBe('jj error: The working copy is stale');
+      expect(addErr?.message).not.toContain('Command failed');
+      expect(addErr?.message).not.toContain('Sensitive draft comment body');
+
+      await expect(service.replyComment('t-1', 'Reply body')).rejects.toThrow(
+        'Store directory does not exist',
+      );
+
+      await expect(service.runTellit(['empty-err'])).rejects.toThrow(/Command failed/);
     });
   });
 });

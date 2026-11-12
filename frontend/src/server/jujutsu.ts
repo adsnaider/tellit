@@ -95,8 +95,25 @@ export class JujutsuService {
   }
 
   async runTellit(args: string[]): Promise<string> {
-    const { stdout } = await execFileAsync(this.tellitBin, ['comment', ...args], { cwd: this.repoDir });
-    return stdout.trim();
+    try {
+      const { stdout } = await execFileAsync(this.tellitBin, ['comment', ...args], {
+        cwd: this.repoDir,
+      });
+      return stdout.trim();
+    } catch (error: unknown) {
+      const rawStderr =
+        typeof error === 'object' && error !== null && 'stderr' in error ? error.stderr : undefined;
+      const stderr =
+        typeof rawStderr === 'string'
+          ? rawStderr.trim()
+          : Buffer.isBuffer(rawStderr)
+            ? rawStderr.toString('utf8').trim()
+            : '';
+      if (stderr) {
+        throw new Error(stderr.replace(/^Error:\s*/, ''), { cause: error });
+      }
+      throw error instanceof Error ? error : new Error('Failed to run tellit');
+    }
   }
 
   async runGit(args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> {

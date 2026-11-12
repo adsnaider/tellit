@@ -33,16 +33,25 @@ export function CommentForm({
 }: CommentFormProps) {
   const [body, setBody] = useState(initialValue);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
   const [mode, setMode] = useState<CommentFormMode>('edit');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const hasSuggestion = hasSuggestionInBody(body);
   const effectiveMode: CommentFormMode = hasSuggestion ? mode : 'edit';
+
+  const handleBodyChange = (nextBody: string) => {
+    setBody(nextBody);
+    if (submitError !== null) {
+      setSubmitError(null);
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
     if (!body.trim()) return;
 
+    setSubmitError(null);
     setIsSubmitting(true);
     try {
       await onSubmit(body.trim());
@@ -50,6 +59,9 @@ export function CommentForm({
       setMode('edit');
     } catch (error) {
       console.error('Failed to submit comment:', error);
+      setSubmitError(
+        error instanceof Error && error.message.trim() ? error.message : 'Failed to submit comment',
+      );
     } finally {
       setIsSubmitting(false);
     }
@@ -107,7 +119,7 @@ export function CommentForm({
           <SuggestionTemplateButton
             selectedCode={selectedCode}
             value={body}
-            onChange={setBody}
+            onChange={handleBodyChange}
             textareaRef={textareaRef}
           />
         )}
@@ -127,13 +139,22 @@ export function CommentForm({
           ref={textareaRef}
           className="w-full min-h-[60px] mb-2 resize-y bg-github-bg-secondary border border-github-border rounded px-3 py-2 text-github-text-primary text-sm leading-6 focus:outline-none focus:border-blue-600 focus:ring-2 focus:ring-blue-600/30 focus:min-h-[80px] disabled:opacity-50"
           value={body}
-          onChange={(e) => setBody(e.target.value)}
+          onChange={(e) => handleBodyChange(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder={placeholder}
           rows={Math.max(3, body.split('\n').length)}
           autoFocus
           disabled={isSubmitting}
         />
+      )}
+
+      {submitError && (
+        <div
+          role="alert"
+          className="mb-2 rounded border border-red-500/40 bg-red-500/10 px-2.5 py-1.5 text-xs text-red-300 break-words"
+        >
+          {submitError}
+        </div>
       )}
 
       <div className="flex gap-2 justify-end">

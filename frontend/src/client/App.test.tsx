@@ -1078,3 +1078,312 @@ describe('App Component - Mobile sidebar auto-close', () => {
     });
   });
 });
+
+describe('App Component - Jujutsu comment error handling', () => {
+  const jjDiffResponse: DiffResponse = {
+    ...mockDiffResponse,
+    commit: 'commit123',
+    baseCommitish: 'commit000',
+    targetCommitish: 'commit123',
+    requestedBaseCommitish: 'commit000',
+    requestedTargetCommitish: 'commit123',
+    files: [
+      {
+        path: 'test.ts',
+        status: 'modified',
+        additions: 1,
+        deletions: 0,
+        chunks: [
+          {
+            header: '@@ -10,1 +10,1 @@',
+            oldStart: 10,
+            oldLines: 1,
+            newStart: 10,
+            newLines: 1,
+            lines: [
+              {
+                type: 'add',
+                content: 'const first = 1;',
+                newLineNumber: 10,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockComments = [];
+    mockConfirm.mockReturnValue(false);
+    window.localStorage.setItem('difit.diffViewMode', 'unified');
+  });
+
+  it('shows a dismissible error banner and preserves the draft when POST /api/jj/comments fails', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    vi.mocked(global.fetch).mockImplementation((input, init) => {
+      const url = String(input);
+      if (url === '/api/jj/status') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ isJj: true }),
+        } as Response);
+      }
+      if (url === '/api/jj/changes') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ changes: [] }),
+        } as Response);
+      }
+      if (url === '/api/jj/comments' && init?.method === 'POST') {
+        return Promise.resolve({
+          ok: false,
+          status: 500,
+          statusText: 'Internal Server Error',
+          json: async () => ({ error: 'jj error: The working copy is stale' }),
+        } as Response);
+      }
+      if (url.startsWith('/api/jj/comments')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ threads: mockComments }),
+        } as Response);
+      }
+      if (url.includes('/api/revisions')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => null,
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => jjDiffResponse,
+        blob: async () => ({ size: 1024 }),
+      } as Response);
+    });
+
+    const { container } = renderApp();
+
+    await waitFor(() => {
+      expect(vi.mocked(global.fetch)).toHaveBeenCalledWith(
+        expect.stringContaining('/api/jj/comments?target=commit123'),
+      );
+    });
+
+    const row = await waitFor(() => {
+      const found = container.querySelector('[data-diff-line-row="true"]');
+      expect(found).not.toBeNull();
+      return found!;
+    });
+
+    fireEvent.click(row);
+    fireEvent.click(row, { shiftKey: true });
+
+    const textarea = await screen.findByPlaceholderText('Leave a comment...');
+    fireEvent.change(textarea, { target: { value: 'Draft comment on stale workspace' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Submit' }));
+
+    const alerts = await waitFor(() => {
+      const foundAlerts = screen.getAllByRole('alert');
+      expect(foundAlerts).toHaveLength(2);
+      return foundAlerts;
+    });
+    for (const alert of alerts) {
+      expect(alert).toHaveTextContent('jj error: The working copy is stale');
+    }
+    expect(screen.getByPlaceholderText('Leave a comment...')).toHaveValue(
+      'Draft comment on stale workspace',
+    );
+
+    // Dismissing the top-level banner leaves the inline form draft intact.
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss comment error' }));
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
+    expect(screen.getByPlaceholderText('Leave a comment...')).toHaveValue(
+      'Draft comment on stale workspace',
+    );
+
+    consoleErrorSpy.mockRestore();
+  });
+
+  it('preserves the reply draft and surfaces errors when POST /api/jj/comments/:id/reply fails', async () => {
+    mockComments = [
+      createMockThread({
+        id: 'thread-99',
+        filePath: 'test.ts',
+        line: 10,
+        body: 'Initial thread comment',
+      }),
+    ];
+
+    let replyAttempts = 0;
+    vi.mocked(global.fetch).mockImplementation((input, init) => {
+      const url = String(input);
+      if (url === '/api/jj/status') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ isJj: true }),
+        } as Response);
+      }
+      if (url === '/api/jj/changes') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ changes: [] }),
+        } as Response);
+      }
+      if (url === '/api/jj/comments/thread-99/reply' && init?.method === 'POST') {
+        replyAttempts += 1;
+        if (replyAttempts === 1) {
+          return Promise.resolve({
+            ok: false,
+            status: 500,
+            statusText: 'Internal Server Error',
+            json: async () => ({ error: 'jj error: Thread not found in revision' }),
+          } as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ id: 'reply-1', success: true }),
+        } as Response);
+      }
+      if (url.startsWith('/api/jj/comments')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ threads: mockComments }),
+        } as Response);
+      }
+      if (url.includes('/api/revisions')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => null,
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => jjDiffResponse,
+        blob: async () => ({ size: 1024 }),
+      } as Response);
+    });
+
+    renderApp();
+
+    await waitFor(() => {
+      expect(vi.mocked(global.fetch)).toHaveBeenCalledWith(
+        expect.stringContaining('/api/jj/comments?target=commit123'),
+      );
+    });
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Write a reply...' }));
+    const replyTextarea = await screen.findByPlaceholderText('Write a reply...');
+    fireEvent.change(replyTextarea, { target: { value: 'Follow-up note' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Reply' }));
+
+    const alerts = await waitFor(() => {
+      const foundAlerts = screen.getAllByRole('alert');
+      expect(foundAlerts).toHaveLength(2);
+      return foundAlerts;
+    });
+    for (const alert of alerts) {
+      expect(alert).toHaveTextContent('jj error: Thread not found in revision');
+    }
+    expect(screen.getByPlaceholderText('Write a reply...')).toHaveValue('Follow-up note');
+
+    // Retrying clears the banner and closes the reply form on success.
+    fireEvent.click(screen.getByRole('button', { name: 'Reply' }));
+    await waitFor(() => {
+      expect(replyAttempts).toBe(2);
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(screen.queryByPlaceholderText('Write a reply...')).not.toBeInTheDocument();
+    });
+  });
+
+  it('shows the error banner cleanly when POST /api/jj/comments/:id/resolve fails and clears it on success', async () => {
+    mockComments = [
+      createMockThread({
+        id: 'thread-42',
+        filePath: 'test.ts',
+        line: 10,
+        body: 'Check error handling',
+      }),
+    ];
+
+    let resolveAttempts = 0;
+    vi.mocked(global.fetch).mockImplementation((input, init) => {
+      const url = String(input);
+      if (url === '/api/jj/status') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ isJj: true }),
+        } as Response);
+      }
+      if (url === '/api/jj/changes') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ changes: [] }),
+        } as Response);
+      }
+      if (url === '/api/jj/comments/thread-42/resolve' && init?.method === 'POST') {
+        resolveAttempts += 1;
+        if (resolveAttempts === 1) {
+          return Promise.resolve({
+            ok: false,
+            status: 500,
+            statusText: 'Internal Server Error',
+            json: async () => ({ error: 'jj error: Failed to write store' }),
+          } as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ success: true, resolved: true }),
+        } as Response);
+      }
+      if (url.startsWith('/api/jj/comments')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ threads: mockComments }),
+        } as Response);
+      }
+      if (url.includes('/api/revisions')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => null,
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => jjDiffResponse,
+        blob: async () => ({ size: 1024 }),
+      } as Response);
+    });
+
+    renderApp();
+
+    await waitFor(() => {
+      expect(vi.mocked(global.fetch)).toHaveBeenCalledWith(
+        expect.stringContaining('/api/jj/comments?target=commit123'),
+      );
+    });
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Resolve thread' }));
+    const confirmButton = screen.queryByRole('button', { name: 'Resolve' });
+    if (confirmButton) {
+      fireEvent.click(confirmButton);
+    }
+
+    const banner = await screen.findByRole('alert');
+    expect(banner).toHaveTextContent('jj error: Failed to write store');
+
+    // Retrying clears the error banner once the resolve request succeeds.
+    fireEvent.click(screen.getByRole('button', { name: 'Resolve thread' }));
+    const retryConfirm = screen.queryByRole('button', { name: 'Resolve' });
+    if (retryConfirm) {
+      fireEvent.click(retryConfirm);
+    }
+
+    await waitFor(() => {
+      expect(resolveAttempts).toBe(2);
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+  });
+});

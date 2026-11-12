@@ -340,11 +340,59 @@ pub struct GetCommitArgs {
     pub threads: bool,
 }
 
+/// Runs `jj` with `args` and returns its trimmed standard output.
+///
+/// Prepends `--no-pager` and `--ignore-working-copy` unless already present. Operation-pinned
+/// invocations (`--at-op` or `--at-operation`) omit `--ignore-working-copy` because Jujutsu
+/// rejects combining those flags.
+///
+/// # Errors
+///
+/// Returns an error if spawning `jj` fails or `jj` exits with a non-zero status.
+///
+/// # Examples
+///
+/// ```no_run
+/// let root = tellit_cli::run_jj(&["root"])?;
+/// assert!(!root.is_empty());
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub fn run_jj(args: &[&str]) -> Result<String> {
-    let output = std::process::Command::new("jj")
-        .args(args)
+    run_jj_with_bin(Path::new("jj"), args)
+}
+
+/// Prepends `--no-pager` and `--ignore-working-copy` to `args` when compatible and not already set.
+fn effective_jj_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let flag_args = args.split(|&arg| arg == "--").next().unwrap_or(args);
+    let has_no_pager = flag_args.contains(&"--no-pager");
+    let has_ignore_wc_or_at_op = flag_args.iter().any(|&arg| {
+        matches!(arg, "--ignore-working-copy" | "--at-op" | "--at-operation")
+            || arg.starts_with("--at-op=")
+            || arg.starts_with("--at-operation=")
+    });
+
+    let mut effective = Vec::with_capacity(args.len() + 2);
+    if !has_no_pager {
+        effective.push("--no-pager");
+    }
+    if !has_ignore_wc_or_at_op {
+        effective.push("--ignore-working-copy");
+    }
+    effective.extend_from_slice(args);
+    effective
+}
+
+fn run_jj_with_bin(jj_bin: &Path, args: &[&str]) -> Result<String> {
+    let effective_args = effective_jj_args(args);
+    let output = std::process::Command::new(jj_bin)
+        .args(&effective_args)
         .output()
-        .with_context(|| "Failed to execute 'jj'. Is jj installed and available in PATH?")?;
+        .with_context(|| {
+            format!(
+                "Failed to execute '{}'. Is jj installed and available in PATH?",
+                jj_bin.display()
+            )
+        })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("jj error: {}", stderr.trim());
@@ -1156,5 +1204,128 @@ mod tests {
         // Test disapprove
         set_commit_approval(&store, Some(commit_hash), true).unwrap();
         assert!(!is_commit_approved(&store, commit_hash));
+    }
+
+    #[test]
+    fn test_effective_jj_args() {
+        assert_eq!(
+            effective_jj_args(&["root"]),
+            vec!["--no-pager", "--ignore-working-copy", "root"]
+        );
+        assert_eq!(
+            effective_jj_args(&["log", "-r", "@"]),
+            vec!["--no-pager", "--ignore-working-copy", "log", "-r", "@"]
+        );
+
+        // Avoids duplicating --ignore-working-copy or --no-pager when already present.
+        assert_eq!(
+            effective_jj_args(&["--ignore-working-copy", "root"]),
+            vec!["--no-pager", "--ignore-working-copy", "root"]
+        );
+        assert_eq!(
+            effective_jj_args(&["--no-pager", "root"]),
+            vec!["--ignore-working-copy", "--no-pager", "root"]
+        );
+        assert_eq!(
+            effective_jj_args(&["--no-pager", "--ignore-working-copy", "log", "-r", "@"]),
+            vec!["--no-pager", "--ignore-working-copy", "log", "-r", "@"]
+        );
+
+        // Omits --ignore-working-copy when args already pin an operation.
+        assert_eq!(
+            effective_jj_args(&["--at-op", "@-", "log"]),
+            vec!["--no-pager", "--at-op", "@-", "log"]
+        );
+        assert_eq!(
+            effective_jj_args(&["--at-operation", "abc123", "log"]),
+            vec!["--no-pager", "--at-operation", "abc123", "log"]
+        );
+        assert_eq!(
+            effective_jj_args(&["--at-op=@-", "log"]),
+            vec!["--no-pager", "--at-op=@-", "log"]
+        );
+        assert_eq!(
+            effective_jj_args(&["--at-operation=abc123", "log"]),
+            vec!["--no-pager", "--at-operation=abc123", "log"]
+        );
+
+        // Positional paths after `--` do not suppress global flags.
+        assert_eq!(
+            effective_jj_args(&["diff", "--", "--at-op", "--no-pager"]),
+            vec![
+                "--no-pager",
+                "--ignore-working-copy",
+                "diff",
+                "--",
+                "--at-op",
+                "--no-pager"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_jj_with_bin() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("mock-jj");
+        let script = "\
+#!/bin/sh
+if [ \"$1\" != \"--no-pager\" ]; then
+    printf 'expected $1 to be --no-pager, got %s\\n' \"$1\" >&2
+    exit 2
+fi
+if [ \"$2\" = \"--at-op\" ]; then
+    printf '  pinned-op-output  \\n\\n'
+    exit 0
+fi
+if [ \"$2\" != \"--ignore-working-copy\" ]; then
+    printf 'expected $2 to be --ignore-working-copy, got %s\\n' \"$2\" >&2
+    exit 2
+fi
+case \"$3\" in
+    root)
+        printf '\\n  /tmp/mock-workspace  \\n'
+        exit 0
+        ;;
+    fail)
+        printf '  Error: Revision `badrev` does not exist  \\n' >&2
+        exit 1
+        ;;
+    *)
+        printf 'unexpected subcommand: %s\\n' \"$3\" >&2
+        exit 3
+        ;;
+esac
+";
+
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o755)
+                .open(&script_path)
+                .unwrap();
+            file.write_all(script.as_bytes()).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let stdout = run_jj_with_bin(&script_path, &["root"]).unwrap();
+        assert_eq!(stdout, "/tmp/mock-workspace");
+
+        let pinned = run_jj_with_bin(&script_path, &["--at-op", "@-", "log"]).unwrap();
+        assert_eq!(pinned, "pinned-op-output");
+
+        let err = run_jj_with_bin(&script_path, &["fail"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "jj error: Error: Revision `badrev` does not exist"
+        );
+
+        let missing_err = run_jj_with_bin(&dir.path().join("missing-jj"), &["root"]).unwrap_err();
+        assert!(missing_err.to_string().contains("Failed to execute"));
     }
 }

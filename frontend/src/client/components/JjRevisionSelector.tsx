@@ -469,6 +469,132 @@ export function JjChangeSelector({
   );
 }
 
+export interface IndexedJjCommit {
+  commit: JjCommit;
+  commitNumber: number;
+}
+
+export interface IsInterestingCommitOptions {
+  isLatest: boolean;
+  targetCommitId?: string;
+  baseCommitId?: string;
+}
+
+export function isInterestingCommit(
+  commit: JjCommit,
+  { isLatest, targetCommitId, baseCommitId }: IsInterestingCommitOptions,
+): boolean {
+  if (isLatest) return true;
+  if (Boolean(commit.approved) || commit.commentCount > 0) return true;
+  if (commitIdsMatch(commit.commitId, targetCommitId)) return true;
+  return (
+    Boolean(baseCommitId) &&
+    baseCommitId !== 'parent' &&
+    commitIdsMatch(commit.commitId, baseCommitId)
+  );
+}
+
+export function filterInterestingCommits(
+  commits: JjCommit[],
+  options: { targetCommitId?: string; baseCommitId?: string } = {},
+): IndexedJjCommit[] {
+  const { targetCommitId, baseCommitId } = options;
+  return commits
+    .map((commit, originalIndex) => ({
+      commit,
+      commitNumber: originalIndex + 1,
+      isLatest: originalIndex === commits.length - 1,
+    }))
+    .filter(({ commit, isLatest }) =>
+      isInterestingCommit(commit, { isLatest, targetCommitId, baseCommitId }),
+    )
+    .map(({ commit, commitNumber }) => ({ commit, commitNumber }))
+    .reverse();
+}
+
+function CommitOptionRow({
+  commit,
+  commitNumber,
+  isSelected,
+  isTarget = false,
+  onSelect,
+}: {
+  commit: JjCommit;
+  commitNumber: number;
+  isSelected: boolean;
+  isTarget?: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      className={`w-full px-2.5 py-1.5 text-left text-xs font-mono flex items-center justify-between gap-2 transition-colors cursor-pointer ${
+        isSelected
+          ? 'bg-github-bg-tertiary text-github-accent font-medium'
+          : 'text-github-text-primary hover:bg-github-bg-tertiary'
+      }`}
+    >
+      <div className="flex items-center gap-1.5 min-w-0 truncate">
+        <span className="text-github-text-muted shrink-0 text-[10px]">#{commitNumber}</span>
+        <span className="font-semibold text-github-text-primary shrink-0">
+          {commit.shortCommitId}
+        </span>
+        {commit.timestamp && (
+          <span className="text-github-text-muted shrink-0 text-[10px]">
+            [{commit.timestamp.slice(5, 16)}]
+          </span>
+        )}
+        <span className="text-github-text-secondary truncate text-[11px]">{commit.description}</span>
+        {isTarget && (
+          <span className="text-[10px] text-github-text-muted italic shrink-0">(head)</span>
+        )}
+      </div>
+      <CommentDot
+        commentCount={commit.commentCount}
+        unresolvedCommentCount={commit.unresolvedCommentCount}
+        approved={commit.approved}
+        cleanRebaseApproved={commit.cleanRebaseApproved}
+        cleanRebaseSourceNumber={commit.cleanRebaseSourceCommitNumber}
+      />
+    </button>
+  );
+}
+
+function RevisionVisibilityFooter({
+  totalCount,
+  hiddenCount,
+  showAll,
+  onToggle,
+}: {
+  totalCount: number;
+  hiddenCount: number;
+  showAll: boolean;
+  onToggle: () => void;
+}) {
+  if (hiddenCount <= 0) return null;
+  return (
+    <div className="border-t border-github-border/50 mt-1 pt-1">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="w-full px-2.5 py-1.5 text-left text-xs text-github-accent hover:bg-github-bg-tertiary flex items-center justify-between gap-2 cursor-pointer font-sans"
+      >
+        {showAll ? (
+          <span>
+            Hide {hiddenCount} unreviewed {hiddenCount === 1 ? 'revision' : 'revisions'}
+          </span>
+        ) : (
+          <>
+            <span>Show all {totalCount} revisions</span>
+            <span className="text-[10px] text-github-text-muted">{hiddenCount} hidden</span>
+          </>
+        )}
+      </button>
+    </div>
+  );
+}
+
 export interface JjCommitComparisonSelectorProps {
   commits: JjCommit[];
   targetCommitId: string;
@@ -500,14 +626,26 @@ export function JjCommitComparisonSelector({
 }: JjCommitComparisonSelectorProps) {
   const [isFromOpen, setIsFromOpen] = useState(false);
   const [isToOpen, setIsToOpen] = useState(false);
+  const [showAllFrom, setShowAllFrom] = useState(false);
+  const [showAllTo, setShowAllTo] = useState(false);
   const fromDropdownRef = useRef<HTMLDivElement>(null);
   const toDropdownRef = useRef<HTMLDivElement>(null);
 
-  useClickOutside(fromDropdownRef, () => setIsFromOpen(false));
-  useClickOutside(toDropdownRef, () => setIsToOpen(false));
+  const closeFromDropdown = useCallback(() => {
+    setIsFromOpen(false);
+    setShowAllFrom(false);
+  }, []);
+
+  const closeToDropdown = useCallback(() => {
+    setIsToOpen(false);
+    setShowAllTo(false);
+  }, []);
+
+  useClickOutside(fromDropdownRef, closeFromDropdown);
+  useClickOutside(toDropdownRef, closeToDropdown);
 
   // Reverse chronological order for dropdown menus (top is latest commit)
-  const reversedCommits = useMemo(() => {
+  const reversedCommits = useMemo<IndexedJjCommit[]>(() => {
     return commits
       .map((commit, originalIndex) => ({
         commit,
@@ -516,10 +654,21 @@ export function JjCommitComparisonSelector({
       .reverse();
   }, [commits]);
 
-  const activeTargetIndex = commits.findIndex((c) => c.commitId === targetCommitId);
+  const interestingReversedCommits = useMemo<IndexedJjCommit[]>(
+    () => filterInterestingCommits(commits, { targetCommitId, baseCommitId }),
+    [commits, targetCommitId, baseCommitId],
+  );
+
+  const hiddenCount = reversedCommits.length - interestingReversedCommits.length;
+  const visibleFromCommits =
+    showAllFrom || hiddenCount === 0 ? reversedCommits : interestingReversedCommits;
+  const visibleToCommits =
+    showAllTo || hiddenCount === 0 ? reversedCommits : interestingReversedCommits;
+
+  const activeTargetIndex = commits.findIndex((c) => commitIdsMatch(c.commitId, targetCommitId));
   const activeTargetCommit = activeTargetIndex >= 0 ? commits[activeTargetIndex] : null;
 
-  const activeBaseIndex = commits.findIndex((c) => c.commitId === baseCommitId);
+  const activeBaseIndex = commits.findIndex((c) => commitIdsMatch(c.commitId, baseCommitId));
   const activeBaseCommit = activeBaseIndex >= 0 ? commits[activeBaseIndex] : null;
   const isBaseParent = baseCommitId === 'parent';
 
@@ -535,7 +684,13 @@ export function JjCommitComparisonSelector({
       <div className="relative" ref={fromDropdownRef}>
         <button
           type="button"
-          onClick={() => setIsFromOpen((prev) => !prev)}
+          onClick={() => {
+            if (isFromOpen) {
+              closeFromDropdown();
+            } else {
+              setIsFromOpen(true);
+            }
+          }}
           className="flex items-center gap-1.5 bg-github-bg-tertiary border border-github-border rounded px-2 py-1 text-github-text-primary hover:text-github-accent cursor-pointer max-w-[190px] truncate"
           title="Select diff base revision (From)"
         >
@@ -559,76 +714,51 @@ export function JjCommitComparisonSelector({
         </button>
 
         {isFromOpen && (
-          <div className="absolute left-0 top-full mt-1 z-50 bg-github-bg-secondary border border-github-border rounded-md shadow-xl py-1 w-84 max-h-72 overflow-y-auto">
+          <div className="absolute left-0 top-full mt-1 z-50 bg-github-bg-secondary border border-github-border rounded-md shadow-xl py-1 w-84">
             <div className="px-2.5 py-1 text-[11px] font-semibold text-github-text-muted uppercase tracking-wider border-b border-github-border/50">
               Diff Base (From)
             </div>
-            {/* Parent option */}
-            <button
-              type="button"
-              onClick={() => {
-                onSelectBase('parent');
-                setIsFromOpen(false);
-              }}
-              className={`w-full px-2.5 py-1.5 text-left text-xs font-mono flex items-center justify-between gap-2 transition-colors cursor-pointer ${
-                isBaseParent
-                  ? 'bg-github-bg-tertiary text-github-accent font-medium'
-                  : 'text-github-text-primary hover:bg-github-bg-tertiary'
-              }`}
-            >
-              <div className="flex items-center gap-1.5 min-w-0">
-                <span className="font-semibold text-github-text-primary">Parent</span>
-                <span className="text-github-text-secondary text-[11px]">(Entire Change)</span>
-              </div>
-            </button>
+            <div className="max-h-60 overflow-y-auto">
+              {/* Parent option */}
+              <button
+                type="button"
+                onClick={() => {
+                  onSelectBase('parent');
+                  closeFromDropdown();
+                }}
+                className={`w-full px-2.5 py-1.5 text-left text-xs font-mono flex items-center justify-between gap-2 transition-colors cursor-pointer ${
+                  isBaseParent
+                    ? 'bg-github-bg-tertiary text-github-accent font-medium'
+                    : 'text-github-text-primary hover:bg-github-bg-tertiary'
+                }`}
+              >
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <span className="font-semibold text-github-text-primary">Parent</span>
+                  <span className="text-github-text-secondary text-[11px]">(Entire Change)</span>
+                </div>
+              </button>
 
-            {/* Commits in reverse chronological order */}
-            {reversedCommits.map(({ commit, commitNumber }) => {
-              const isSelected = !isBaseParent && commit.commitId === baseCommitId;
-              const isTarget = commit.commitId === targetCommitId;
-              return (
-                <button
+              {/* Commits in reverse chronological order */}
+              {visibleFromCommits.map(({ commit, commitNumber }) => (
+                <CommitOptionRow
                   key={commit.commitId}
-                  type="button"
-                  onClick={() => {
+                  commit={commit}
+                  commitNumber={commitNumber}
+                  isSelected={!isBaseParent && commitIdsMatch(commit.commitId, baseCommitId)}
+                  isTarget={commitIdsMatch(commit.commitId, targetCommitId)}
+                  onSelect={() => {
                     onSelectBase(commit.commitId);
-                    setIsFromOpen(false);
+                    closeFromDropdown();
                   }}
-                  className={`w-full px-2.5 py-1.5 text-left text-xs font-mono flex items-center justify-between gap-2 transition-colors cursor-pointer ${
-                    isSelected
-                      ? 'bg-github-bg-tertiary text-github-accent font-medium'
-                      : 'text-github-text-primary hover:bg-github-bg-tertiary'
-                  }`}
-                >
-                  <div className="flex items-center gap-1.5 min-w-0 truncate">
-                    <span className="text-github-text-muted shrink-0 text-[10px]">
-                      #{commitNumber}
-                    </span>
-                    <span className="font-semibold text-github-text-primary shrink-0">
-                      {commit.shortCommitId}
-                    </span>
-                    {commit.timestamp && (
-                      <span className="text-github-text-muted shrink-0 text-[10px]">
-                        [{commit.timestamp.slice(5, 16)}]
-                      </span>
-                    )}
-                    <span className="text-github-text-secondary truncate text-[11px]">
-                      {commit.description}
-                    </span>
-                    {isTarget && (
-                      <span className="text-[10px] text-github-text-muted italic shrink-0">(head)</span>
-                    )}
-                  </div>
-                  <CommentDot
-                    commentCount={commit.commentCount}
-                    unresolvedCommentCount={commit.unresolvedCommentCount}
-                    approved={commit.approved}
-                    cleanRebaseApproved={commit.cleanRebaseApproved}
-                    cleanRebaseSourceNumber={commit.cleanRebaseSourceCommitNumber}
-                  />
-                </button>
-              );
-            })}
+                />
+              ))}
+            </div>
+            <RevisionVisibilityFooter
+              totalCount={commits.length}
+              hiddenCount={hiddenCount}
+              showAll={showAllFrom}
+              onToggle={() => setShowAllFrom((prev) => !prev)}
+            />
           </div>
         )}
       </div>
@@ -640,7 +770,13 @@ export function JjCommitComparisonSelector({
       <div className="relative" ref={toDropdownRef}>
         <button
           type="button"
-          onClick={() => setIsToOpen((prev) => !prev)}
+          onClick={() => {
+            if (isToOpen) {
+              closeToDropdown();
+            } else {
+              setIsToOpen(true);
+            }
+          }}
           className="flex items-center gap-1.5 bg-github-bg-tertiary border border-github-border rounded px-2 py-1 text-github-text-primary hover:text-github-accent cursor-pointer max-w-[240px] truncate"
           title="Select diff head revision (To)"
         >
@@ -668,53 +804,35 @@ export function JjCommitComparisonSelector({
         </button>
 
         {isToOpen && (
-          <div className="absolute right-0 top-full mt-1 z-50 bg-github-bg-secondary border border-github-border rounded-md shadow-xl py-1 w-84 max-h-72 overflow-y-auto">
+          <div className="absolute right-0 top-full mt-1 z-50 bg-github-bg-secondary border border-github-border rounded-md shadow-xl py-1 w-84">
             <div className="px-2.5 py-1 text-[11px] font-semibold text-github-text-muted uppercase tracking-wider border-b border-github-border/50">
-              Diff Head / Commits ({commits.length})
+              {`Diff Head / Commits (${
+                showAllTo || hiddenCount === 0
+                  ? commits.length
+                  : `${interestingReversedCommits.length} of ${commits.length}`
+              })`}
             </div>
-            {/* Commits in reverse chronological order */}
-            {reversedCommits.map(({ commit, commitNumber }) => {
-              const isSelected = commit.commitId === targetCommitId;
-              return (
-                <button
+            <div className="max-h-60 overflow-y-auto">
+              {/* Commits in reverse chronological order */}
+              {visibleToCommits.map(({ commit, commitNumber }) => (
+                <CommitOptionRow
                   key={commit.commitId}
-                  type="button"
-                  onClick={() => {
+                  commit={commit}
+                  commitNumber={commitNumber}
+                  isSelected={commitIdsMatch(commit.commitId, targetCommitId)}
+                  onSelect={() => {
                     onSelectTarget(commit.commitId);
-                    setIsToOpen(false);
+                    closeToDropdown();
                   }}
-                  className={`w-full px-2.5 py-1.5 text-left text-xs font-mono flex items-center justify-between gap-2 transition-colors cursor-pointer ${
-                    isSelected
-                      ? 'bg-github-bg-tertiary text-github-accent font-medium'
-                      : 'text-github-text-primary hover:bg-github-bg-tertiary'
-                  }`}
-                >
-                  <div className="flex items-center gap-1.5 min-w-0 truncate">
-                    <span className="text-github-text-muted shrink-0 text-[10px]">
-                      #{commitNumber}
-                    </span>
-                    <span className="font-semibold text-github-text-primary shrink-0">
-                      {commit.shortCommitId}
-                    </span>
-                    {commit.timestamp && (
-                      <span className="text-github-text-muted shrink-0 text-[10px]">
-                        [{commit.timestamp.slice(5, 16)}]
-                      </span>
-                    )}
-                    <span className="text-github-text-secondary truncate text-[11px]">
-                      {commit.description}
-                    </span>
-                  </div>
-                  <CommentDot
-                    commentCount={commit.commentCount}
-                    unresolvedCommentCount={commit.unresolvedCommentCount}
-                    approved={commit.approved}
-                    cleanRebaseApproved={commit.cleanRebaseApproved}
-                    cleanRebaseSourceNumber={commit.cleanRebaseSourceCommitNumber}
-                  />
-                </button>
-              );
-            })}
+                />
+              ))}
+            </div>
+            <RevisionVisibilityFooter
+              totalCount={commits.length}
+              hiddenCount={hiddenCount}
+              showAll={showAllTo}
+              onToggle={() => setShowAllTo((prev) => !prev)}
+            />
           </div>
         )}
       </div>

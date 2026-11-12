@@ -1386,4 +1386,154 @@ describe('App Component - Jujutsu comment error handling', () => {
       expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     });
   });
+
+  it('displays the Revisions tree above FileList, skips empty undescribed @, and hides the duplicate header Change selector when sidebar is open', async () => {
+    vi.mocked(useViewport).mockReturnValue({ isMobile: false, isDesktop: true });
+
+    const emptyAtChange = {
+      changeId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      shortChangeId: 'aaaaaaaa',
+      shortestChangeId: 'a',
+      commitId: '1111111111111111111111111111111111111111',
+      shortCommitId: '11111111',
+      isWorkingCopy: true,
+      isEmpty: true,
+      hasDescription: false,
+      isImmutable: false,
+      isConflict: false,
+      bookmarks: [],
+      parentCommitIds: ['2222222222222222222222222222222222222222'],
+      timestamp: '2026-11-12 19:00:00',
+      description: '(no description set)',
+      commentCount: 0,
+      unresolvedCommentCount: 0,
+    };
+
+    const parentChange = {
+      changeId: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      shortChangeId: 'bbbbbbbb',
+      shortestChangeId: 'b',
+      commitId: '2222222222222222222222222222222222222222',
+      shortCommitId: '22222222',
+      isWorkingCopy: false,
+      isEmpty: false,
+      hasDescription: true,
+      isImmutable: false,
+      isConflict: false,
+      bookmarks: ['feat-sidebar'],
+      parentCommitIds: [],
+      timestamp: '2026-11-12 18:55:00',
+      description: 'Active change under review',
+      commentCount: 0,
+      unresolvedCommentCount: 0,
+    };
+
+    const graphRows = [
+      {
+        type: 'commit' as const,
+        key: emptyAtChange.commitId,
+        graphCols: ['@'],
+        downCols: [0],
+        change: emptyAtChange,
+      },
+      {
+        type: 'commit' as const,
+        key: parentChange.commitId,
+        graphCols: ['○'],
+        downCols: [],
+        change: parentChange,
+      },
+    ];
+
+    const jjDiffResponse: DiffResponse = {
+      ...mockDiffResponse,
+      commit: '2222222222222222222222222222222222222222',
+      targetCommitish: '2222222222222222222222222222222222222222',
+      baseCommitish: '2222222222222222222222222222222222222222-',
+    };
+
+    vi.mocked(global.fetch).mockImplementation((input) => {
+      const url = String(input);
+      if (url === '/api/jj/status') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ isJj: true }),
+        } as Response);
+      }
+      if (url === '/api/jj/changes') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ changes: [emptyAtChange, parentChange], graphRows }),
+        } as Response);
+      }
+      if (url === `/api/jj/changes/${parentChange.changeId}/commits`) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            commits: [
+              {
+                commitId: parentChange.commitId,
+                shortCommitId: parentChange.shortCommitId,
+                timestamp: parentChange.timestamp,
+                description: parentChange.description,
+                isWorkingCopy: false,
+                commentCount: 0,
+                unresolvedCommentCount: 0,
+              },
+            ],
+          }),
+        } as Response);
+      }
+      if (url.startsWith('/api/jj/diff') || url.startsWith('/api/diff')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => jjDiffResponse,
+        } as Response);
+      }
+      if (url.startsWith('/api/jj/comments')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ threads: [] }),
+        } as Response);
+      }
+      if (url.includes('/api/revisions')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => null,
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({}),
+        blob: async () => ({ size: 1024 }),
+      } as Response);
+    });
+
+    const { container } = renderApp();
+
+    const revisionsSection = await screen.findByRole('region', { name: 'Revisions' });
+    const sidebar = container.querySelector('#file-tree-panel');
+    expect(sidebar).toContainElement(revisionsSection);
+
+    // Revisions tree renders above FileList and auto-selects the non-empty parent change.
+    const parentRow = await screen.findByRole('button', { name: /Active change under review/ });
+    await waitFor(() => {
+      expect(parentRow).toHaveAttribute('aria-current', 'true');
+    });
+
+    // FileList renders inside the sidebar below the Revisions tree.
+    const fileItems = await screen.findAllByText('test.ts');
+    expect(sidebar).toContainElement(fileItems[0] ?? null);
+    expect(
+      revisionsSection.compareDocumentPosition(fileItems[0] as Node) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    // Duplicate header Change: dropdown stays hidden while the desktop sidebar is open.
+    expect(screen.queryByText('Change:')).not.toBeInTheDocument();
+
+    // Collapsing the sidebar reveals the header Change: fallback selector.
+    fireEvent.click(screen.getByTitle('Collapse file tree'));
+    expect(await screen.findByText('Change:')).toBeInTheDocument();
+  });
 });

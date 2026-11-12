@@ -44,6 +44,7 @@ import {
   JjChangeSelector,
   JjCommitComparisonSelector,
 } from './components/JjRevisionSelector';
+import { JjRevisionTreePanel } from './components/JjRevisionTree';
 import { ReloadButton } from './components/ReloadButton';
 import { RevisionDetailModal } from './components/RevisionDetailModal';
 import { SettingsModal } from './components/SettingsModal';
@@ -631,8 +632,9 @@ function App() {
     lineIndex: number;
   } | null>(null);
   const fetchDiffDataRef = useRef<((selection?: DiffSelection) => Promise<void>) | null>(null);
+  const reloadJjRevisionsRef = useRef<(() => Promise<void>) | null>(null);
   const handleWatchReload = useCallback(async () => {
-    await fetchDiffDataRef.current?.();
+    await Promise.all([fetchDiffDataRef.current?.(), reloadJjRevisionsRef.current?.()]);
   }, []);
   const handleCommentsChanged = useCallback(async () => {
     try {
@@ -1238,6 +1240,9 @@ function App() {
     currentCommitId: jjCommitId || diffData?.targetCommitish,
     onSelectDiff: handleJjDiffChange,
   });
+  useEffect(() => {
+    reloadJjRevisionsRef.current = isJjRepo ? jjRevisions.reloadRevisions : null;
+  }, [isJjRepo, jjRevisions.reloadRevisions]);
 
   const handleAddComment = useCallback(
     async (
@@ -1560,9 +1565,10 @@ function App() {
             }`}
           >
             <div className={`flex flex-wrap items-center ${isMobile ? 'gap-2' : 'gap-3'}`}>
-              {isJjRepo && (
+              {isJjRepo && (!isFileTreeOpen || isMobile) && (
                 <JjChangeSelector
                   changes={jjRevisions.changes}
+                  graphRows={jjRevisions.graphRows}
                   selectedChangeId={jjRevisions.selectedChangeId}
                   onSelectChange={jjRevisions.setSelectedChangeId}
                   isCustomInput={jjRevisions.isCustomInput}
@@ -1796,7 +1802,7 @@ function App() {
           >
             <aside
               id="file-tree-panel"
-              className={`bg-github-bg-secondary overflow-y-auto flex flex-col ${
+              className={`bg-github-bg-secondary overflow-hidden flex flex-col ${
                 isMobile
                   ? 'fixed inset-y-0 right-0 z-40 w-[min(85vw,360px)] border-l border-github-border transition-transform duration-300 ease-out'
                   : 'relative border-r border-github-border'
@@ -1813,7 +1819,22 @@ function App() {
                   : undefined,
               }}
             >
-              <div className="flex-1 overflow-y-auto">
+              {isJjRepo && (
+                <JjRevisionTreePanel
+                  changes={jjRevisions.changes}
+                  graphRows={jjRevisions.graphRows}
+                  selectedChangeId={jjRevisions.selectedChangeId}
+                  onSelectChange={jjRevisions.setSelectedChangeId}
+                  isCustomInput={jjRevisions.isCustomInput}
+                  setIsCustomInput={jjRevisions.setIsCustomInput}
+                  customInput={jjRevisions.customInput}
+                  setCustomInput={jjRevisions.setCustomInput}
+                  customError={jjRevisions.customError}
+                  handleCustomSubmit={jjRevisions.handleCustomSubmit}
+                  loading={jjRevisions.loadingChanges}
+                />
+              )}
+              <div className="flex-1 min-h-0 overflow-y-auto">
                 <FileList
                   files={diffData.files}
                   onScrollToFile={scrollFileIntoDiffContainer}

@@ -12,67 +12,99 @@ import {
 } from 'lucide-react';
 import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react';
 
-import { type JjChange, type JjCommit } from '../../types/diff';
+import { type JjChange, type JjCommit, type JjGraphRow } from '../../types/diff';
 import { useClickOutside } from '../hooks/useClickOutside';
 
-export function CommentDot({
-  commentCount,
-  unresolvedCommentCount,
-  approved,
-  cleanRebaseApproved,
-  cleanRebaseSourceNumber,
-}: {
-  commentCount?: number;
-  unresolvedCommentCount?: number;
-  approved?: boolean;
-  cleanRebaseApproved?: boolean;
-  cleanRebaseSourceNumber?: number;
-}) {
-  const count = commentCount ?? 0;
-  const unresolved = unresolvedCommentCount ?? 0;
+import { CommentDot, JjRevisionTree } from './JjRevisionTree';
 
-  // Comments take precedence. Only if all comments are resolved should it show green.
-  if (unresolved > 0) {
-    return (
-      <span
-        className="inline-block w-2 h-2 rounded-full shrink-0 bg-yellow-400 shadow-sm"
-        title={`${unresolved} unresolved comment${unresolved > 1 ? 's' : ''}`}
-      />
-    );
+export { CommentDot };
+
+export function commitIdsMatch(a?: string, b?: string): boolean {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (Math.min(a.length, b.length) >= 6) {
+    return a.startsWith(b) || b.startsWith(a);
+  }
+  return false;
+}
+
+export function isEmptyUndescribedChange(c: JjChange): boolean {
+  return Boolean(c.isEmpty && c.hasDescription === false && (c.commentCount ?? 0) === 0);
+}
+
+export function pickInitialChange(
+  changes: JjChange[],
+  currentCommitId?: string,
+): JjChange | undefined {
+  if (changes.length === 0) {
+    return undefined;
   }
 
-  if (approved) {
-    return (
-      <span
-        className="inline-block w-2 h-2 rounded-full shrink-0 bg-green-500 shadow-sm"
-        title={count > 0 ? 'Approved (all comments resolved)' : 'Approved'}
-      />
-    );
-  }
-
-  if (cleanRebaseApproved) {
-    return (
-      <span
-        className="inline-block w-2.5 h-2.5 rounded-full shrink-0 bg-emerald-400 border border-emerald-200/60 shadow-sm"
-        title={
-          cleanRebaseSourceNumber
-            ? `Approved (Clean Rebase from #${cleanRebaseSourceNumber})`
-            : 'Approved (Clean Rebase)'
+  const walkToNonEmptyAncestor = (start: JjChange): JjChange | undefined => {
+    const visited = new Set<string>();
+    const queue: JjChange[] = [start];
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (!current || visited.has(current.commitId)) continue;
+      visited.add(current.commitId);
+      if (!isEmptyUndescribedChange(current)) {
+        return current;
+      }
+      for (const parentId of current.parentCommitIds ?? []) {
+        const parent = changes.find((c) => commitIdsMatch(c.commitId, parentId));
+        if (parent && !visited.has(parent.commitId)) {
+          queue.push(parent);
         }
-      />
-    );
+      }
+    }
+    return undefined;
+  };
+
+  if (currentCommitId) {
+    const commitMatch = changes.find((c) => commitIdsMatch(c.commitId, currentCommitId));
+    if (commitMatch) {
+      if (!isEmptyUndescribedChange(commitMatch)) {
+        return commitMatch;
+      }
+      return (
+        walkToNonEmptyAncestor(commitMatch) ??
+        changes.find((c) => !isEmptyUndescribedChange(c)) ??
+        commitMatch
+      );
+    }
   }
 
-  if (count > 0) {
+  const workingCopy = changes.find((c) => c.isWorkingCopy);
+  if (workingCopy) {
     return (
-      <span
-        className="inline-block w-2 h-2 rounded-full shrink-0 bg-gray-400"
-        title="All comments resolved"
-      />
+      walkToNonEmptyAncestor(workingCopy) ??
+      changes.find((c) => !isEmptyUndescribedChange(c)) ??
+      workingCopy
     );
   }
 
-  return null;
+  return changes.find((c) => !isEmptyUndescribedChange(c)) ?? changes[0];
+}
+
+function makeStandaloneCommitRow(change: JjChange): JjGraphRow {
+  return {
+    type: 'commit',
+    key: change.commitId,
+    graphCols: [change.isWorkingCopy ? '@' : change.isImmutable ? '◆' : '○'],
+    downCols: [],
+    change,
+  };
+}
+
+function synthesizeGraphRows(changes: JjChange[]): JjGraphRow[] {
+  return changes.map(makeStandaloneCommitRow);
+}
+
+function resolveGraphRows(changes: JjChange[], graphRows?: JjGraphRow[]): JjGraphRow[] {
+  if (Array.isArray(graphRows) && (graphRows.length > 0 || changes.length === 0)) {
+    return graphRows;
+  }
+  return synthesizeGraphRows(changes);
 }
 
 export interface UseJjRevisionsProps {
@@ -85,6 +117,7 @@ export function useJjRevisions({
   onSelectDiff,
 }: UseJjRevisionsProps) {
   const [changes, setChanges] = useState<JjChange[]>([]);
+  const [graphRows, setGraphRows] = useState<JjGraphRow[]>([]);
   const [selectedChangeId, setSelectedChangeId] = useState<string>('');
   const [commits, setCommits] = useState<JjCommit[]>([]);
   const [targetCommitId, setTargetCommitId] = useState<string>('');
@@ -96,12 +129,21 @@ export function useJjRevisions({
   const [customInput, setCustomInput] = useState('');
   const [customError, setCustomError] = useState<string | null>(null);
 
+  const currentCommitIdRef = useRef(currentCommitId);
+  const onSelectDiffRef = useRef(onSelectDiff);
+  useEffect(() => {
+    currentCommitIdRef.current = currentCommitId;
+    onSelectDiffRef.current = onSelectDiff;
+  }, [currentCommitId, onSelectDiff]);
+
   const loadChanges = useCallback(async () => {
     try {
       const res = await fetch('/api/jj/changes');
       if (res.ok) {
-        const data = (await res.json()) as { changes?: JjChange[] };
-        setChanges(data.changes || []);
+        const data = (await res.json()) as { changes?: JjChange[]; graphRows?: JjGraphRow[] };
+        const fetchedChanges = data.changes || [];
+        setChanges(fetchedChanges);
+        setGraphRows(resolveGraphRows(fetchedChanges, data.graphRows));
       }
     } catch (err) {
       console.error('Failed to reload jj changes:', err);
@@ -121,20 +163,27 @@ export function useJjRevisions({
     }
   }, []);
 
+  const reloadRevisions = useCallback(async () => {
+    await Promise.all([
+      loadChanges(),
+      selectedChangeId ? loadCommits(selectedChangeId) : Promise.resolve(),
+    ]);
+  }, [loadChanges, loadCommits, selectedChangeId]);
+
   // Initial load of changes
   useEffect(() => {
     let mounted = true;
     fetch('/api/jj/changes')
       .then((res) => res.json())
-      .then((data: { changes?: JjChange[] }) => {
+      .then((data: { changes?: JjChange[]; graphRows?: JjGraphRow[] }) => {
         if (!mounted) return;
         const fetchedChanges = data.changes || [];
         setChanges(fetchedChanges);
+        setGraphRows(resolveGraphRows(fetchedChanges, data.graphRows));
         setLoadingChanges(false);
 
-        if (fetchedChanges.length > 0) {
-          const match = fetchedChanges.find((c) => c.commitId === currentCommitId || c.isWorkingCopy);
-          const initialChange = match || fetchedChanges[0];
+        const initialChange = pickInitialChange(fetchedChanges, currentCommitIdRef.current);
+        if (initialChange) {
           setSelectedChangeId(initialChange.changeId);
         }
       })
@@ -156,11 +205,17 @@ export function useJjRevisions({
       const res = await fetch(`/api/jj/changes?query=${encodeURIComponent(query)}`);
       if (res.ok) {
         const data = (await res.json()) as { changes?: JjChange[] };
-        if (data.changes && data.changes.length > 0) {
-          const found = data.changes[0];
+        const found = data.changes?.[0];
+        if (found) {
           setChanges((prev) => {
             const exists = prev.some((c) => c.changeId === found.changeId);
             return exists ? prev : [found, ...prev];
+          });
+          setGraphRows((prev) => {
+            const exists = prev.some(
+              (row) => row.type === 'commit' && row.change.changeId === found.changeId,
+            );
+            return exists ? prev : [makeStandaloneCommitRow(found), ...prev];
           });
           setSelectedChangeId(found.changeId);
           setIsCustomInput(false);
@@ -187,12 +242,15 @@ export function useJjRevisions({
         setCommits(fetchedCommits);
         setLoadingCommits(false);
 
-        if (fetchedCommits.length > 0) {
-          const match = fetchedCommits.find((c) => c.commitId === currentCommitId);
-          const selectedTarget = match ? match.commitId : fetchedCommits[fetchedCommits.length - 1].commitId;
+        const match = fetchedCommits.find((c) =>
+          commitIdsMatch(c.commitId, currentCommitIdRef.current),
+        );
+        const latestCommit = fetchedCommits[fetchedCommits.length - 1];
+        const selectedTarget = match?.commitId ?? latestCommit?.commitId;
+        if (selectedTarget) {
           setTargetCommitId(selectedTarget);
           setBaseCommitId('parent');
-          onSelectDiff(selectedTarget, undefined);
+          onSelectDiffRef.current(selectedTarget, undefined);
         }
       })
       .catch((err) => {
@@ -238,6 +296,7 @@ export function useJjRevisions({
 
   return {
     changes,
+    graphRows,
     selectedChangeId,
     setSelectedChangeId,
     commits,
@@ -257,11 +316,13 @@ export function useJjRevisions({
     handleBaseChange,
     handleToggleIgnoreRebase,
     handleToggleApprove,
+    reloadRevisions,
   };
 }
 
 export interface JjChangeSelectorProps {
   changes: JjChange[];
+  graphRows?: JjGraphRow[];
   selectedChangeId: string;
   onSelectChange: (changeId: string) => void;
   isCustomInput: boolean;
@@ -275,6 +336,7 @@ export interface JjChangeSelectorProps {
 
 export function JjChangeSelector({
   changes,
+  graphRows,
   selectedChangeId,
   onSelectChange,
   isCustomInput,
@@ -289,6 +351,10 @@ export function JjChangeSelector({
   const dropdownRef = useRef<HTMLDivElement>(null);
   useClickOutside(dropdownRef, () => setIsOpen(false));
 
+  const effectiveGraphRows = useMemo(
+    () => resolveGraphRows(changes, graphRows),
+    [changes, graphRows],
+  );
   const selectedChange = changes.find((c) => c.changeId === selectedChangeId);
 
   if (loading && changes.length === 0) {
@@ -371,46 +437,19 @@ export function JjChangeSelector({
       </div>
 
       {isOpen && (
-        <div className="absolute left-0 top-full mt-1 z-50 bg-github-bg-secondary border border-github-border rounded-md shadow-xl py-1 w-80 max-h-72 overflow-y-auto">
+        <div className="absolute left-0 top-full mt-1 z-50 bg-github-bg-secondary border border-github-border rounded-md shadow-xl py-1 w-80">
           <div className="px-2.5 py-1 text-[11px] font-semibold text-github-text-muted uppercase tracking-wider border-b border-github-border/50">
             Changes
           </div>
-          {changes.map((change) => {
-            const isSelected = change.changeId === selectedChangeId;
-            return (
-              <button
-                key={change.changeId}
-                type="button"
-                onClick={() => {
-                  onSelectChange(change.changeId);
-                  setIsOpen(false);
-                }}
-                className={`w-full px-2.5 py-1.5 text-left text-xs font-mono flex items-center justify-between gap-2 transition-colors cursor-pointer ${
-                  isSelected
-                    ? 'bg-github-bg-tertiary text-github-accent font-medium'
-                    : 'text-github-text-primary hover:bg-github-bg-tertiary'
-                }`}
-              >
-                <div className="flex items-center gap-1.5 min-w-0 truncate">
-                  <span className="text-github-accent font-bold">
-                    {change.isWorkingCopy ? '@' : '○'}
-                  </span>
-                  <span className="font-semibold text-github-text-primary">
-                    {change.shortChangeId}
-                  </span>
-                  <span className="text-github-text-secondary truncate text-[11px]">
-                    {change.description}
-                  </span>
-                </div>
-                <CommentDot
-                  commentCount={change.commentCount}
-                  unresolvedCommentCount={change.unresolvedCommentCount}
-                  approved={change.approved}
-                  cleanRebaseApproved={change.cleanRebaseApproved}
-                />
-              </button>
-            );
-          })}
+          <JjRevisionTree
+            graphRows={effectiveGraphRows}
+            selectedChangeId={selectedChangeId}
+            onSelectChange={(changeId) => {
+              onSelectChange(changeId);
+              setIsOpen(false);
+            }}
+            className="max-h-60 overflow-y-auto overflow-x-auto"
+          />
           <div className="border-t border-github-border/50 mt-1 pt-1">
             <button
               type="button"
@@ -455,7 +494,7 @@ export function JjCommitComparisonSelector({
   isRebaseDiff,
   rebaseIgnored,
   rebaseConflict,
-  ignoreRebase = true,
+  ignoreRebase: _ignoreRebase = true,
   onToggleIgnoreRebase,
   loading = false,
 }: JjCommitComparisonSelectorProps) {

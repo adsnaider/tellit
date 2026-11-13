@@ -699,6 +699,8 @@ export async function startServer(
     }
   });
 
+  const JJ_COMMENT_FALLBACK_TIMESTAMP = '1970-01-01T00:00:00.000Z';
+
   app.get('/api/jj/comments', async (req, res) => {
     try {
       const commitId = (req.query.commit || req.query.target) as string;
@@ -714,8 +716,8 @@ export async function startServer(
       const threads: DiffCommentThread[] = rawThreads.map(t => ({
         id: t.thread_id,
         filePath: t.filepath,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
+        createdAt: JJ_COMMENT_FALLBACK_TIMESTAMP,
+        updatedAt: JJ_COMMENT_FALLBACK_TIMESTAMP,
         resolved: t.resolved,
         position: {
           side: t.side || 'new',
@@ -728,8 +730,8 @@ export async function startServer(
         messages: t.comments.map((body, i) => ({
           id: `${t.thread_id}:${i}`,
           body,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
+          createdAt: JJ_COMMENT_FALLBACK_TIMESTAMP,
+          updatedAt: JJ_COMMENT_FALLBACK_TIMESTAMP,
         })),
       }));
       res.json({ threads });
@@ -979,6 +981,7 @@ export async function startServer(
       createdAt: thread.createdAt,
       updatedAt: thread.updatedAt,
       codeContent: thread.codeSnapshot?.content,
+      ...(thread.resolved !== undefined ? { resolved: thread.resolved } : {}),
       messages: thread.messages,
     };
   }
@@ -1032,6 +1035,7 @@ export async function startServer(
               content: thread.codeContent,
             }
           : undefined,
+      ...(thread.resolved !== undefined ? { resolved: thread.resolved } : {}),
       messages,
     };
   }

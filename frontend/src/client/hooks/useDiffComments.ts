@@ -64,6 +64,7 @@ function normalizeThread(thread: DiffCommentThread): CommentThread {
     createdAt: thread.createdAt,
     updatedAt: thread.updatedAt,
     codeContent: thread.codeSnapshot?.content,
+    resolved: thread.resolved,
     messages: thread.messages,
   };
 }
@@ -160,17 +161,17 @@ export function useDiffComments(
 
   const saveThreads = useCallback(
     (newThreads: DiffCommentThread[]) => {
-      if (!baseCommitish || !targetCommitish) return;
-
-      storageService.saveCommentThreads(
-        baseCommitish,
-        targetCommitish,
-        newThreads,
-        currentCommitHash,
-        branchToHash,
-        repositoryId,
-        baseMode,
-      );
+      if (baseCommitish && targetCommitish) {
+        storageService.saveCommentThreads(
+          baseCommitish,
+          targetCommitish,
+          newThreads,
+          currentCommitHash,
+          branchToHash,
+          repositoryId,
+          baseMode,
+        );
+      }
       setThreads(newThreads);
       setHasLoadedComments(true);
     },

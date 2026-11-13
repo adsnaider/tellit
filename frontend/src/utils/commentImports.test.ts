@@ -4,6 +4,7 @@ import type { CommentImport, DiffCommentThread } from '../types/diff';
 
 import {
   mergeCommentImports,
+  mergeCommentThreads,
   parseCommentImportValue,
   serializeCommentImports,
 } from './commentImports';
@@ -15,6 +16,7 @@ function createThread({
   line = 10,
   body,
   updatedAt = '2024-01-01T00:00:00.000Z',
+  resolved,
 }: {
   id: string;
   filePath?: string;
@@ -22,6 +24,7 @@ function createThread({
   line?: number;
   body: string;
   updatedAt?: string;
+  resolved?: boolean;
 }): DiffCommentThread {
   return {
     id,
@@ -41,6 +44,7 @@ function createThread({
         updatedAt,
       },
     ],
+    ...(resolved !== undefined ? { resolved } : {}),
   };
 }
 
@@ -259,6 +263,38 @@ describe('commentImports', () => {
       expect(result.threads).toEqual([]);
       expect(result.warnings).toHaveLength(1);
       expect(result.warnings[0]).toContain('Skipped reply import');
+    });
+  });
+
+  describe('mergeCommentThreads', () => {
+    it('preserves resolved state on existing and added threads', () => {
+      const existing = [createThread({ id: 't1', body: 'Existing', resolved: true })];
+      const incoming = [
+        createThread({ id: 't1', body: 'Existing', updatedAt: '2024-01-02T00:00:00.000Z' }),
+        createThread({ id: 't2', line: 20, body: 'New resolved', resolved: true }),
+      ];
+
+      const result = mergeCommentThreads(existing, incoming);
+
+      expect(result.threads).toHaveLength(2);
+      expect(result.threads[0]?.resolved).toBe(true);
+      expect(result.threads[1]?.resolved).toBe(true);
+    });
+
+    it('adopts resolved updates from incoming threads', () => {
+      const existing = [
+        createThread({ id: 't1', body: 'Resolve me' }),
+        createThread({ id: 't2', line: 20, body: 'Reopen me', resolved: true }),
+      ];
+      const incoming = [
+        createThread({ id: 't1', body: 'Resolve me', resolved: true }),
+        createThread({ id: 't2', line: 20, body: 'Reopen me', resolved: false }),
+      ];
+
+      const result = mergeCommentThreads(existing, incoming);
+
+      expect(result.threads[0]?.resolved).toBe(true);
+      expect(result.threads[1]?.resolved).toBe(false);
     });
   });
 });

@@ -1,7 +1,8 @@
 import { renderHook, act } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-import type { DiffContextStorage } from '../../types/diff';
+import type { DiffCommentThread, DiffContextStorage } from '../../types/diff';
+import { storageService } from '../services/StorageService';
 import { useDiffComments } from './useDiffComments';
 
 // Mock StorageService
@@ -499,6 +500,39 @@ const next = true;
       expect(result.current.threads[0]?.id).toBe(threadId);
       expect(result.current.threads[0]?.messages).toHaveLength(2);
       expect(result.current.threads[0]?.messages[1]?.body).toBe('Reply comment');
+    });
+
+    it('updates transient in-memory threads without touching storage when refs are undefined', () => {
+      const { result } = renderHook(() => useDiffComments(undefined, undefined));
+      expect(result.current.hasLoadedComments).toBe(false);
+      expect(result.current.threads).toEqual([]);
+
+      const transientThreads: DiffCommentThread[] = [
+        {
+          id: 'jj-thread-1',
+          filePath: 'src/lib.rs',
+          createdAt: '1970-01-01T00:00:00.000Z',
+          updatedAt: '1970-01-01T00:00:00.000Z',
+          resolved: true,
+          position: { side: 'new', line: 12 },
+          messages: [
+            {
+              id: 'jj-thread-1:0',
+              body: 'Transient thread',
+              createdAt: '1970-01-01T00:00:00.000Z',
+              updatedAt: '1970-01-01T00:00:00.000Z',
+            },
+          ],
+        },
+      ];
+
+      act(() => {
+        result.current.replaceThreads(transientThreads);
+      });
+
+      expect(result.current.hasLoadedComments).toBe(true);
+      expect(result.current.threads).toEqual(transientThreads);
+      expect(storageService.saveCommentThreads).not.toHaveBeenCalled();
     });
   });
 });

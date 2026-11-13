@@ -333,6 +333,7 @@ function cloneThread(thread: DiffCommentThread): DiffCommentThread {
     position: clonePosition(thread.position),
     codeSnapshot: cloneCodeSnapshot(thread.codeSnapshot),
     messages: thread.messages.map(cloneMessage),
+    ...(thread.resolved !== undefined ? { resolved: thread.resolved } : {}),
   };
 }
 
@@ -413,6 +414,8 @@ function mergeThread(
     maxIsoTimestamp(existingThread.updatedAt, incomingThread.updatedAt),
   );
 
+  const resolved = incomingThread.resolved ?? existingThread.resolved;
+
   return {
     ...cloneThread(existingThread),
     createdAt:
@@ -423,6 +426,7 @@ function mergeThread(
     position: clonePosition(existingThread.position),
     codeSnapshot: cloneCodeSnapshot(incomingThread.codeSnapshot ?? existingThread.codeSnapshot),
     messages: orderedMessages,
+    ...(resolved !== undefined ? { resolved } : {}),
   };
 }
 

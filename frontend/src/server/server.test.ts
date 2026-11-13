@@ -7,6 +7,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // Set environment variable to skip fetch mocking
 process.env.VITEST_SERVER_TEST = 'true';
 
+import { JujutsuService } from './jujutsu.js';
 import { startServer } from './server.js';
 import type { CommentImport } from '../types/diff.js';
 
@@ -338,6 +339,137 @@ describe('Server Integration Tests', () => {
         const after = await getSession(result.port);
         expect(after.version).toBeGreaterThan(before.version);
       } finally {
+        if (result.server) {
+          await new Promise<void>((resolve) => {
+            result.server!.close(() => resolve());
+          });
+        }
+      }
+    });
+
+    it('preserves resolved state across normalized payloads and stale merges', async () => {
+      const port = await getAvailablePort(4966);
+      const result = await startServer({
+        preferredPort: port,
+        openBrowser: false,
+      });
+
+      try {
+        // Post a CommentThread-shaped payload (normalized via normalizeThreadPayload)
+        // with resolved: true; establishes version 1.
+        await postThreads(result.port, [
+          {
+            id: 't1',
+            file: 'src/a.ts',
+            line: 10,
+            side: 'new',
+            createdAt: isoNow,
+            updatedAt: isoNow,
+            resolved: true,
+            messages: [{ id: 't1', body: 'resolved thread', createdAt: isoNow, updatedAt: isoNow }],
+          },
+        ]);
+
+        const afterFirst = await getSession(result.port);
+        expect(afterFirst.version).toBe(1);
+        expect((afterFirst.threads[0] as { resolved?: boolean } | undefined)?.resolved).toBe(true);
+
+        // Out-of-band import bumps the server version to 2.
+        await fetch(`http://localhost:${result.port}/api/comment-imports`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify([
+            {
+              type: 'thread',
+              id: 'agent-1',
+              filePath: 'src/b.ts',
+              position: { side: 'new', line: 20 },
+              body: 'agent finding',
+              author: 'Agent',
+            },
+          ] satisfies CommentImport[]),
+        });
+
+        // Stale client push omitting resolved merges against version 2 and keeps resolved: true.
+        const staleResponse = await postThreads(
+          result.port,
+          [makeThread('t1', 'src/a.ts', 10, 'resolved thread')],
+          1,
+        );
+        const staleBody = (await staleResponse.json()) as {
+          merged: boolean;
+          threads: Array<{ id: string; resolved?: boolean }>;
+        };
+        expect(staleBody.merged).toBe(true);
+        expect(staleBody.threads.find((thread) => thread.id === 't1')?.resolved).toBe(true);
+      } finally {
+        if (result.server) {
+          await new Promise<void>((resolve) => {
+            result.server!.close(() => resolve());
+          });
+        }
+      }
+    });
+
+    it('GET /api/jj/comments uses deterministic fallback timestamps across fetches', async () => {
+      const spy = vi.spyOn(JujutsuService.prototype, 'getCommentsForDiff').mockResolvedValue([
+        {
+          thread_id: 'jj-t1',
+          change_id: 'change-1',
+          commit_id: 'abc123',
+          git_commit_hash: 'def456',
+          filepath: 'src/lib.rs',
+          line_range: { start: 10, end: 12 },
+          comments: ['Initial finding', 'Follow-up reply'],
+          resolved: true,
+          side: 'new',
+        },
+      ]);
+
+      const port = await getAvailablePort(4966);
+      const result = await startServer({
+        preferredPort: port,
+        openBrowser: false,
+      });
+
+      try {
+        const firstRes = await fetch(`http://localhost:${result.port}/api/jj/comments?commit=abc123`);
+        const firstBody = (await firstRes.json()) as { threads: unknown[] };
+
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        const secondRes = await fetch(`http://localhost:${result.port}/api/jj/comments?commit=abc123`);
+        const secondBody = (await secondRes.json()) as { threads: unknown[] };
+
+        expect(firstRes.ok).toBe(true);
+        expect(secondRes.ok).toBe(true);
+        expect(firstBody).toEqual(secondBody);
+        expect(firstBody.threads).toEqual([
+          {
+            id: 'jj-t1',
+            filePath: 'src/lib.rs',
+            createdAt: '1970-01-01T00:00:00.000Z',
+            updatedAt: '1970-01-01T00:00:00.000Z',
+            resolved: true,
+            position: { side: 'new', line: { start: 10, end: 12 } },
+            messages: [
+              {
+                id: 'jj-t1:0',
+                body: 'Initial finding',
+                createdAt: '1970-01-01T00:00:00.000Z',
+                updatedAt: '1970-01-01T00:00:00.000Z',
+              },
+              {
+                id: 'jj-t1:1',
+                body: 'Follow-up reply',
+                createdAt: '1970-01-01T00:00:00.000Z',
+                updatedAt: '1970-01-01T00:00:00.000Z',
+              },
+            ],
+          },
+        ]);
+      } finally {
+        spy.mockRestore();
         if (result.server) {
           await new Promise<void>((resolve) => {
             result.server!.close(() => resolve());

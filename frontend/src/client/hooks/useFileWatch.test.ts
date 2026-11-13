@@ -204,6 +204,44 @@ describe('useFileWatch', () => {
         expect(result.current.isConnected).toBe(true);
       });
     });
+
+    it('invokes updated onCommentsChanged without closing or recreating EventSource', async () => {
+      const firstOnCommentsChanged = vi.fn().mockResolvedValue(undefined);
+      const secondOnCommentsChanged = vi.fn().mockResolvedValue(undefined);
+
+      const { result, rerender } = renderHook(
+        ({ onCommentsChanged }: { onCommentsChanged: () => Promise<void> }) =>
+          useFileWatch(undefined, onCommentsChanged),
+        { initialProps: { onCommentsChanged: firstOnCommentsChanged } },
+      );
+
+      await waitFor(() => {
+        expect(result.current.isConnected).toBe(true);
+      });
+
+      expect(MockEventSource.instances).toHaveLength(1);
+      const eventSource = MockEventSource.instances[0]!;
+
+      rerender({ onCommentsChanged: secondOnCommentsChanged });
+
+      expect(MockEventSource.instances).toHaveLength(1);
+      expect(eventSource.close).not.toHaveBeenCalled();
+
+      act(() => {
+        eventSource.dispatchMessage(
+          JSON.stringify({
+            type: 'commentsChanged',
+            version: 2,
+            timestamp: new Date().toISOString(),
+          }),
+        );
+      });
+
+      await waitFor(() => {
+        expect(secondOnCommentsChanged).toHaveBeenCalledTimes(1);
+      });
+      expect(firstOnCommentsChanged).not.toHaveBeenCalled();
+    });
   });
 
   describe('reload functionality', () => {

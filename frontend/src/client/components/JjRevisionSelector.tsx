@@ -132,11 +132,15 @@ export function useJjRevisions({
   const currentCommitIdRef = useRef(currentCommitId);
   const onSelectDiffRef = useRef(onSelectDiff);
   const changesRef = useRef(changes);
+  const selectedChangeIdRef = useRef(selectedChangeId);
+  const commitsRequestIdRef = useRef(0);
+  const hasStartedInitialChangeLoadRef = useRef(false);
   useEffect(() => {
     currentCommitIdRef.current = currentCommitId;
     onSelectDiffRef.current = onSelectDiff;
     changesRef.current = changes;
-  }, [changes, currentCommitId, onSelectDiff]);
+    selectedChangeIdRef.current = selectedChangeId;
+  }, [changes, currentCommitId, onSelectDiff, selectedChangeId]);
 
   const loadChanges = useCallback(async () => {
     try {
@@ -154,11 +158,14 @@ export function useJjRevisions({
 
   const loadCommits = useCallback(async (changeId: string) => {
     if (!changeId) return;
+    const reqId = ++commitsRequestIdRef.current;
     try {
       const res = await fetch(`/api/jj/changes/${encodeURIComponent(changeId)}/commits`);
       if (res.ok) {
         const data = (await res.json()) as { commits?: JjCommit[] };
-        setCommits(data.commits || []);
+        if (commitsRequestIdRef.current === reqId && selectedChangeIdRef.current === changeId) {
+          setCommits(data.commits || []);
+        }
       }
     } catch (err) {
       console.error('Failed to reload jj commits:', err);
@@ -235,25 +242,42 @@ export function useJjRevisions({
   useEffect(() => {
     if (!selectedChangeId) return;
     let mounted = true;
+    const reqId = ++commitsRequestIdRef.current;
+    const isInitialChangeLoad = !hasStartedInitialChangeLoadRef.current;
+    hasStartedInitialChangeLoadRef.current = true;
+    const immediateSwitchTarget = !isInitialChangeLoad
+      ? changesRef.current.find((c) => c.changeId === selectedChangeId)?.commitId
+      : undefined;
+
+    if (immediateSwitchTarget) {
+      setCommits([]);
+      setTargetCommitId(immediateSwitchTarget);
+      setBaseCommitId('parent');
+      onSelectDiffRef.current(immediateSwitchTarget, undefined);
+    }
+
     setLoadingCommits(true);
     fetch(`/api/jj/changes/${encodeURIComponent(selectedChangeId)}/commits`)
       .then((res) => res.json())
       .then((data: { commits?: JjCommit[] }) => {
-        if (!mounted) return;
+        if (!mounted || commitsRequestIdRef.current !== reqId) return;
         const fetchedCommits = data.commits || [];
         setCommits(fetchedCommits);
         setLoadingCommits(false);
 
-        const match = fetchedCommits.find((c) =>
-          commitIdsMatch(c.commitId, currentCommitIdRef.current),
-        );
+        const match = isInitialChangeLoad
+          ? fetchedCommits.find((c) => commitIdsMatch(c.commitId, currentCommitIdRef.current))
+          : undefined;
         const selectedChange = changesRef.current.find((c) => c.changeId === selectedChangeId);
         const changeHeadCommit = selectedChange
           ? fetchedCommits.find((c) => commitIdsMatch(c.commitId, selectedChange.commitId))
           : undefined;
         const latestCommit = changeHeadCommit ?? fetchedCommits[fetchedCommits.length - 1];
         const selectedTarget = match?.commitId ?? latestCommit?.commitId;
-        if (selectedTarget) {
+        if (
+          selectedTarget &&
+          (!immediateSwitchTarget || !commitIdsMatch(selectedTarget, immediateSwitchTarget))
+        ) {
           setTargetCommitId(selectedTarget);
           setBaseCommitId('parent');
           onSelectDiffRef.current(selectedTarget, undefined);
@@ -261,7 +285,9 @@ export function useJjRevisions({
       })
       .catch((err) => {
         console.error('Failed to load jj commits:', err);
-        setLoadingCommits(false);
+        if (mounted && commitsRequestIdRef.current === reqId) {
+          setLoadingCommits(false);
+        }
       });
     return () => {
       mounted = false;

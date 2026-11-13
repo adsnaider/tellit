@@ -18,8 +18,13 @@ export function useFileWatch(
   const eventSourceRef = useRef<EventSource | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const reconnectAttemptsRef = useRef(0);
+  const onCommentsChangedRef = useRef(onCommentsChanged);
   const maxReconnectAttempts = 5;
   const reconnectDelay = 3000; // 3 seconds
+
+  useEffect(() => {
+    onCommentsChangedRef.current = onCommentsChanged;
+  }, [onCommentsChanged]);
 
   const [watchState, setWatchState] = useState<ClientWatchState>({
     isWatchEnabled: false,
@@ -83,8 +88,8 @@ export function useFileWatch(
               break;
 
             case 'commentsChanged':
-              if (onCommentsChanged) {
-                void onCommentsChanged();
+              if (onCommentsChangedRef.current) {
+                void onCommentsChangedRef.current();
               }
               break;
           }
@@ -131,7 +136,7 @@ export function useFileWatch(
       console.error('Failed to connect to file watch service:', connectionError);
       setError('Failed to connect to file watch service');
     }
-  }, [maxReconnectAttempts, onCommentsChanged, reconnectDelay]);
+  }, [maxReconnectAttempts, reconnectDelay]);
 
   const handleReload = useCallback(async () => {
     if (watchState.isReloading) {

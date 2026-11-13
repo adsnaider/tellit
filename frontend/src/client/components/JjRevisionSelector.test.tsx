@@ -375,4 +375,138 @@ describe('JjRevisionSelector', () => {
     });
     expect(onSelectDiff).not.toHaveBeenCalledWith(trailingCommitB, undefined);
   });
+
+  it('ignores out-of-order commits responses after switching to another change', async () => {
+    const commitA1 = '1111111111111111111111111111111111111111';
+    const commitA2 = '4444444444444444444444444444444444444444';
+    const commitB = '2222222222222222222222222222222222222222';
+    const changeA: JjChange = {
+      changeId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      shortChangeId: 'aaaaaaaa',
+      commitId: commitA2,
+      shortCommitId: commitA2.slice(0, 8),
+      isWorkingCopy: true,
+      isEmpty: false,
+      hasDescription: true,
+      timestamp: '2026-11-12 19:00:00',
+      description: 'Change A',
+      commentCount: 0,
+      unresolvedCommentCount: 0,
+    };
+    const changeB: JjChange = {
+      changeId: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      shortChangeId: 'bbbbbbbb',
+      commitId: commitB,
+      shortCommitId: commitB.slice(0, 8),
+      isWorkingCopy: false,
+      isEmpty: false,
+      hasDescription: true,
+      timestamp: '2026-11-12 18:00:00',
+      description: 'Change B',
+      commentCount: 0,
+      unresolvedCommentCount: 0,
+    };
+
+    const graphRows: JjGraphRow[] = [
+      { type: 'commit', key: changeA.commitId, graphCols: ['@'], downCols: [0], change: changeA },
+      { type: 'commit', key: changeB.commitId, graphCols: ['○'], downCols: [], change: changeB },
+    ];
+
+    const commitsForA: JjCommit[] = [
+      {
+        commitId: commitA1,
+        shortCommitId: commitA1.slice(0, 8),
+        timestamp: '2026-11-12 18:30:00',
+        description: 'Change A older revision',
+        isWorkingCopy: false,
+        commentCount: 0,
+        unresolvedCommentCount: 0,
+      },
+      {
+        commitId: commitA2,
+        shortCommitId: commitA2.slice(0, 8),
+        timestamp: '2026-11-12 19:00:00',
+        description: 'Change A head revision',
+        isWorkingCopy: true,
+        commentCount: 0,
+        unresolvedCommentCount: 0,
+      },
+    ];
+    const commitsForB: JjCommit[] = [
+      {
+        commitId: commitB,
+        shortCommitId: commitB.slice(0, 8),
+        timestamp: '2026-11-12 18:00:00',
+        description: 'Change B head revision',
+        isWorkingCopy: false,
+        commentCount: 0,
+        unresolvedCommentCount: 0,
+      },
+    ];
+
+    let resolveSlowCommitsA: ((res: Response) => void) | undefined;
+    let slowCommitsACalled = false;
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url === '/api/jj/changes') {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ changes: [changeA, changeB], graphRows }),
+          } as Response);
+        }
+        if (url === `/api/jj/changes/${encodeURIComponent(changeA.changeId)}/commits`) {
+          slowCommitsACalled = true;
+          return new Promise<Response>((resolve) => {
+            resolveSlowCommitsA = resolve;
+          });
+        }
+        if (url === `/api/jj/changes/${encodeURIComponent(changeB.changeId)}/commits`) {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ commits: commitsForB }),
+          } as Response);
+        }
+        return Promise.reject(new Error(`Unexpected fetch URL: ${url}`));
+      }),
+    );
+
+    const onSelectDiff = vi.fn();
+    render(<JjRevisionSelector currentCommitId={commitA1} onSelectDiff={onSelectDiff} />);
+
+    await waitFor(() => {
+      expect(slowCommitsACalled).toBe(true);
+    });
+
+    // Switch to Change B while Change A's /commits request is still in flight.
+    fireEvent.click(screen.getByTitle('Select Jujutsu Change'));
+    fireEvent.click(screen.getByRole('button', { name: /bbbbbbbb/i }));
+
+    await waitFor(() => {
+      expect(onSelectDiff).toHaveBeenCalledWith(commitB, undefined);
+    });
+    expect(onSelectDiff).not.toHaveBeenCalledWith(commitA1, undefined);
+    expect(onSelectDiff).not.toHaveBeenCalledWith(commitA2, undefined);
+
+    onSelectDiff.mockClear();
+
+    // Now resolve the stale Change A /commits response.
+    resolveSlowCommitsA?.({
+      ok: true,
+      json: async () => ({ commits: commitsForA }),
+    } as Response);
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(onSelectDiff).not.toHaveBeenCalled();
+
+    // Verify Change B's commit list stayed intact rather than being overwritten by Change A's commits.
+    fireEvent.click(screen.getByTitle('Select diff head revision (To)'));
+    expect(screen.getByText('Change B head revision')).toBeInTheDocument();
+    expect(screen.queryByText('Change A head revision')).not.toBeInTheDocument();
+    expect(screen.queryByText('Change A older revision')).not.toBeInTheDocument();
+  });
 });

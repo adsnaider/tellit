@@ -10,6 +10,7 @@ import { DiffMode } from '../types/watch';
 
 import App from './App';
 import { useDiffComments } from './hooks/useDiffComments';
+import { useFileWatch } from './hooks/useFileWatch';
 import { useViewedFiles } from './hooks/useViewedFiles';
 import { useViewport } from './hooks/useViewport';
 
@@ -69,19 +70,21 @@ const mockWatchState: ClientWatchState = {
 };
 
 vi.mock('./hooks/useFileWatch', () => ({
-  useFileWatch: vi.fn((onReload?: () => Promise<void>) => ({
-    shouldReload: mockWatchState.shouldReload,
-    isConnected: true,
-    error: null,
-    reload: vi.fn(async () => {
-      if (onReload) {
-        await onReload();
-      }
-      mockWatchState.shouldReload = false;
-      mockWatchState.lastChangeType = null;
+  useFileWatch: vi.fn(
+    (onReload?: () => Promise<void>, _onCommentsChanged?: () => Promise<void>) => ({
+      shouldReload: mockWatchState.shouldReload,
+      isConnected: true,
+      error: null,
+      reload: vi.fn(async () => {
+        if (onReload) {
+          await onReload();
+        }
+        mockWatchState.shouldReload = false;
+        mockWatchState.lastChangeType = null;
+      }),
+      watchState: mockWatchState,
     }),
-    watchState: mockWatchState,
-  })),
+  ),
 }));
 
 // Mock navigator.sendBeacon
@@ -1535,5 +1538,392 @@ describe('App Component - Jujutsu comment error handling', () => {
     // Collapsing the sidebar reveals the header Change: fallback selector.
     fireEvent.click(screen.getByTitle('Collapse file tree'));
     expect(await screen.findByText('Change:')).toBeInTheDocument();
+  });
+});
+
+describe('App Component - Jujutsu comment sync and switching', () => {
+  const makeChange = (
+    prefix: string,
+    description: string,
+    overrides: Record<string, unknown> = {},
+  ) => {
+    const hex = prefix.repeat(40).slice(0, 40);
+    return {
+      changeId: prefix.repeat(32).slice(0, 32),
+      shortChangeId: prefix.repeat(8).slice(0, 8),
+      commitId: hex,
+      shortCommitId: hex.slice(0, 8),
+      isWorkingCopy: false,
+      isEmpty: false,
+      hasDescription: true,
+      timestamp: '2026-11-12 19:00:00',
+      description,
+      commentCount: 0,
+      unresolvedCommentCount: 0,
+      ...overrides,
+    };
+  };
+
+  const makeFileDiff = (path: string, lineContent: string) => ({
+    path,
+    status: 'modified' as const,
+    additions: 1,
+    deletions: 0,
+    chunks: [
+      {
+        header: '@@ -10,1 +10,1 @@',
+        oldStart: 10,
+        oldLines: 1,
+        newStart: 10,
+        newLines: 1,
+        lines: [
+          {
+            type: 'add' as const,
+            content: lineContent,
+            newLineNumber: 10,
+          },
+        ],
+      },
+    ],
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockComments = [];
+    mockConfirm.mockReturnValue(false);
+    window.localStorage.setItem('difit.diffViewMode', 'unified');
+  });
+
+  it('dismisses the comment form before /api/jj/changes reload finishes and never touches legacy /api/comments endpoints', async () => {
+    const changeA = makeChange('a', 'Change A under review', { isWorkingCopy: true });
+    const graphRows = [
+      {
+        type: 'commit' as const,
+        key: changeA.commitId,
+        graphCols: ['@'],
+        downCols: [],
+        change: changeA,
+      },
+    ];
+    const diffA: DiffResponse = {
+      ...mockDiffResponse,
+      commit: changeA.commitId,
+      baseCommitish: `${changeA.commitId}-`,
+      targetCommitish: changeA.commitId,
+      files: [makeFileDiff('fileA.ts', 'const a = 1;')],
+    };
+    const submittedThread = createMockThread({
+      id: 'jj-new-thread',
+      filePath: 'fileA.ts',
+      line: 10,
+      body: 'Fast jj comment',
+    });
+
+    let changesRequestCount = 0;
+    let resolveReloadChanges: ((res: Response) => void) | undefined;
+    let threads: DiffCommentThread[] = [];
+
+    vi.mocked(global.fetch).mockImplementation((input, init) => {
+      const url = String(input);
+      if (url === '/api/jj/status') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ isJj: true }),
+        } as Response);
+      }
+      if (url === '/api/jj/changes') {
+        changesRequestCount += 1;
+        if (changesRequestCount === 1) {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ changes: [changeA], graphRows }),
+          } as Response);
+        }
+        return new Promise<Response>((resolve) => {
+          resolveReloadChanges = resolve;
+        });
+      }
+      if (url === `/api/jj/changes/${changeA.changeId}/commits`) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            commits: [
+              {
+                commitId: changeA.commitId,
+                shortCommitId: changeA.shortCommitId,
+                timestamp: changeA.timestamp,
+                description: changeA.description,
+                isWorkingCopy: true,
+                commentCount: threads.length,
+                unresolvedCommentCount: threads.length,
+              },
+            ],
+          }),
+        } as Response);
+      }
+      if (url.startsWith('/api/jj/diff') || url.startsWith('/api/diff')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => diffA,
+          blob: async () => ({ size: 1024 }),
+        } as Response);
+      }
+      if (url === '/api/jj/comments' && init?.method === 'POST') {
+        threads = [submittedThread];
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ success: true, threadId: submittedThread.id }),
+        } as Response);
+      }
+      if (url.startsWith('/api/jj/comments')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ threads }),
+        } as Response);
+      }
+      if (url.includes('/api/revisions')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => null,
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({}),
+        blob: async () => ({ size: 1024 }),
+      } as Response);
+    });
+
+    const { container } = renderApp();
+
+    const row = await waitFor(() => {
+      const found = container.querySelector('[data-diff-line-row="true"]');
+      expect(found).not.toBeNull();
+      return found!;
+    });
+
+    fireEvent.click(row);
+    fireEvent.click(row, { shiftKey: true });
+
+    const textarea = await screen.findByPlaceholderText('Leave a comment...');
+    fireEvent.change(textarea, { target: { value: 'Fast jj comment' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Submit' }));
+
+    // Comment form must close as soon as POST/GET /api/jj/comments finish,
+    // even while the background /api/jj/changes reload is still pending.
+    await waitFor(() => {
+      expect(screen.queryByPlaceholderText('Leave a comment...')).not.toBeInTheDocument();
+    });
+    expect(changesRequestCount).toBe(2);
+    expect(mockReplaceThreads).toHaveBeenCalledWith([submittedThread]);
+
+    const legacyUrls = vi
+      .mocked(global.fetch)
+      .mock.calls.map(([input]) => String(input))
+      .filter((url) => url.startsWith('/api/comments') || url.includes('/api/comments-json'));
+    expect(legacyUrls).toEqual([]);
+
+    resolveReloadChanges?.({
+      ok: true,
+      json: async () => ({ changes: [changeA], graphRows }),
+    } as Response);
+  });
+
+  it('ignores slow out-of-order /api/jj/comments from the previous change after switching changes', async () => {
+    const changeA = makeChange('a', 'Change A under review', { isWorkingCopy: true });
+    const changeB = makeChange('b', 'Change B under review');
+    const graphRows = [
+      {
+        type: 'commit' as const,
+        key: changeA.commitId,
+        graphCols: ['@'],
+        downCols: [0],
+        change: changeA,
+      },
+      {
+        type: 'commit' as const,
+        key: changeB.commitId,
+        graphCols: ['○'],
+        downCols: [],
+        change: changeB,
+      },
+    ];
+    const diffA: DiffResponse = {
+      ...mockDiffResponse,
+      commit: changeA.commitId,
+      baseCommitish: `${changeA.commitId}-`,
+      targetCommitish: changeA.commitId,
+      files: [makeFileDiff('fileA.ts', 'const a = 1;')],
+    };
+    const diffB: DiffResponse = {
+      ...mockDiffResponse,
+      commit: changeB.commitId,
+      baseCommitish: `${changeB.commitId}-`,
+      targetCommitish: changeB.commitId,
+      files: [makeFileDiff('fileB.ts', 'const b = 2;')],
+    };
+    const threadA = createMockThread({
+      id: 'thread-a',
+      filePath: 'fileA.ts',
+      line: 10,
+      body: 'comment-from-A',
+    });
+    const threadB = createMockThread({
+      id: 'thread-b',
+      filePath: 'fileB.ts',
+      line: 10,
+      body: 'comment-from-B',
+    });
+
+    let commitACommentsCalls = 0;
+    let resolveSlowCommitAComments: ((res: Response) => void) | undefined;
+
+    vi.mocked(global.fetch).mockImplementation((input) => {
+      const url = String(input);
+      if (url === '/api/jj/status') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ isJj: true }),
+        } as Response);
+      }
+      if (url === '/api/jj/changes') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ changes: [changeA, changeB], graphRows }),
+        } as Response);
+      }
+      if (url === `/api/jj/changes/${changeA.changeId}/commits`) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            commits: [
+              {
+                commitId: changeA.commitId,
+                shortCommitId: changeA.shortCommitId,
+                timestamp: changeA.timestamp,
+                description: changeA.description,
+                isWorkingCopy: true,
+                commentCount: 1,
+                unresolvedCommentCount: 1,
+              },
+            ],
+          }),
+        } as Response);
+      }
+      if (url === `/api/jj/changes/${changeB.changeId}/commits`) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            commits: [
+              {
+                commitId: changeB.commitId,
+                shortCommitId: changeB.shortCommitId,
+                timestamp: changeB.timestamp,
+                description: changeB.description,
+                isWorkingCopy: false,
+                commentCount: 1,
+                unresolvedCommentCount: 1,
+              },
+            ],
+          }),
+        } as Response);
+      }
+      if (url.startsWith(`/api/jj/diff?target=${changeB.commitId}`)) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => diffB,
+        } as Response);
+      }
+      if (url.startsWith('/api/jj/diff') || url.startsWith('/api/diff')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => diffA,
+          blob: async () => ({ size: 1024 }),
+        } as Response);
+      }
+      if (url === `/api/jj/comments?target=${changeA.commitId}`) {
+        commitACommentsCalls += 1;
+        if (commitACommentsCalls === 1) {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ threads: [threadA] }),
+          } as Response);
+        }
+        return new Promise<Response>((resolve) => {
+          resolveSlowCommitAComments = resolve;
+        });
+      }
+      if (url === `/api/jj/comments?target=${changeB.commitId}`) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ threads: [threadB] }),
+        } as Response);
+      }
+      if (url.includes('/api/revisions')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => null,
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({}),
+        blob: async () => ({ size: 1024 }),
+      } as Response);
+    });
+
+    renderApp();
+
+    await screen.findAllByText('fileA.ts');
+    await waitFor(() => {
+      expect(mockReplaceThreads).toHaveBeenCalledWith([threadA]);
+    });
+    const changeARow = await screen.findByRole('button', { name: /Change A under review/ });
+    await waitFor(() => {
+      expect(changeARow).toHaveAttribute('aria-current', 'true');
+    });
+
+    mockReplaceThreads.mockClear();
+
+    // Trigger an in-flight comment refresh on Change A via SSE commentsChanged.
+    const latestOnCommentsChanged = vi.mocked(useFileWatch).mock.lastCall?.[1];
+    expect(latestOnCommentsChanged).toBeTypeOf('function');
+    act(() => {
+      void latestOnCommentsChanged?.();
+    });
+
+    await waitFor(() => {
+      expect(commitACommentsCalls).toBe(2);
+    });
+
+    // Switch to Change B while Change A's comments refresh is still pending.
+    fireEvent.click(screen.getByRole('button', { name: /Change B under review/ }));
+
+    await screen.findAllByText('fileB.ts');
+    await waitFor(() => {
+      expect(mockReplaceThreads).toHaveBeenCalledWith([threadB]);
+    });
+
+    mockReplaceThreads.mockClear();
+
+    // Resolve the stale Change A comments response and ensure it does not overwrite Change B.
+    resolveSlowCommitAComments?.({
+      ok: true,
+      json: async () => ({ threads: [threadA] }),
+    } as Response);
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(mockReplaceThreads).not.toHaveBeenCalled();
+    expect(screen.getAllByText('fileB.ts').length).toBeGreaterThan(0);
+
+    const legacyUrls = vi
+      .mocked(global.fetch)
+      .mock.calls.map(([input]) => String(input))
+      .filter((url) => url.startsWith('/api/comments') || url.includes('/api/comments-json'));
+    expect(legacyUrls).toEqual([]);
   });
 });

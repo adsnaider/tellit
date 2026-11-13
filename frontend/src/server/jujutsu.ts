@@ -397,27 +397,32 @@ export class JujutsuService {
     }
   }
 
-  private readStoreApprovedCommits(changeId: string): string[] {
+  private findTellitStoreDir(): string | null {
     const jjPaths = this.resolveJjRepoPaths();
     const candidateRoots = jjPaths?.mainRepoRoot
       ? [join(jjPaths.mainRepoRoot, '.tellit'), join(this.repoDir, '.tellit')]
       : [join(this.repoDir, '.tellit')];
-    const storeDir = candidateRoots.find((dir) => existsSync(dir));
+    return candidateRoots.find((dir) => existsSync(dir)) ?? null;
+  }
+
+  private readStoreApprovedCommits(changeId: string): string[] {
+    const storeDir = this.findTellitStoreDir();
     if (!storeDir) {
       return [];
     }
 
-    let matchedChangeDirs: string[] = [];
+    let exactMatch: string | null = null;
+    const matchedChangeDirs: string[] = [];
     try {
       const entries = readdirSync(storeDir, { withFileTypes: true });
       for (const entry of entries) {
         if (!entry.isDirectory()) continue;
         const name = entry.name;
         if (name === changeId) {
-          matchedChangeDirs = [join(storeDir, name)];
-          break;
-        }
-        if (
+          const path = join(storeDir, name);
+          exactMatch = path;
+          matchedChangeDirs.push(path);
+        } else if (
           name.startsWith(changeId) ||
           (name.length >= 6 && changeId.startsWith(name))
         ) {
@@ -428,8 +433,10 @@ export class JujutsuService {
       return [];
     }
 
+    const dirsToScan = changeId.length < 6 && exactMatch ? [exactMatch] : matchedChangeDirs;
+
     const approved = new Set<string>();
-    for (const changeDir of matchedChangeDirs) {
+    for (const changeDir of dirsToScan) {
       try {
         const commitEntries = readdirSync(changeDir, { withFileTypes: true });
         for (const commitEntry of commitEntries) {
@@ -445,6 +452,39 @@ export class JujutsuService {
     }
 
     return Array.from(approved).sort();
+  }
+
+  private isStoreCommitApproved(commitId: string): boolean {
+    const storeDir = this.findTellitStoreDir();
+    if (!storeDir) {
+      return false;
+    }
+
+    try {
+      const changeEntries = readdirSync(storeDir, { withFileTypes: true });
+      for (const changeDir of changeEntries) {
+        if (!changeDir.isDirectory()) continue;
+        const changePath = join(storeDir, changeDir.name);
+        try {
+          const commitEntries = readdirSync(changePath, { withFileTypes: true });
+          for (const commitDir of commitEntries) {
+            if (!commitDir.isDirectory()) continue;
+            if (
+              commitMatches(commitDir.name, commitId) &&
+              this.isApprovalFileApproved(join(changePath, commitDir.name, 'approval.json'))
+            ) {
+              return true;
+            }
+          }
+        } catch {
+          // Ignore unreadable change directory
+        }
+      }
+    } catch {
+      return false;
+    }
+
+    return false;
   }
 
   async runGit(args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> {
@@ -597,17 +637,33 @@ export class JujutsuService {
         ? details.approvedCommits
         : this.readStoreApprovedCommits(change.changeId);
 
-    if (approvedCommits.some((id) => commitMatches(id, change.commitId))) {
+    const markDirectlyApproved = () => {
       change.approved = true;
+      delete change.cleanRebaseApproved;
+    };
+
+    if (
+      approvedCommits.some((id) => commitMatches(id, change.commitId)) ||
+      this.isStoreCommitApproved(change.commitId)
+    ) {
+      markDirectlyApproved();
       return;
     }
 
-    if (details.approvedCommits === undefined && approvedCommits.length === 0 && details.approval) {
-      change.approved = true;
-      return;
+    if (details.approval) {
+      if (details.approvedCommits === undefined && approvedCommits.length === 0) {
+        markDirectlyApproved();
+        return;
+      }
+      const commitDetails = await this.getCommitDetails(change.commitId);
+      if (commitDetails.approval) {
+        markDirectlyApproved();
+        return;
+      }
     }
 
     change.approved = false;
+    delete change.cleanRebaseApproved;
 
     if (approvedCommits.length === 0) {
       return;
@@ -886,19 +942,23 @@ export class JujutsuService {
       }
     }
 
-    const commitMap = new Map<string, JjCommit>();
+    const evologCommits = new Map<string, JjCommit>();
     const commitParentsCache = new Map<string, Promise<string[]>>();
-    for (const line of jjCommitsRaw.split('\n').filter(l => l.trim().length > 0)) {
+    for (const line of jjCommitsRaw.split('\n').filter((l) => l.trim().length > 0)) {
       const parts = line.split('\t');
       if (parts.length < 4) continue;
       const [commitId, timestamp, isWorkingCopy, description, parentsRaw] = parts;
+      if (!commitId) continue;
       if (parentsRaw) {
         commitParentsCache.set(commitId, Promise.resolve(parentsRaw.split(',').filter(Boolean)));
       }
-      commitMap.set(commitId, {
+      if (evologCommits.has(commitId)) {
+        evologCommits.delete(commitId);
+      }
+      evologCommits.set(commitId, {
         commitId,
         shortCommitId: commitId.slice(0, 8),
-        timestamp,
+        timestamp: timestamp ?? '',
         isWorkingCopy: isWorkingCopy === '1',
         description: description || '(no description set)',
         commentCount: 0,
@@ -909,10 +969,29 @@ export class JujutsuService {
     // 2. Fetch all threads for the change
     const changeThreads = await this.getChangeThreads(changeId);
 
+    const historicalCommits = new Map<string, JjCommit>();
+    const findMatchingCommit = (cid: string): JjCommit | undefined => {
+      const exact = evologCommits.get(cid) ?? historicalCommits.get(cid);
+      if (exact) {
+        return exact;
+      }
+      for (const commit of evologCommits.values()) {
+        if (commitMatches(commit.commitId, cid)) {
+          return commit;
+        }
+      }
+      for (const commit of historicalCommits.values()) {
+        if (commitMatches(commit.commitId, cid)) {
+          return commit;
+        }
+      }
+      return undefined;
+    };
+
     // 3. For any historical commit that has threads but isn't in jj log:
     for (const thread of changeThreads) {
-      if (!commitMap.has(thread.commit_id)) {
-        commitMap.set(thread.commit_id, {
+      if (!findMatchingCommit(thread.commit_id)) {
+        historicalCommits.set(thread.commit_id, {
           commitId: thread.commit_id,
           shortCommitId: thread.commit_id.slice(0, 8),
           timestamp: '',
@@ -926,7 +1005,7 @@ export class JujutsuService {
 
     // 4. Populate comment counts
     for (const thread of changeThreads) {
-      const commit = commitMap.get(thread.commit_id);
+      const commit = findMatchingCommit(thread.commit_id);
       if (commit) {
         commit.commentCount++;
         if (!thread.resolved) {
@@ -935,14 +1014,8 @@ export class JujutsuService {
       }
     }
 
-    // Convert map to array and preserve chronological order (oldest to newest)
-    const result = Array.from(commitMap.values());
-    result.sort((a, b) => {
-      if (a.timestamp && b.timestamp) {
-        return a.timestamp.localeCompare(b.timestamp);
-      }
-      return 0;
-    });
+    // Preserve causal evolog order (prepending historical non-evolog commits)
+    const result = [...historicalCommits.values(), ...evologCommits.values()];
 
     await Promise.all(
       result.map(async (c) => {

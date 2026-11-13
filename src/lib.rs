@@ -736,26 +736,38 @@ pub fn get_thread(store: &Path, thread_id_query: &str) -> Result<ThreadInfo> {
     })
 }
 
+fn commit_id_matches(a: &str, b: &str) -> bool {
+    a == b || (a.len() >= 6 && b.starts_with(a)) || (b.len() >= 6 && a.starts_with(b))
+}
+
 fn matched_change_dirs(store: &Path, change_query: &str) -> Result<Vec<PathBuf>> {
     if !store.exists() {
         return Ok(Vec::new());
     }
 
+    let mut exact_match: Option<PathBuf> = None;
     let mut matched_dirs = Vec::new();
     for entry in std::fs::read_dir(store)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name == change_query {
-                return Ok(vec![entry.path()]);
-            }
-            if name.starts_with(change_query)
+                let path = entry.path();
+                exact_match = Some(path.clone());
+                matched_dirs.push(path);
+            } else if name.starts_with(change_query)
                 || (name.len() >= 6 && change_query.starts_with(&name))
             {
                 matched_dirs.push(entry.path());
             }
         }
     }
+    if change_query.len() < 6 {
+        if let Some(exact) = exact_match {
+            return Ok(vec![exact]);
+        }
+    }
+    matched_dirs.sort();
     Ok(matched_dirs)
 }
 
@@ -1030,14 +1042,10 @@ pub fn is_commit_approved(store: &Path, commit_query: &str) -> bool {
     {
         if entry.file_type().is_dir() {
             let commit_name = entry.file_name().to_string_lossy();
-            if commit_name == commit_query
-                || (commit_query.len() >= 6 && commit_name.starts_with(commit_query))
-                || (commit_name.len() >= 6 && commit_query.starts_with(&*commit_name))
+            if commit_id_matches(&commit_name, commit_query)
+                && is_approval_file_approved(&entry.path().join("approval.json"))
             {
-                let approval_file = entry.path().join("approval.json");
-                if approval_file.is_file() {
-                    return is_approval_file_approved(&approval_file);
-                }
+                return true;
             }
         }
     }
@@ -1148,6 +1156,24 @@ pub fn set_commit_approval(
     if disapprove {
         if approval_file.exists() {
             let _ = std::fs::remove_file(&approval_file);
+        }
+        if store.exists() {
+            for entry in WalkDir::new(store)
+                .min_depth(2)
+                .max_depth(2)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                if entry.file_type().is_dir() {
+                    let commit_name = entry.file_name().to_string_lossy();
+                    if commit_id_matches(&commit_name, &commit_id) {
+                        let matching_approval = entry.path().join("approval.json");
+                        if matching_approval.exists() {
+                            let _ = std::fs::remove_file(&matching_approval);
+                        }
+                    }
+                }
+            }
         }
         Ok((change_id, commit_id, false))
     } else {
@@ -1269,6 +1295,83 @@ mod tests {
         set_commit_approval(&store, Some(commit_hash), true).unwrap();
         assert!(!is_commit_approved(&store, commit_hash));
         assert!(get_change_approved_commits(&store, "change123").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_coexisting_prefix_and_full_change_store_lookup() {
+        let dir = tempdir().unwrap();
+        let store = dir.path().join(".tellit");
+
+        let short_change = "shortchg";
+        let full_change = "shortchgfullchangeid000000000000";
+        let head_commit = "commithashhead111111";
+        let earlier_commit = "commithashearlier222";
+
+        let short_commit_dir = store.join(short_change).join(head_commit);
+        let full_commit_dir = store.join(full_change).join(earlier_commit);
+        std::fs::create_dir_all(&short_commit_dir).unwrap();
+        std::fs::create_dir_all(&full_commit_dir).unwrap();
+
+        std::fs::write(
+            short_commit_dir.join("approval.json"),
+            r#"{"approved":true,"timestamp":"2"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            full_commit_dir.join("approval.json"),
+            r#"{"approved":true,"timestamp":"1"}"#,
+        )
+        .unwrap();
+
+        let thread_a = ThreadData {
+            filepath: "src/a.rs".to_string(),
+            line_range: None,
+            comments: vec!["Thread on head".to_string()],
+            resolved: false,
+        };
+        let thread_b = ThreadData {
+            filepath: "src/b.rs".to_string(),
+            line_range: None,
+            comments: vec!["Thread on earlier".to_string()],
+            resolved: true,
+        };
+        std::fs::write(
+            short_commit_dir.join("11111111-1111-1111-1111-111111111111.json"),
+            serde_json::to_vec_pretty(&thread_a).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            full_commit_dir.join("22222222-2222-2222-2222-222222222222.json"),
+            serde_json::to_vec_pretty(&thread_b).unwrap(),
+        )
+        .unwrap();
+
+        let expected_commits = vec![earlier_commit.to_string(), head_commit.to_string()];
+        for query in [full_change, short_change] {
+            assert_eq!(
+                get_change_approved_commits(&store, query).unwrap(),
+                expected_commits
+            );
+            assert_eq!(get_change_commits(&store, query).unwrap(), expected_commits);
+            let threads = get_change_threads(&store, query).unwrap();
+            assert_eq!(threads.len(), 2);
+        }
+
+        // Duplicate commit dirs where one has approved=false and another has approved=true
+        let false_dup_dir = store.join("otherchg").join(head_commit);
+        std::fs::create_dir_all(&false_dup_dir).unwrap();
+        std::fs::write(
+            false_dup_dir.join("approval.json"),
+            r#"{"approved":false,"timestamp":"1"}"#,
+        )
+        .unwrap();
+        assert!(is_commit_approved(&store, head_commit));
+
+        // Disapproving removes all matching approval.json files across store directories
+        set_commit_approval(&store, Some(head_commit), true).unwrap();
+        assert!(!is_commit_approved(&store, head_commit));
+        assert!(!short_commit_dir.join("approval.json").exists());
+        assert!(!false_dup_dir.join("approval.json").exists());
     }
 
     #[test]

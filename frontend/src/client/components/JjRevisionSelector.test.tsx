@@ -1,13 +1,14 @@
-import { fireEvent, render, screen } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import '@testing-library/jest-dom';
 
-import { type JjCommit } from '../../types/diff';
+import { type JjChange, type JjCommit, type JjGraphRow } from '../../types/diff';
 
 import {
   filterInterestingCommits,
   isInterestingCommit,
   JjCommitComparisonSelector,
+  JjRevisionSelector,
 } from './JjRevisionSelector';
 
 function makeCommit(index: number, overrides: Partial<JjCommit> = {}): JjCommit {
@@ -216,5 +217,162 @@ describe('JjCommitComparisonSelector', () => {
     fireEvent.click(screen.getByTitle('Select diff head revision (To)'));
     expect(screen.getByText('Diff Head / Commits (3)')).toBeInTheDocument();
     expect(screen.queryByText(/Show all .* revisions/i)).not.toBeInTheDocument();
+  });
+
+  it('passes full 40-char activeTargetCommit.commitId to onToggleApprove when targetCommitId is a 7-char prefix', () => {
+    const c1 = makeCommit(1, { approved: true, description: 'Earlier approved' });
+    const c2 = makeCommit(2, { approved: false, description: 'Current unapproved' });
+    const onToggleApprove = vi.fn();
+
+    const { rerender } = render(
+      <JjCommitComparisonSelector
+        commits={[c1, c2]}
+        targetCommitId={c2.commitId.slice(0, 7)}
+        baseCommitId="parent"
+        onSelectBase={vi.fn()}
+        onSelectTarget={vi.fn()}
+        onToggleApprove={onToggleApprove}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^Approve$/i }));
+    expect(onToggleApprove).toHaveBeenCalledWith(c2.commitId, false);
+
+    // Clean-rebase upgrade path also passes full 40-char commitId
+    const c2CleanRebase = makeCommit(2, {
+      approved: false,
+      cleanRebaseApproved: true,
+      cleanRebaseSourceCommitNumber: 1,
+      description: 'Clean rebased',
+    });
+    rerender(
+      <JjCommitComparisonSelector
+        commits={[c1, c2CleanRebase]}
+        targetCommitId={c2CleanRebase.commitId.slice(0, 7)}
+        baseCommitId="parent"
+        onSelectBase={vi.fn()}
+        onSelectTarget={vi.fn()}
+        onToggleApprove={onToggleApprove}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Approved \(Clean Rebase\)/i }));
+    expect(onToggleApprove).toHaveBeenCalledWith(c2CleanRebase.commitId, false);
+  });
+});
+
+describe('JjRevisionSelector', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('prefers selectedChange.commitId as the default To target when switching to a change', async () => {
+    const changeA: JjChange = {
+      changeId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      shortChangeId: 'aaaaaaaa',
+      commitId: '1111111111111111111111111111111111111111',
+      shortCommitId: '11111111',
+      isWorkingCopy: true,
+      isEmpty: false,
+      hasDescription: true,
+      timestamp: '2026-11-12 19:00:00',
+      description: 'Change A',
+      commentCount: 0,
+      unresolvedCommentCount: 0,
+    };
+    const headCommitB = '2222222222222222222222222222222222222222';
+    const trailingCommitB = '3333333333333333333333333333333333333333';
+    const changeB: JjChange = {
+      changeId: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      shortChangeId: 'bbbbbbbb',
+      commitId: headCommitB,
+      shortCommitId: headCommitB.slice(0, 8),
+      isWorkingCopy: false,
+      isEmpty: false,
+      hasDescription: true,
+      timestamp: '2026-11-12 18:00:00',
+      description: 'Change B',
+      commentCount: 0,
+      unresolvedCommentCount: 0,
+    };
+
+    const graphRows: JjGraphRow[] = [
+      { type: 'commit', key: changeA.commitId, graphCols: ['@'], downCols: [0], change: changeA },
+      { type: 'commit', key: changeB.commitId, graphCols: ['○'], downCols: [], change: changeB },
+    ];
+
+    const commitsForA: JjCommit[] = [
+      {
+        commitId: changeA.commitId,
+        shortCommitId: changeA.shortCommitId,
+        timestamp: '2026-11-12 19:00:00',
+        description: 'Change A head',
+        isWorkingCopy: true,
+        commentCount: 0,
+        unresolvedCommentCount: 0,
+      },
+    ];
+    const commitsForB: JjCommit[] = [
+      {
+        commitId: headCommitB,
+        shortCommitId: headCommitB.slice(0, 8),
+        timestamp: '2026-11-12 18:00:00',
+        description: 'Change B head',
+        isWorkingCopy: false,
+        commentCount: 0,
+        unresolvedCommentCount: 0,
+      },
+      {
+        commitId: trailingCommitB,
+        shortCommitId: trailingCommitB.slice(0, 8),
+        timestamp: '2026-11-12 17:00:00',
+        description: 'Older or trailing entry',
+        isWorkingCopy: false,
+        commentCount: 0,
+        unresolvedCommentCount: 0,
+      },
+    ];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url === '/api/jj/changes') {
+          return {
+            ok: true,
+            json: async () => ({ changes: [changeA, changeB], graphRows }),
+          } as Response;
+        }
+        if (url === `/api/jj/changes/${encodeURIComponent(changeA.changeId)}/commits`) {
+          return {
+            ok: true,
+            json: async () => ({ commits: commitsForA }),
+          } as Response;
+        }
+        if (url === `/api/jj/changes/${encodeURIComponent(changeB.changeId)}/commits`) {
+          return {
+            ok: true,
+            json: async () => ({ commits: commitsForB }),
+          } as Response;
+        }
+        throw new Error(`Unexpected fetch URL: ${url}`);
+      }),
+    );
+
+    const onSelectDiff = vi.fn();
+    render(<JjRevisionSelector currentCommitId={changeA.commitId} onSelectDiff={onSelectDiff} />);
+
+    await waitFor(() => {
+      expect(onSelectDiff).toHaveBeenCalledWith(changeA.commitId, undefined);
+    });
+
+    // Open change dropdown (verifying graphRows renders the tree) and pick Change B
+    fireEvent.click(screen.getByTitle('Select Jujutsu Change'));
+    fireEvent.click(screen.getByRole('button', { name: /bbbbbbbb/i }));
+
+    await waitFor(() => {
+      expect(onSelectDiff).toHaveBeenCalledWith(headCommitB, undefined);
+    });
+    expect(onSelectDiff).not.toHaveBeenCalledWith(trailingCommitB, undefined);
   });
 });

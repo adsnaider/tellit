@@ -1122,5 +1122,153 @@ describe('JujutsuService comment aggregation', () => {
         rmSync(tempDir, { recursive: true, force: true });
       }
     });
+
+    it('preserves causal evolog order across mixed timezones and restored commits while keeping historical threads first', async () => {
+      const changeId = 'c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1';
+      const historicalCommit = '0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa';
+      const utcEarlierCommit = '1111bbbb1111bbbb1111bbbb1111bbbb1111bbbb';
+      const middleCommit = '2222cccc2222cccc2222cccc2222cccc2222cccc';
+      const restoredLocalHeadCommit = utcEarlierCommit;
+      const localLaterCommit = '3333dddd3333dddd3333dddd3333dddd3333dddd';
+      const parentA = 'aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111';
+      const parentB = 'bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222';
+
+      // Causal order from `jj evolog --reversed`:
+      // 1) UTC commit at 22:30:59
+      // 2) middle commit
+      // 3) jj undo restored utcEarlierCommit, followed by local-tz (-05:00) commit 17:55:05
+      const evologOutput = [
+        `${utcEarlierCommit}\t2026-11-12 22:30:59\t0\tEarlier UTC snapshot\t${parentA}`,
+        `${middleCommit}\t2026-11-12 22:45:00\t0\tIntermediate edit\t${parentB}`,
+        `${restoredLocalHeadCommit}\t2026-11-12 22:30:59\t0\tEarlier UTC snapshot\t${parentA}`,
+        `${localLaterCommit}\t2026-11-12 17:55:05\t1\tRestored local-tz head\t${parentB}`,
+      ].join('\n');
+
+      vi.spyOn(jjService, 'runJj').mockResolvedValue(evologOutput);
+      vi.spyOn(jjService, 'getChangeThreads').mockResolvedValue([
+        {
+          thread_id: 't-hist',
+          change_id: changeId,
+          commit_id: historicalCommit,
+          git_commit_hash: historicalCommit,
+          filepath: 'src/lib.rs',
+          comments: ['Historical thread'],
+          resolved: false,
+        },
+      ]);
+      vi.spyOn(jjService, 'getCommitDetails').mockImplementation(async (commitId) => {
+        if (commitId === localLaterCommit) {
+          return { threads: [], approval: true };
+        }
+        return { threads: [], approval: false };
+      });
+      vi.spyOn(jjService, 'runGit').mockResolvedValue({
+        stdout: 'diff --git a/x b/x\n+diff\n',
+        stderr: '',
+        exitCode: 0,
+      });
+
+      const commits = await jjService.getCommitsForChange(changeId);
+      expect(commits).toHaveLength(4);
+      expect(commits[0]?.commitId).toBe(historicalCommit);
+      expect(commits[0]?.description).toBe('(historical revision)');
+      expect(commits[1]?.commitId).toBe(middleCommit);
+      // Revisited commit moved to its causal position before the true head
+      expect(commits[2]?.commitId).toBe(restoredLocalHeadCommit);
+      // True evolog head remains last despite lexicographically earlier local timestamp (17:55 < 22:30)
+      const head = commits[commits.length - 1];
+      expect(head?.commitId).toBe(localLaterCommit);
+      expect(head?.approved).toBe(true);
+      expect(head?.cleanRebaseApproved).toBeUndefined();
+    });
+
+    it('marks changes directly approved across coexisting short and full change directories and details.approval fallback', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'tellit-coexist-dirs-'));
+      try {
+        const shortChangeId = 'uvwx1234';
+        const fullChangeId = 'uvwx1234567890123456789012345678';
+        const earlierCommit = '1111111111111111111111111111111111111111';
+        const currentCommit = '2222222222222222222222222222222222222222';
+        const parentA = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+        const parentB = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+
+        // Coexisting short-prefix dir (head commit) and full change dir (earlier commit)
+        const shortDir = join(tempDir, '.tellit', shortChangeId, currentCommit);
+        const fullDir = join(tempDir, '.tellit', fullChangeId, earlierCommit);
+        mkdirSync(shortDir, { recursive: true });
+        mkdirSync(fullDir, { recursive: true });
+        writeFileSync(
+          join(shortDir, 'approval.json'),
+          JSON.stringify({ approved: true, timestamp: '2' }),
+        );
+        writeFileSync(
+          join(fullDir, 'approval.json'),
+          JSON.stringify({ approved: true, timestamp: '1' }),
+        );
+
+        const storeService = new JujutsuService(tempDir);
+        vi.spyOn(storeService, 'runJj').mockImplementation(async (args) => {
+          if (args.some((a) => a.includes(JJ_LOG_NODE_MARKER))) {
+            return buildGraphRow({
+              changeId: fullChangeId,
+              commitId: currentCommit,
+              parentId: parentB,
+              description: 'Directly approved head',
+            });
+          }
+          if (args.includes(earlierCommit)) {
+            return parentA;
+          }
+          return '';
+        });
+        vi.spyOn(storeService, 'getChangeDetails').mockResolvedValue({
+          threads: [],
+          approval: false,
+        });
+
+        const fallbackResult = await storeService.getChangesGraph();
+        expect(fallbackResult.changes).toHaveLength(1);
+        expect(fallbackResult.changes[0]?.approved).toBe(true);
+        expect(fallbackResult.changes[0]?.cleanRebaseApproved).toBeUndefined();
+
+        // Also verify details.approval=true checks per-commit approval when approvedCommits only had earlierCommit
+        const isolatedDir = mkdtempSync(join(tmpdir(), 'tellit-details-approval-'));
+        try {
+          const isolatedService = new JujutsuService(isolatedDir);
+          vi.spyOn(isolatedService, 'runJj').mockImplementation(async (args) => {
+            if (args.some((a) => a.includes(JJ_LOG_NODE_MARKER))) {
+              return buildGraphRow({
+                changeId: fullChangeId,
+                commitId: currentCommit,
+                parentId: parentB,
+                description: 'Directly approved via commit details',
+              });
+            }
+            if (args.includes(earlierCommit)) {
+              return parentA;
+            }
+            return '';
+          });
+          vi.spyOn(isolatedService, 'getChangeDetails').mockResolvedValue({
+            threads: [],
+            approval: true,
+            approvedCommits: [earlierCommit],
+          });
+          vi.spyOn(isolatedService, 'getCommitDetails').mockImplementation(async (cid) => ({
+            threads: [],
+            approval: cid === currentCommit,
+          }));
+
+          const detailsFallbackResult = await isolatedService.getChangesGraph();
+          expect(detailsFallbackResult.changes).toHaveLength(1);
+          expect(detailsFallbackResult.changes[0]?.approved).toBe(true);
+          expect(detailsFallbackResult.changes[0]?.cleanRebaseApproved).toBeUndefined();
+        } finally {
+          rmSync(isolatedDir, { recursive: true, force: true });
+        }
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
   });
 });

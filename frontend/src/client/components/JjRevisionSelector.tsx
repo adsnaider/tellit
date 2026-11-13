@@ -131,10 +131,12 @@ export function useJjRevisions({
 
   const currentCommitIdRef = useRef(currentCommitId);
   const onSelectDiffRef = useRef(onSelectDiff);
+  const changesRef = useRef(changes);
   useEffect(() => {
     currentCommitIdRef.current = currentCommitId;
     onSelectDiffRef.current = onSelectDiff;
-  }, [currentCommitId, onSelectDiff]);
+    changesRef.current = changes;
+  }, [changes, currentCommitId, onSelectDiff]);
 
   const loadChanges = useCallback(async () => {
     try {
@@ -245,7 +247,11 @@ export function useJjRevisions({
         const match = fetchedCommits.find((c) =>
           commitIdsMatch(c.commitId, currentCommitIdRef.current),
         );
-        const latestCommit = fetchedCommits[fetchedCommits.length - 1];
+        const selectedChange = changesRef.current.find((c) => c.changeId === selectedChangeId);
+        const changeHeadCommit = selectedChange
+          ? fetchedCommits.find((c) => commitIdsMatch(c.commitId, selectedChange.commitId))
+          : undefined;
+        const latestCommit = changeHeadCommit ?? fetchedCommits[fetchedCommits.length - 1];
         const selectedTarget = match?.commitId ?? latestCommit?.commitId;
         if (selectedTarget) {
           setTargetCommitId(selectedTarget);
@@ -899,9 +905,9 @@ export function JjCommitComparisonSelector({
           onClick={() => {
             if (activeTargetCommit.cleanRebaseApproved && !activeTargetCommit.approved) {
               // Direct reapproval upgrade
-              onToggleApprove(targetCommitId, false);
+              onToggleApprove(activeTargetCommit.commitId, false);
             } else {
-              onToggleApprove(targetCommitId, Boolean(activeTargetCommit.approved));
+              onToggleApprove(activeTargetCommit.commitId, Boolean(activeTargetCommit.approved));
             }
           }}
           className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium border transition-all cursor-pointer ${
@@ -955,6 +961,7 @@ export function JjRevisionSelector({
     <div className="flex flex-wrap items-center gap-2">
       <JjChangeSelector
         changes={revisions.changes}
+        graphRows={revisions.graphRows}
         selectedChangeId={revisions.selectedChangeId}
         onSelectChange={revisions.setSelectedChangeId}
         isCustomInput={revisions.isCustomInput}

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 
 import {
   type BaseMode,
@@ -95,6 +95,7 @@ export function useDiffComments(
 ): UseDiffCommentsReturn {
   const [threads, setThreads] = useState<DiffCommentThread[]>([]);
   const [hasLoadedComments, setHasLoadedComments] = useState(false);
+  const hadStorageContextRef = useRef(false);
 
   const loadDiffContextData = useCallback(() => {
     if (!baseCommitish || !targetCommitish) {
@@ -132,11 +133,15 @@ export function useDiffComments(
 
   useEffect(() => {
     if (!baseCommitish || !targetCommitish) {
-      setThreads([]);
-      setHasLoadedComments(false);
+      if (hadStorageContextRef.current) {
+        hadStorageContextRef.current = false;
+        setThreads([]);
+        setHasLoadedComments(false);
+      }
       return;
     }
 
+    hadStorageContextRef.current = true;
     const loadedThreads =
       loadDiffContextData()?.threads ||
       storageService.getCommentThreads(

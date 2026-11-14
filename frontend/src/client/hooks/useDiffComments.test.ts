@@ -1,7 +1,7 @@
 import { renderHook, act } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-import type { DiffCommentThread, DiffContextStorage } from '../../types/diff';
+import type { BaseMode, DiffCommentThread, DiffContextStorage } from '../../types/diff';
 import { storageService } from '../services/StorageService';
 import { useDiffComments } from './useDiffComments';
 
@@ -533,6 +533,148 @@ const next = true;
       expect(result.current.hasLoadedComments).toBe(true);
       expect(result.current.threads).toEqual(transientThreads);
       expect(storageService.saveCommentThreads).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('transient state without commit refs', () => {
+    it('preserves threads across commit, repository, and baseMode changes when refs stay undefined', () => {
+      const initialThreads: DiffCommentThread[] = [
+        {
+          id: 'jj-thread-1',
+          filePath: 'src/lib.rs',
+          createdAt: '1970-01-01T00:00:00.000Z',
+          updatedAt: '1970-01-01T00:00:00.000Z',
+          resolved: false,
+          position: { side: 'new', line: 12 },
+          messages: [
+            {
+              id: 'jj-thread-1:0',
+              body: 'Transient thread 1',
+              createdAt: '1970-01-01T00:00:00.000Z',
+              updatedAt: '1970-01-01T00:00:00.000Z',
+            },
+          ],
+        },
+      ];
+      const nextThreads: DiffCommentThread[] = [
+        {
+          id: 'jj-thread-2',
+          filePath: 'src/main.rs',
+          createdAt: '1970-01-01T00:00:00.000Z',
+          updatedAt: '1970-01-01T00:00:00.000Z',
+          resolved: false,
+          position: { side: 'new', line: 24 },
+          messages: [
+            {
+              id: 'jj-thread-2:0',
+              body: 'Transient thread 2',
+              createdAt: '1970-01-01T00:00:00.000Z',
+              updatedAt: '1970-01-01T00:00:00.000Z',
+            },
+          ],
+        },
+      ];
+
+      type HookProps = {
+        currentCommitHash?: string;
+        repositoryId?: string;
+        baseMode?: BaseMode;
+      };
+      const initialProps: HookProps = {
+        currentCommitHash: 'commit-1',
+        repositoryId: 'repo-1',
+        baseMode: 'merge-base',
+      };
+      const { result, rerender } = renderHook(
+        ({ currentCommitHash, repositoryId, baseMode }: HookProps) =>
+          useDiffComments(undefined, undefined, currentCommitHash, undefined, repositoryId, baseMode),
+        { initialProps },
+      );
+
+      act(() => {
+        result.current.replaceThreads(initialThreads);
+      });
+      expect(result.current.threads).toEqual(initialThreads);
+      expect(result.current.hasLoadedComments).toBe(true);
+
+      rerender({
+        currentCommitHash: 'commit-2',
+        repositoryId: 'repo-2',
+        baseMode: 'direct',
+      });
+      expect(result.current.threads).toEqual(initialThreads);
+      expect(result.current.hasLoadedComments).toBe(true);
+
+      act(() => {
+        result.current.replaceThreads(nextThreads);
+        rerender({
+          currentCommitHash: 'commit-3',
+          repositoryId: 'repo-2',
+          baseMode: 'direct',
+        });
+      });
+      expect(result.current.threads).toEqual(nextThreads);
+      expect(result.current.hasLoadedComments).toBe(true);
+      expect(storageService.saveCommentThreads).not.toHaveBeenCalled();
+    });
+
+    it('clears previously loaded storage threads when commit refs become undefined', () => {
+      const storedThreads: DiffCommentThread[] = [
+        {
+          id: 'stored-thread-1',
+          filePath: 'src/app.ts',
+          createdAt: '1970-01-01T00:00:00.000Z',
+          updatedAt: '1970-01-01T00:00:00.000Z',
+          resolved: false,
+          position: { side: 'new', line: 5 },
+          messages: [
+            {
+              id: 'stored-thread-1:0',
+              body: 'Stored comment',
+              createdAt: '1970-01-01T00:00:00.000Z',
+              updatedAt: '1970-01-01T00:00:00.000Z',
+            },
+          ],
+        },
+      ];
+      mockDiffContextData = {
+        version: 2,
+        baseCommitish: 'main',
+        targetCommitish: 'feature-branch',
+        createdAt: '1970-01-01T00:00:00.000Z',
+        lastModifiedAt: '1970-01-01T00:00:00.000Z',
+        threads: storedThreads,
+        viewedFiles: [],
+        appliedCommentImportIds: [],
+      };
+
+      type HookProps = {
+        baseCommitish?: string;
+        targetCommitish?: string;
+        currentCommitHash?: string;
+      };
+      const initialProps: HookProps = {
+        baseCommitish: 'main',
+        targetCommitish: 'feature-branch',
+        currentCommitHash: 'abc123',
+      };
+      const { result, rerender } = renderHook(
+        ({ baseCommitish, targetCommitish, currentCommitHash }: HookProps) =>
+          useDiffComments(baseCommitish, targetCommitish, currentCommitHash),
+        { initialProps },
+      );
+
+      expect(result.current.hasLoadedComments).toBe(true);
+      expect(result.current.threads).toEqual(storedThreads);
+
+      rerender({
+        baseCommitish: undefined,
+        targetCommitish: undefined,
+        currentCommitHash: 'def456',
+      });
+
+      expect(result.current.hasLoadedComments).toBe(false);
+      expect(result.current.threads).toEqual([]);
     });
   });
 });

@@ -278,6 +278,8 @@ function App() {
   const { settings, updateSettings } = useAppearanceSettings();
   const { isMobile, isDesktop } = useViewport();
 
+  const isLegacyCommentMode = jjStatusChecked && !isJjRepo;
+
   // New diff-aware comment system
   const {
     hasLoadedComments,
@@ -292,22 +294,22 @@ function App() {
     generateThreadPrompt,
     generateAllCommentsPrompt,
   } = useDiffComments(
-    jjStatusChecked && !isJjRepo ? resolvedSelection?.baseCommitish : undefined,
-    jjStatusChecked && !isJjRepo ? resolvedSelection?.targetCommitish : undefined,
-    diffData?.commit, // Using commit as currentCommitHash
+    isLegacyCommentMode ? resolvedSelection?.baseCommitish : undefined,
+    isLegacyCommentMode ? resolvedSelection?.targetCommitish : undefined,
+    isLegacyCommentMode ? diffData?.commit : undefined, // Using commit as currentCommitHash
     undefined, // branchToHash map - could be populated from server data
-    diffData?.repositoryId, // Repository identifier for storage isolation
-    resolvedSelection?.baseMode,
+    isLegacyCommentMode ? diffData?.repositoryId : undefined, // Repository identifier for storage isolation
+    isLegacyCommentMode ? resolvedSelection?.baseMode : undefined,
   );
 
   const showMobileCommentsBar = isMobile && threads.length > 0;
   const commentsContextKey = useMemo(() => {
-    if (!jjStatusChecked || isJjRepo || !resolvedSelectionKey) {
+    if (!isLegacyCommentMode || !resolvedSelectionKey) {
       return null;
     }
 
     return `${diffData?.repositoryId ?? 'default'}:${resolvedSelectionKey}`;
-  }, [diffData?.repositoryId, isJjRepo, jjStatusChecked, resolvedSelectionKey]);
+  }, [diffData?.repositoryId, isLegacyCommentMode, resolvedSelectionKey]);
   const commentSessionQueryString = useMemo(() => {
     if (!resolvedSelection) {
       return null;

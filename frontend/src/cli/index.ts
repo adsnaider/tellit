@@ -21,7 +21,6 @@ import {
   readStdin,
 } from './utils.js';
 import { createCommentCommand } from './comment.js';
-import { getPrPatch, getPrCommentImports } from './github.js';
 import {
   BACKGROUND_CHILD_ENV,
   emitBackgroundHandshake,
@@ -84,7 +83,6 @@ interface CliOptions {
   host?: string;
   open: boolean;
   comment: string[];
-  pr?: string;
   clean?: boolean;
   includeUntracked?: boolean;
   keepAlive?: boolean;
@@ -119,7 +117,6 @@ program
     (value: string, previous: string[]) => [...previous, value],
     [],
   )
-  .option('--pr <url>', 'GitHub PR URL to review (e.g., https://github.com/owner/repo/pull/123)')
   .option('--clean', 'start with a clean slate by clearing all existing comments')
   .option('--include-untracked', 'automatically include untracked files in diff')
   .option('--keep-alive', 'keep server running even after browser disconnects')
@@ -134,8 +131,6 @@ program
       const isBackgroundChild = process.env[BACKGROUND_CHILD_ENV] === '1';
       const backgroundMode = options.background || isBackgroundChild;
       let stdinDiff: string | undefined;
-      let stdinReviewLabel = 'diff from stdin';
-      let manualCommentImports: CommentImport[] = [];
       let commentImports: CommentImport[] = [];
 
       if (
@@ -152,8 +147,7 @@ program
       }
 
       try {
-        manualCommentImports = parseCommentOptions(options.comment);
-        commentImports = manualCommentImports;
+        commentImports = parseCommentOptions(options.comment);
       } catch (error) {
         console.error(
           `Error: ${error instanceof Error ? error.message : 'Invalid --comment value'}`,
@@ -166,68 +160,31 @@ program
         options.open = false;
       }
 
-      if (options.pr) {
-        if (commitish !== 'HEAD' || compareWith) {
-          console.error('Error: --pr option cannot be used with positional arguments');
-          process.exit(1);
-        }
+      // Check if we should read from stdin
+      const readFromStdin = shouldReadStdin({
+        commitish,
+        hasPositionalArgs: program.args.length > 0,
+      });
 
-        if (options.mergeBase) {
-          console.error('Error: --merge-base option cannot be used with --pr');
-          process.exit(1);
-        }
-
+      if (readFromStdin) {
         if (options.context !== undefined) {
-          console.error('Error: --context option cannot be used with --pr');
+          console.error('Error: --context option cannot be used with stdin diff');
           process.exit(1);
         }
-
-        try {
-          stdinDiff = getPrPatch(options.pr);
-          stdinReviewLabel = options.pr;
-        } catch (error) {
-          console.error(
-            `Error resolving PR: ${error instanceof Error ? error.message : 'Unknown error'}`,
-          );
+        if (options.mergeBase) {
+          console.error('Error: --merge-base option cannot be used with stdin diff');
           process.exit(1);
         }
-
-        try {
-          const prCommentImports = await getPrCommentImports(options.pr);
-          commentImports = [...prCommentImports, ...manualCommentImports];
-        } catch (error) {
-          console.warn(
-            `Warning: Failed to load PR review comments: ${error instanceof Error ? error.message : 'Unknown error'}`,
-          );
-        }
-      } else {
-        // Check if we should read from stdin
-        const readFromStdin = shouldReadStdin({
-          commitish,
-          hasPositionalArgs: program.args.length > 0,
-          hasPrOption: false,
-        });
-
-        if (readFromStdin) {
-          if (options.context !== undefined) {
-            console.error('Error: --context option cannot be used with stdin diff');
-            process.exit(1);
-          }
-          if (options.mergeBase) {
-            console.error('Error: --merge-base option cannot be used with stdin diff');
-            process.exit(1);
-          }
-          // Read unified diff from stdin
-          stdinDiff = await readStdin();
-          if (!stdinDiff.trim()) {
-            console.error('Error: No diff content received from stdin');
-            process.exit(1);
-          }
+        // Read unified diff from stdin
+        stdinDiff = await readStdin();
+        if (!stdinDiff.trim()) {
+          console.error('Error: No diff content received from stdin');
+          process.exit(1);
         }
       }
 
       if (stdinDiff) {
-        // Start server with stdin diff (including --pr patch)
+        // Start server with stdin diff
         const { url, port } = await startServer({
           stdinDiff,
           preferredPort: options.port,
@@ -247,7 +204,7 @@ program
         }
 
         console.log(`\n🚀 tellit server started on ${url}`);
-        console.log(`📋 Reviewing: ${stdinReviewLabel}`);
+        console.log('📋 Reviewing: diff from stdin');
         if (options.keepAlive) {
           console.log('🔒 Keep-alive mode: server will stay running after browser disconnects');
         }

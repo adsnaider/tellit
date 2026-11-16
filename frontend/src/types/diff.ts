@@ -303,3 +303,9 @@ interface ExpandedRange {
 export interface ExpandedLine extends DiffLine {
   isExpanded?: boolean;
 }
+
+export interface MergedChunk extends DiffChunk {
+  originalIndices: number[];
+  hiddenLinesBefore: number;
+  hiddenLinesAfter: number;
+}

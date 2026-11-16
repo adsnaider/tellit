@@ -1,5 +1,5 @@
 import type { DiffSide } from '../../../types/diff';
-import type { CursorPosition, ViewMode } from '../../hooks/keyboardNavigation/types';
+import type { CursorPosition, ViewMode } from './types';
 
 /**
  * Creates a DOM element ID from a cursor position

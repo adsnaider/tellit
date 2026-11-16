@@ -1,5 +1,4 @@
-import { type DiffFile } from '../../types/diff';
-import { type MergedChunk } from '../hooks/useExpandedLines';
+import { type DiffFile, type MergedChunk } from '../../types/diff';
 
 interface MergedChunksState {
   diffVersion: number | null;

@@ -12,15 +12,15 @@
     "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
+    "verbatimModuleSyntax": false,
     "exactOptionalPropertyTypes": false,
     "noPropertyAccessFromIndexSignature": false,
-    "jsx": "react-jsx",
     "incremental": true,
     "paths": {
       "@/*": ["./src/*"],
       "@/types/*": ["./src/types/*"]
     }
   },
-  "include": ["src/**/*", "dev/**/*"],
+  "include": ["src/**/*.ts", "src/**/*.svelte", "dev/**/*"],
   "references": [{ "path": "./tsconfig.cli.json" }]
 }

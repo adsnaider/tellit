@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { svelte } from '@sveltejs/vite-plugin-svelte';
+import { svelteTesting } from '@testing-library/svelte/vite';
 import { defineConfig } from 'vitest/config';
 
 const resolveFromRoot = (relativePath: string) => path.resolve(process.cwd(), relativePath);
@@ -12,7 +14,7 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'happy-dom',
-    include: ['src/**/*.test.ts', 'src/**/*.test.tsx', 'dev/**/*.test.ts'],
+    include: ['src/**/*.test.ts', 'dev/**/*.test.ts'],
     setupFiles: ['./vitest.setup.ts'],
     pool: 'forks',
   },
@@ -29,6 +31,8 @@ export default defineConfig({
     },
   },
   plugins: [
+    svelte(),
+    svelteTesting(),
     {
       name: 'vitest-virtual-vite-env',
       enforce: 'pre',

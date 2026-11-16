@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import type { DiffFile } from '../../types/diff';
-import type { MergedChunk } from '../hooks/useExpandedLines';
+import type { DiffFile, MergedChunk } from '../../types/diff';
 
 import { buildMergedChunksState, getMergedChunksForVersion } from './mergedChunks';
 

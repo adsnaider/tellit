@@ -30,7 +30,6 @@ export function detectStdinSource(stdinStat: StdinStat = fstatSync(0)): StdinSou
 interface ShouldReadStdinOptions {
   commitish: string;
   hasPositionalArgs: boolean;
-  hasPrOption: boolean;
   stdinSource?: StdinSource;
 }
 
@@ -39,7 +38,7 @@ export function shouldReadStdin(options: ShouldReadStdinOptions): boolean {
     return true;
   }
 
-  if (options.hasPositionalArgs || options.hasPrOption) {
+  if (options.hasPositionalArgs) {
     return false;
   }
 

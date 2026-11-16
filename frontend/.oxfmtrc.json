@@ -4,7 +4,6 @@
   "tabWidth": 2,
   "printWidth": 100,
   "singleQuote": true,
-  "jsxSingleQuote": false,
   "quoteProps": "as-needed",
   "trailingComma": "all",
   "semi": true,
@@ -26,6 +25,6 @@
     ".claude/**",
     "public/**",
     "docs/syntax-sample/**",
-    "pnpm-lock.yaml"
+    "**/*.svelte"
   ]
 }

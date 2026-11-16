@@ -56,7 +56,6 @@ describe('CLI Utils', () => {
         shouldReadStdin({
           commitish: '-',
           hasPositionalArgs: true,
-          hasPrOption: true,
           stdinSource: 'tty',
         }),
       ).toBe(true);
@@ -67,18 +66,6 @@ describe('CLI Utils', () => {
         shouldReadStdin({
           commitish: '.',
           hasPositionalArgs: true,
-          hasPrOption: false,
-          stdinSource: 'pipe',
-        }),
-      ).toBe(false);
-    });
-
-    it('does not read stdin when --pr is specified', () => {
-      expect(
-        shouldReadStdin({
-          commitish: 'HEAD',
-          hasPositionalArgs: false,
-          hasPrOption: true,
           stdinSource: 'pipe',
         }),
       ).toBe(false);
@@ -89,7 +76,6 @@ describe('CLI Utils', () => {
         shouldReadStdin({
           commitish: 'HEAD',
           hasPositionalArgs: false,
-          hasPrOption: false,
           stdinSource: 'pipe',
         }),
       ).toBe(true);
@@ -98,7 +84,6 @@ describe('CLI Utils', () => {
         shouldReadStdin({
           commitish: 'HEAD',
           hasPositionalArgs: false,
-          hasPrOption: false,
           stdinSource: 'file',
         }),
       ).toBe(true);
@@ -107,7 +92,6 @@ describe('CLI Utils', () => {
         shouldReadStdin({
           commitish: 'HEAD',
           hasPositionalArgs: false,
-          hasPrOption: false,
           stdinSource: 'socket',
         }),
       ).toBe(true);
@@ -118,7 +102,6 @@ describe('CLI Utils', () => {
         shouldReadStdin({
           commitish: 'HEAD',
           hasPositionalArgs: false,
-          hasPrOption: false,
           stdinSource: 'tty',
         }),
       ).toBe(false);

@@ -1,7 +1,6 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["typescript", "react", "import"],
-  "jsPlugins": [{ "name": "react-hooks-js", "specifier": "eslint-plugin-react-hooks" }],
+  "plugins": ["typescript", "import"],
   "categories": {
     "correctness": "error",
     "suspicious": "off",
@@ -23,6 +22,7 @@
     "public/**",
     "tests/**",
     "scripts/**",
+    "**/*.svelte",
     "*.config.js",
     "*.config.mjs",
     "*.config.ts",
@@ -36,13 +36,6 @@
     "no-await-in-loop": "off",
     "no-undef": "off",
     "no-unused-vars": ["error", { "argsIgnorePattern": "^_" }],
-    "react/react-in-jsx-scope": "off",
-    "react/no-array-index-key": "off",
-    "react/rules-of-hooks": "error",
-    "react/exhaustive-deps": "error",
-    "react-hooks-js/refs": "off",
-    "react-hooks-js/set-state-in-effect": "off",
-    "react-hooks-js/immutability": "error",
     "typescript/no-explicit-any": "error",
     "typescript/no-non-null-assertion": "error",
     "typescript/consistent-type-assertions": "error",
@@ -68,7 +61,7 @@
   },
   "overrides": [
     {
-      "files": ["**/*.test.ts", "**/*.test.tsx"],
+      "files": ["**/*.test.ts"],
       "rules": {
         "typescript/no-unsafe-assignment": "off",
         "typescript/no-unsafe-member-access": "off",

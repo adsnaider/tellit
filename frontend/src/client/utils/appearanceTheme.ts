@@ -1,4 +1,4 @@
-type ThemePreference = 'light' | 'dark' | 'auto';
+export type ThemePreference = 'light' | 'dark' | 'auto';
 
 export type ColorVisionMode = 'normal' | 'deuteranopia';
 
@@ -112,12 +112,12 @@ const getThemeWindow = (): ThemeWindow | undefined => {
   return window;
 };
 
-type StoredAppearanceSettings = {
+export type StoredAppearanceSettings = {
   colorVision?: ColorVisionMode;
   theme?: ThemePreference;
 };
 
-function getStoredAppearanceSettings(
+export function getStoredAppearanceSettings(
   storage: ThemeStorage | undefined = getThemeStorage(),
 ): StoredAppearanceSettings | null {
   if (!storage) {

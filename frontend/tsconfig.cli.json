@@ -20,8 +20,7 @@
     "paths": {
       "@/*": ["./src/*"],
       "@/types/*": ["./src/types/*"]
-    },
-    "jsx": "react"
+    }
   },
   "include": ["src/cli/**/*", "src/server/**/*", "src/types/**/*", "src/utils/**/*"],
   "exclude": ["src/client/**/*", "node_modules", "dist", "tests"]

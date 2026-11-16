@@ -16,10 +16,6 @@ vi.mock('./utils.js', async () => {
     markFilesIntentToAdd: vi.fn(),
   };
 });
-vi.mock('./github.js', () => ({
-  getPrPatch: vi.fn(),
-  getPrCommentImports: vi.fn(),
-}));
 
 const { simpleGit } = await import('simple-git');
 const { startServer } = await import('../server/server.js');
@@ -30,7 +26,6 @@ const {
   parseCommentOptions,
   shouldReadStdin,
 } = await import('./utils.js');
-const { getPrPatch, getPrCommentImports } = await import('./github.js');
 
 describe('CLI index.ts', () => {
   let mockGit: any;
@@ -38,8 +33,6 @@ describe('CLI index.ts', () => {
   let mockPromptUser: any;
   let mockFindUntrackedFiles: any;
   let mockMarkFilesIntentToAdd: any;
-  let mockGetPrPatch: any;
-  let mockGetPrCommentImports: any;
   let actualParseCommentOptions: typeof parseCommentOptions;
 
   // Store original console methods
@@ -66,9 +59,6 @@ describe('CLI index.ts', () => {
     mockPromptUser = vi.mocked(promptUser);
     mockFindUntrackedFiles = vi.mocked(findUntrackedFiles);
     mockMarkFilesIntentToAdd = vi.mocked(markFilesIntentToAdd);
-    mockGetPrPatch = vi.mocked(getPrPatch);
-    mockGetPrCommentImports = vi.mocked(getPrCommentImports);
-    mockGetPrCommentImports.mockResolvedValue([]);
     actualParseCommentOptions = parseCommentOptions;
 
     // Mock console and process.exit
@@ -148,7 +138,6 @@ describe('CLI index.ts', () => {
         .option('--host <host>', 'host', '')
         .option('--no-open', 'no-open')
         .option('--merge-base', 'merge-base')
-        .option('--pr <url>', 'pr')
         .action(async (commitish: string, _compareWith: string | undefined, options: any) => {
           // Simulate the logic from index.ts
           let targetCommitish = commitish;
@@ -241,7 +230,6 @@ describe('CLI index.ts', () => {
         .option('--port <port>', 'port', parseInt)
         .option('--host <host>', 'host', '')
         .option('--no-open', 'no-open')
-        .option('--pr <url>', 'pr')
         .option('--merge-base', 'merge-base')
         .option('--clean', 'start with a clean slate by clearing all existing comments')
         .option('--keep-alive', 'keep server running even after browser disconnects')
@@ -312,38 +300,6 @@ describe('CLI index.ts', () => {
       expect(mockStartServer).not.toHaveBeenCalled();
     });
 
-    it('rejects --context with --pr', async () => {
-      const prUrl = 'https://github.com/owner/repo/pull/123';
-      const program = new Command();
-
-      program
-        .argument('[commit-ish]', 'commit-ish', 'HEAD')
-        .argument('[compare-with]', 'compare-with')
-        .option('--context <lines>', 'context', parseInt)
-        .option('--pr <url>', 'pr')
-        .action(async (_commitish: string, _compareWith: string | undefined, options: any) => {
-          if (options.pr && options.context !== undefined) {
-            console.error('Error: --context option cannot be used with --pr');
-            process.exit(1);
-            return;
-          }
-
-          await startServer({
-            stdinDiff: getPrPatch(options.pr),
-            contextLines: options.context,
-          });
-        });
-
-      await program.parseAsync(['--pr', prUrl, '--context', '3'], { from: 'user' });
-
-      expect(console.error).toHaveBeenCalledWith(
-        'Error: --context option cannot be used with --pr',
-      );
-      expect(process.exit).toHaveBeenCalledWith(1);
-      expect(mockGetPrPatch).not.toHaveBeenCalled();
-      expect(mockStartServer).not.toHaveBeenCalled();
-    });
-
     it('rejects --context with stdin diff', async () => {
       const program = new Command();
 
@@ -355,7 +311,6 @@ describe('CLI index.ts', () => {
           const readFromStdin = shouldReadStdin({
             commitish,
             hasPositionalArgs: program.args.length > 0,
-            hasPrOption: false,
           });
 
           if (readFromStdin && options.context !== undefined) {
@@ -381,37 +336,6 @@ describe('CLI index.ts', () => {
   });
 
   describe('--merge-base option', () => {
-    it('rejects --merge-base with --pr', async () => {
-      const prUrl = 'https://github.com/owner/repo/pull/123';
-      const program = new Command();
-
-      program
-        .argument('[commit-ish]', 'commit-ish', 'HEAD')
-        .argument('[compare-with]', 'compare-with')
-        .option('--merge-base', 'merge-base')
-        .option('--pr <url>', 'pr')
-        .action(async (commitish: string, _compareWith: string | undefined, options: any) => {
-          if (options.pr && commitish === 'HEAD' && !_compareWith && options.mergeBase) {
-            console.error('Error: --merge-base option cannot be used with --pr');
-            process.exit(1);
-            return;
-          }
-
-          await startServer({
-            stdinDiff: getPrPatch(options.pr),
-          });
-        });
-
-      await program.parseAsync(['--pr', prUrl, '--merge-base'], { from: 'user' });
-
-      expect(console.error).toHaveBeenCalledWith(
-        'Error: --merge-base option cannot be used with --pr',
-      );
-      expect(process.exit).toHaveBeenCalledWith(1);
-      expect(mockGetPrPatch).not.toHaveBeenCalled();
-      expect(mockStartServer).not.toHaveBeenCalled();
-    });
-
     it('rejects --merge-base with stdin diff', async () => {
       const program = new Command();
 
@@ -423,7 +347,6 @@ describe('CLI index.ts', () => {
           const readFromStdin = shouldReadStdin({
             commitish,
             hasPositionalArgs: program.args.length > 0,
-            hasPrOption: false,
           });
 
           if (readFromStdin && options.mergeBase) {
@@ -545,7 +468,6 @@ describe('CLI index.ts', () => {
         .option('--port <port>', 'port', parseInt)
         .option('--host <host>', 'host', '')
         .option('--no-open', 'no-open')
-        .option('--pr <url>', 'pr')
         .action(async (commitish: string, _compareWith: string | undefined, options: any) => {
           if (commitish === 'working' || commitish === '.') {
             const git = simpleGit();
@@ -577,7 +499,6 @@ describe('CLI index.ts', () => {
         .option('--port <port>', 'port', parseInt)
         .option('--host <host>', 'host', '')
         .option('--no-open', 'no-open')
-        .option('--pr <url>', 'pr')
         .action(async (commitish: string, _compareWith: string | undefined, options: any) => {
           if (commitish === 'working' || commitish === '.') {
             const git = simpleGit();
@@ -610,7 +531,6 @@ describe('CLI index.ts', () => {
         .option('--port <port>', 'port', parseInt)
         .option('--host <host>', 'host', '')
         .option('--no-open', 'no-open')
-        .option('--pr <url>', 'pr')
         .option('--include-untracked', 'include untracked')
         .action(async (commitish: string, _compareWith: string | undefined, options: any) => {
           if (commitish === 'working' || commitish === '.') {
@@ -648,7 +568,6 @@ describe('CLI index.ts', () => {
         .option('--port <port>', 'port', parseInt)
         .option('--host <host>', 'host', '')
         .option('--no-open', 'no-open')
-        .option('--pr <url>', 'pr')
         .option('--include-untracked', 'include untracked')
         .action(async (commitish: string, _compareWith: string | undefined, options: any) => {
           if (commitish === 'working' || commitish === '.') {
@@ -672,200 +591,6 @@ describe('CLI index.ts', () => {
 
       expect(mockFindUntrackedFiles).toHaveBeenCalledWith(mockGit);
       expect(mockMarkFilesIntentToAdd).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('GitHub PR integration', () => {
-    it('loads PR patch, appends manual comments after PR imports, and starts server with stdin diff', async () => {
-      const prUrl = 'https://github.com/owner/repo/pull/123';
-      const prPatch = 'diff --git a/file.ts b/file.ts\nindex 1111111..2222222 100644\n';
-      const prCommentImports = [
-        {
-          type: 'thread' as const,
-          id: 'PR_COMMENT_1',
-          filePath: 'src/example.ts',
-          position: { side: 'new' as const, line: 10 },
-          body: 'Imported PR thread',
-          author: 'octocat',
-          createdAt: '2026-03-25T09:00:00Z',
-          updatedAt: '2026-03-25T09:05:00Z',
-        },
-        {
-          type: 'reply' as const,
-          id: 'PR_COMMENT_2',
-          filePath: 'src/example.ts',
-          position: { side: 'new' as const, line: 10 },
-          body: 'Imported PR reply',
-          author: 'hubot',
-          createdAt: '2026-03-25T09:10:00Z',
-          updatedAt: '2026-03-25T09:12:00Z',
-        },
-      ];
-      mockGetPrPatch.mockReturnValue(prPatch);
-      mockGetPrCommentImports.mockResolvedValue(prCommentImports);
-
-      const program = new Command();
-
-      program
-        .argument('[commit-ish]', 'commit-ish', 'HEAD')
-        .argument('[compare-with]', 'compare-with')
-        .option(
-          '--comment <json>',
-          'comment',
-          (value: string, previous: string[]) => [...previous, value],
-          [],
-        )
-        .option('--port <port>', 'port', parseInt)
-        .option('--host <host>', 'host', '')
-        .option('--no-open', 'no-open')
-        .option('--pr <url>', 'pr')
-        .action(async (commitish: string, _compareWith: string | undefined, options: any) => {
-          const manualCommentImports = actualParseCommentOptions(options.comment);
-          let commentImports = manualCommentImports;
-
-          if (options.pr) {
-            if (commitish !== 'HEAD' || _compareWith) {
-              console.error('Error: --pr option cannot be used with positional arguments');
-              process.exit(1);
-            }
-
-            const importedPrComments = await getPrCommentImports(options.pr);
-            commentImports = [...importedPrComments, ...manualCommentImports];
-          }
-
-          await startServer({
-            stdinDiff: getPrPatch(options.pr),
-            preferredPort: options.port,
-            host: options.host,
-            openBrowser: options.open,
-            commentImports,
-          });
-        });
-
-      await program.parseAsync(
-        [
-          '--pr',
-          prUrl,
-          '--comment',
-          '{"type":"reply","filePath":"src/example.ts","position":{"side":"new","line":10},"body":"Manual reply"}',
-        ],
-        { from: 'user' },
-      );
-
-      expect(mockGetPrPatch).toHaveBeenCalledWith(prUrl);
-      expect(mockGetPrCommentImports).toHaveBeenCalledWith(prUrl);
-      expect(mockStartServer).toHaveBeenCalledWith({
-        stdinDiff: prPatch,
-        preferredPort: undefined,
-        host: '',
-        openBrowser: true,
-        commentImports: [
-          ...prCommentImports,
-          {
-            type: 'reply',
-            id: undefined,
-            filePath: 'src/example.ts',
-            position: { side: 'new', line: 10 },
-            body: 'Manual reply',
-            author: undefined,
-            createdAt: undefined,
-            updatedAt: undefined,
-            codeSnapshot: undefined,
-          },
-        ],
-      });
-    });
-
-    it('continues with patch only when PR comment import fetch fails', async () => {
-      const prUrl = 'https://github.com/owner/repo/pull/123';
-      const prPatch = 'diff --git a/file.ts b/file.ts\nindex 1111111..2222222 100644\n';
-      mockGetPrPatch.mockReturnValue(prPatch);
-      mockGetPrCommentImports.mockRejectedValue(new Error('gh api graphql failed'));
-
-      const program = new Command();
-
-      program
-        .argument('[commit-ish]', 'commit-ish', 'HEAD')
-        .argument('[compare-with]', 'compare-with')
-        .option(
-          '--comment <json>',
-          'comment',
-          (value: string, previous: string[]) => [...previous, value],
-          [],
-        )
-        .option('--port <port>', 'port', parseInt)
-        .option('--host <host>', 'host', '')
-        .option('--no-open', 'no-open')
-        .option('--pr <url>', 'pr')
-        .action(async (commitish: string, _compareWith: string | undefined, options: any) => {
-          const manualCommentImports = actualParseCommentOptions(options.comment);
-          let commentImports = manualCommentImports;
-
-          if (options.pr) {
-            if (commitish !== 'HEAD' || _compareWith) {
-              console.error('Error: --pr option cannot be used with positional arguments');
-              process.exit(1);
-            }
-
-            try {
-              const importedPrComments = await getPrCommentImports(options.pr);
-              commentImports = [...importedPrComments, ...manualCommentImports];
-            } catch (error) {
-              console.warn(
-                `Warning: Failed to load PR review comments: ${error instanceof Error ? error.message : 'Unknown error'}`,
-              );
-            }
-          }
-
-          await startServer({
-            stdinDiff: getPrPatch(options.pr),
-            preferredPort: options.port,
-            host: options.host,
-            openBrowser: options.open,
-            ...(commentImports.length > 0 ? { commentImports } : {}),
-          });
-        });
-
-      await program.parseAsync(['--pr', prUrl], { from: 'user' });
-
-      expect(console.warn).toHaveBeenCalledWith(
-        'Warning: Failed to load PR review comments: gh api graphql failed',
-      );
-      expect(mockStartServer).toHaveBeenCalledWith({
-        stdinDiff: prPatch,
-        preferredPort: undefined,
-        host: '',
-        openBrowser: true,
-      });
-    });
-
-    it('rejects PR option with positional arguments', async () => {
-      const program = new Command();
-
-      program
-        .argument('[commit-ish]', 'commit-ish', 'HEAD')
-        .argument('[compare-with]', 'compare-with')
-        .option('--port <port>', 'port', parseInt)
-        .option('--host <host>', 'host', '')
-        .option('--no-open', 'no-open')
-        .option('--pr <url>', 'pr')
-        .action(async (commitish: string, _compareWith: string | undefined, options: any) => {
-          if (options.pr) {
-            if (commitish !== 'HEAD' || _compareWith) {
-              console.error('Error: --pr option cannot be used with positional arguments');
-              process.exit(1);
-            }
-          }
-        });
-
-      await program.parseAsync(['main', '--pr', 'https://github.com/owner/repo/pull/123'], {
-        from: 'user',
-      });
-
-      expect(console.error).toHaveBeenCalledWith(
-        'Error: --pr option cannot be used with positional arguments',
-      );
-      expect(process.exit).toHaveBeenCalledWith(1);
     });
   });
 
@@ -971,7 +696,6 @@ describe('CLI index.ts', () => {
         .option('--port <port>', 'port', parseInt)
         .option('--host <host>', 'host', '')
         .option('--no-open', 'no-open')
-        .option('--pr <url>', 'pr')
         .option('--clean', 'start with a clean slate by clearing all existing comments')
         .action(async (commitish: string, _compareWith: string | undefined, options: any) => {
           const { url } = await startServer({
@@ -1018,7 +742,6 @@ describe('CLI index.ts', () => {
         .option('--port <port>', 'port', parseInt)
         .option('--host <host>', 'host', '')
         .option('--no-open', 'no-open')
-        .option('--pr <url>', 'pr')
         .option('--clean', 'start with a clean slate by clearing all existing comments')
         .action(async (commitish: string, _compareWith: string | undefined, options: any) => {
           const { url } = await startServer({
@@ -1067,7 +790,6 @@ describe('CLI index.ts', () => {
         .option('--port <port>', 'port', parseInt)
         .option('--host <host>', 'host', '')
         .option('--no-open', 'no-open')
-        .option('--pr <url>', 'pr')
         .option('--clean', 'start with a clean slate by clearing all existing comments')
         .option('--keep-alive', 'keep server running even after browser disconnects')
         .action(async (commitish: string, _compareWith: string | undefined, options: any) => {
@@ -1116,7 +838,6 @@ describe('CLI index.ts', () => {
         .option('--port <port>', 'port', parseInt)
         .option('--host <host>', 'host', '')
         .option('--no-open', 'no-open')
-        .option('--pr <url>', 'pr')
         .option('--clean', 'start with a clean slate by clearing all existing comments')
         .option('--keep-alive', 'keep server running even after browser disconnects')
         .action(async (commitish: string, _compareWith: string | undefined, options: any) => {
@@ -1167,7 +888,6 @@ describe('CLI index.ts', () => {
         .option('--port <port>', 'port', parseInt)
         .option('--host <host>', 'host', '')
         .option('--no-open', 'no-open')
-        .option('--pr <url>', 'pr')
         .action(async (commitish: string, _compareWith: string | undefined, options: any) => {
           const { url, isEmpty } = await startServer({
             selection: { targetCommitish: commitish, baseCommitish: commitish + '^' },
@@ -1213,7 +933,6 @@ describe('CLI index.ts', () => {
         .option('--port <port>', 'port', parseInt)
         .option('--host <host>', 'host', '')
         .option('--no-open', 'no-open')
-        .option('--pr <url>', 'pr')
         .action(async (commitish: string, _compareWith: string | undefined, options: any) => {
           const { url, isEmpty } = await startServer({
             selection: { targetCommitish: commitish, baseCommitish: commitish + '^' },
@@ -1288,7 +1007,6 @@ describe('CLI index.ts', () => {
           .option('--port <port>', 'port', parseInt)
           .option('--host <host>', 'host', '')
           .option('--no-open', 'no-open')
-          .option('--pr <url>', 'pr')
           .action(async (commitish: string, compareWith: string | undefined, options: any) => {
             // Simulate determineDiffMode function behavior
             let diffMode: DiffMode;
@@ -1337,7 +1055,6 @@ describe('CLI index.ts', () => {
         .option('--port <port>', 'port', parseInt)
         .option('--host <host>', 'host', '')
         .option('--no-open', 'no-open')
-        .option('--pr <url>', 'pr')
         .action(async (commitish: string, compareWith: string | undefined, options: any) => {
           // Simulate determineDiffMode function behavior
           let diffMode: DiffMode;
@@ -1386,7 +1103,6 @@ describe('CLI index.ts', () => {
         .option('--port <port>', 'port', parseInt)
         .option('--host <host>', 'host', '')
         .option('--no-open', 'no-open')
-        .option('--pr <url>', 'pr')
         .action(async (commitish: string, compareWith: string | undefined, options: any) => {
           // Simulate determineDiffMode function behavior with the fix
           let diffMode: DiffMode;

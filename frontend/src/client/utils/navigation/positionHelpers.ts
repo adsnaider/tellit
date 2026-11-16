@@ -1,5 +1,5 @@
 import type { CommentThread, DiffFile, DiffSide } from '../../../types/diff';
-import type { CursorPosition } from '../../hooks/keyboardNavigation/types';
+import type { CursorPosition } from './types';
 
 /**
  * Finds the position of a specific line number within a file's diff chunks

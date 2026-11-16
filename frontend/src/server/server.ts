@@ -127,10 +127,7 @@ function createCommentSessionKey(selection: DiffSelection): string {
   return getDiffSelectionKey(selection);
 }
 
-export function createCommitMessageDiffFile(
-  baseDesc: string,
-  targetDesc: string,
-): DiffFile {
+export function createCommitMessageDiffFile(baseDesc: string, targetDesc: string): DiffFile {
   const normalizedBase = baseDesc.replace(/\r\n/g, '\n').trimEnd();
   const normalizedTarget = targetDesc.replace(/\r\n/g, '\n').trimEnd();
 
@@ -660,10 +657,7 @@ export async function startServer(
       try {
         const targetDesc = await jjService.getCommitDescription(commitId);
         const isInterDiff = Boolean(
-          baseId &&
-          baseId !== 'parent' &&
-          !baseId.endsWith('^') &&
-          !baseId.endsWith('-')
+          baseId && baseId !== 'parent' && !baseId.endsWith('^') && !baseId.endsWith('-'),
         );
         const baseDesc = isInterDiff && baseId ? await jjService.getCommitDescription(baseId) : '';
         const commitMsgFile = createCommitMessageDiffFile(baseDesc, targetDesc);
@@ -672,10 +666,7 @@ export async function startServer(
         console.error('Failed to create commit message diff:', err);
       }
       const isInterDiff = Boolean(
-        baseId &&
-        baseId !== 'parent' &&
-        !baseId.endsWith('^') &&
-        !baseId.endsWith('-')
+        baseId && baseId !== 'parent' && !baseId.endsWith('^') && !baseId.endsWith('-'),
       );
       const baseCommitish = isInterDiff ? (baseId as string) : `${commitId}^`;
 
@@ -695,7 +686,9 @@ export async function startServer(
       });
     } catch (error) {
       console.error('Error getting jj diff:', error);
-      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to get jj diff' });
+      res
+        .status(500)
+        .json({ error: error instanceof Error ? error.message : 'Failed to get jj diff' });
     }
   });
 
@@ -713,7 +706,7 @@ export async function startServer(
         targetCommit: commitId,
         baseCommit,
       });
-      const threads: DiffCommentThread[] = rawThreads.map(t => ({
+      const threads: DiffCommentThread[] = rawThreads.map((t) => ({
         id: t.thread_id,
         filePath: t.filepath,
         createdAt: JJ_COMMENT_FALLBACK_TIMESTAMP,
@@ -743,8 +736,20 @@ export async function startServer(
 
   app.post('/api/jj/comments', async (req, res) => {
     try {
-      const { commitId, filePath, line, content } = req.body;
-      if (!commitId || !filePath || !content) {
+      const { commitId, filePath, line, content } = (req.body ?? {}) as {
+        commitId?: unknown;
+        filePath?: unknown;
+        line?: { start?: number; end?: number } | number | string;
+        content?: unknown;
+      };
+      if (
+        typeof commitId !== 'string' ||
+        !commitId ||
+        typeof filePath !== 'string' ||
+        !filePath ||
+        typeof content !== 'string' ||
+        !content
+      ) {
         res.status(400).json({ error: 'commitId, filePath, and content are required' });
         return;
       }
@@ -757,14 +762,16 @@ export async function startServer(
       res.json({ success: true, threadId });
     } catch (error) {
       console.error('Error adding jj comment:', error);
-      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to add comment' });
+      res
+        .status(500)
+        .json({ error: error instanceof Error ? error.message : 'Failed to add comment' });
     }
   });
 
   app.post('/api/jj/comments/:threadId/reply', async (req, res) => {
     try {
-      const { content } = req.body;
-      if (!content) {
+      const { content } = (req.body ?? {}) as { content?: unknown };
+      if (typeof content !== 'string' || !content) {
         res.status(400).json({ error: 'content is required' });
         return;
       }
@@ -778,19 +785,31 @@ export async function startServer(
 
   app.post('/api/jj/comments/:threadId/resolve', async (req, res) => {
     try {
-      const unresolve = Boolean(req.body.unresolve);
+      const body = (req.body ?? {}) as { unresolve?: unknown };
+      const unresolve = Boolean(body.unresolve);
       await jjService.resolveComment(req.params.threadId, unresolve);
       res.json({ success: true, resolved: !unresolve });
     } catch (error) {
       console.error('Error resolving jj comment:', error);
-      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to toggle resolve' });
+      res
+        .status(500)
+        .json({ error: error instanceof Error ? error.message : 'Failed to toggle resolve' });
     }
   });
 
   app.post('/api/jj/approve', async (req, res) => {
     try {
-      const { commitId, target, disapprove } = req.body;
-      const effectiveTarget = commitId || target;
+      const { commitId, target, disapprove } = (req.body ?? {}) as {
+        commitId?: unknown;
+        target?: unknown;
+        disapprove?: unknown;
+      };
+      const effectiveTarget =
+        typeof commitId === 'string' && commitId
+          ? commitId
+          : typeof target === 'string' && target
+            ? target
+            : '';
       if (!effectiveTarget) {
         res.status(400).json({ error: 'commitId or target is required' });
         return;
@@ -1416,7 +1435,7 @@ export async function startServer(
 
   app.get(['/', '/index.html'], (_req, res) => {
     setNoCacheHeaders(res);
-    res.sendFile(join(distPath, 'index.html'));
+    res.sendFile('index.html', { root: distPath });
   });
 
   const { port, url, server } = await startServerWithFallback(

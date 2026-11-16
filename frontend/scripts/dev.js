@@ -20,7 +20,7 @@ const cliStdoutProxy = createCliStdoutProxy({
     }
 
     console.log('🚀 Starting Vite dev server...');
-    viteProcess = spawn('pnpm', ['exec', 'vite', '--open', '--clearScreen=false'], {
+    viteProcess = spawn('npx', ['vite', '--open', '--clearScreen=false'], {
       stdio: 'inherit',
       env: {
         ...process.env,
@@ -65,7 +65,7 @@ function startCliProcess() {
 }
 
 function startCompileProcess() {
-  compileProcess = spawn('pnpm', ['exec', 'tsc', '--project', 'tsconfig.cli.json'], {
+  compileProcess = spawn('npx', ['tsc', '--project', 'tsconfig.cli.json'], {
     stdio: 'inherit',
   });
 

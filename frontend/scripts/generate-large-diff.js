@@ -74,63 +74,53 @@ function createTimestampFactory(seed) {
 function generateFileContent(fileIndex, lines) {
   const chunks = [];
 
-  chunks.push(`import React from 'react';
-import { useState, useEffect } from 'react';
-
-interface Component${fileIndex}Props {
+  chunks.push(`export interface Service${fileIndex}Options {
   id: string;
-  data: any[];
-  onUpdate: (id: string, data: any) => void;
+  data: unknown[];
+  onUpdate: (id: string, data: unknown) => void;
 }
 
-export function Component${fileIndex}({ id, data, onUpdate }: Component${fileIndex}Props) {
-  const [state, setState] = useState(data);
-  const [loading, setLoading] = useState(false);
+export function createService${fileIndex}({ id, data, onUpdate }: Service${fileIndex}Options) {
+  let state = [...data];
+  let loading = false;
 `);
 
   // Generate method bodies with realistic code
   const methodCount = Math.floor(lines / 20);
   for (let i = 0; i < methodCount; i++) {
     chunks.push(`
-  const handleAction${i} = async (item: any) => {
-    setLoading(true);
+  const handleAction${i} = async (item: { id: string }) => {
+    loading = true;
     try {
       const response = await fetch(\`/api/endpoint${i}/\${item.id}\`);
       const result = await response.json();
-      setState(prev => [...prev, result]);
+      state = [...state, result];
       onUpdate(id, result);
     } catch (error) {
       console.error('Error in action ${i}:', error);
     } finally {
-      setLoading(false);
+      loading = false;
     }
   };
 `);
   }
 
-  // Generate JSX
   chunks.push(`
-  return (
-    <div className="component-${fileIndex}">
-      <h2>Component ${fileIndex}</h2>
-      {loading && <div>Loading...</div>}
-      <div className="content">
+  return {
+    get state() {
+      return state;
+    },
+    get loading() {
+      return loading;
+    },
 `);
 
-  // Add some JSX elements
   for (let i = 0; i < 10; i++) {
-    chunks.push(`        <div className="item-${i}" key="${i}">
-          <span>Item ${i}</span>
-          <button onClick={() => handleAction${i % methodCount}({ id: '${i}' })}>
-            Action ${i}
-          </button>
-        </div>
+    chunks.push(`    runItem${i}: () => handleAction${i % methodCount}({ id: '${i}' }),
 `);
   }
 
-  chunks.push(`      </div>
-    </div>
-  );
+  chunks.push(`  };
 }
 `);
 
@@ -229,7 +219,7 @@ function generateDiff(size, seed) {
   const nextTimestamp = createTimestampFactory(`${seed}:${size}`);
 
   for (let i = 0; i < files; i++) {
-    const filename = `src/components/Component${i}.tsx`;
+    const filename = `src/services/Service${i}.ts`;
     const oldContent = generateFileContent(i, linesPerFile);
     const newContent = generateModifiedFileContent(i, linesPerFile, random, nextTimestamp);
 

@@ -1,5 +1,5 @@
 import type { DiffFile } from '../../../types/diff';
-import type { CursorPosition } from '../../hooks/keyboardNavigation/types';
+import type { CursorPosition } from './types';
 
 /**
  * Gets the line type at a given position

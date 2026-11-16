@@ -1,9 +1,9 @@
 use std::fs;
-use tempfile::tempdir;
 use tellit_cli::{
-    get_all_threads, get_change_commits, get_commit_threads, get_thread, is_commit_approved,
-    reply_comment, resolve_comment, set_commit_approval, LineRange, ThreadData,
+    LineRange, ThreadData, get_all_threads, get_change_commits, get_commit_threads, get_thread,
+    is_commit_approved, reply_comment, resolve_comment, set_commit_approval,
 };
+use tempfile::tempdir;
 
 #[test]
 fn test_full_comment_workflow() {
@@ -41,7 +41,12 @@ fn test_full_comment_workflow() {
     assert!(!info.resolved);
 
     // Test reply
-    let replied_id = reply_comment(&store, "a1b2c3d4", "Done in the latest revision".to_string()).unwrap();
+    let replied_id = reply_comment(
+        &store,
+        "a1b2c3d4",
+        "Done in the latest revision".to_string(),
+    )
+    .unwrap();
     assert_eq!(replied_id, thread_id);
 
     let info_after_reply = get_thread(&store, thread_id).unwrap();

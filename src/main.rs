@@ -1,98 +1,95 @@
+//! CLI entrypoint for `tellit`.
+
+use std::io::Write;
+use std::path::Path;
 use std::process::ExitCode;
 
 use clap::Parser;
+use tellit_cli::server::{
+    BACKGROUND_CHILD_ENV, BackgroundServerInfo, ServerConfig, spawn_background_child, start_server,
+    wait_for_shutdown_signal,
+};
 use tellit_cli::{
-    add_comment, get_all_threads, get_change_approved_commits, get_change_commits,
-    get_change_threads, get_commit_thread_infos, get_commit_threads, get_thread,
-    get_workspace_root, is_change_approved, is_commit_approved, locate_web_cli, reply_comment,
-    resolve_comment, resolve_store, set_commit_approval, ChangeCommitsGetResponse,
-    ChangeThreadsGetResponse, Cli, Command, CommentAction, CommitGetResponse,
-    CommitIdsGetResponse, GetTarget,
+    ChangeCommitsGetResponse, ChangeThreadsGetResponse, Cli, Command, CommentAction,
+    CommitGetResponse, CommitIdsGetResponse, GetTarget, LaunchArgs, add_comment, get_all_threads,
+    get_change_approved_commits, get_change_commits, get_change_threads, get_commit_thread_infos,
+    get_commit_threads, get_thread, get_workspace_root, is_change_approved, is_commit_approved,
+    reply_comment, resolve_comment, resolve_store, set_commit_approval,
 };
 
-fn locate_node() -> std::path::PathBuf {
-    if let Ok(node_var) = std::env::var("NODE") {
-        let p = std::path::PathBuf::from(node_var);
-        if p.exists() {
-            return p;
-        }
+fn run_launch(launch: &LaunchArgs, store: Option<&Path>) -> anyhow::Result<()> {
+    let is_background_child = std::env::var_os(BACKGROUND_CHILD_ENV).is_some();
+
+    if launch.background && !is_background_child {
+        let info = spawn_background_child(launch, store)?;
+        println!("{}", serde_json::to_string(&info)?);
+        return Ok(());
     }
-    if std::process::Command::new("node").arg("-v").output().is_ok() {
-        return std::path::PathBuf::from("node");
-    }
-    // Search nix store fallback if node is not directly in PATH
-    if let Ok(entries) = std::fs::read_dir("/nix/store") {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.contains("nodejs") && !name.contains("npm") && !name.contains("dev") && !name.contains("source") {
-                let candidate = entry.path().join("bin/node");
-                if candidate.is_file() {
-                    return candidate;
-                }
+
+    let repo_path = match get_workspace_root() {
+        Ok(root) => root,
+        Err(_) => std::env::current_dir()?,
+    };
+
+    let config = ServerConfig::new(repo_path)
+        .with_port(launch.port)
+        .with_host(launch.host.as_deref())
+        .with_keep_alive(launch.keep_alive || is_background_child)
+        .with_quiet(is_background_child);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(async move {
+        let running = start_server(config).await?;
+
+        if is_background_child {
+            let handshake = BackgroundServerInfo {
+                port: running.port,
+                url: running.url.clone(),
+                pid: std::process::id(),
+            };
+            let line = serde_json::to_string(&handshake)?;
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "{line}");
+            let _ = stdout.flush();
+        } else {
+            if running.is_external_bind() {
+                eprintln!(
+                    "Warning: server is bound to external interface {}",
+                    running.addr
+                );
+            }
+            eprintln!("tellit server listening on {}", running.url);
+            let target = launch.commit_ish.as_deref().unwrap_or("@");
+            eprintln!("Reviewing: {target}");
+            if launch.keep_alive {
+                eprintln!("Keep-alive mode: server stays running after browser tabs disconnect.");
+            }
+            if !launch.no_open
+                && let Err(err) = open::that(&running.url)
+            {
+                eprintln!("Warning: failed to open browser automatically: {err}");
             }
         }
-    }
-    std::path::PathBuf::from("node")
+
+        let shutdown_handle = running.shutdown_handle();
+        tokio::spawn(async move {
+            wait_for_shutdown_signal().await;
+            shutdown_handle.shutdown();
+        });
+
+        running.wait().await?;
+        Ok(())
+    })
 }
 
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Launch(launch) => {
-            let web_cli = locate_web_cli()?;
-            let current_exe = std::env::current_exe()
-                .unwrap_or_else(|_| std::path::PathBuf::from("tellit"));
-            let node_bin = locate_node();
-
-            let mut cmd = std::process::Command::new(&node_bin);
-            cmd.arg(&web_cli);
-            cmd.env("TELLIT_BIN", &current_exe);
-
-            if let Some(ref commit) = launch.commit_ish {
-                cmd.arg(commit);
-            } else {
-                cmd.arg("@");
-            }
-
-            if let Some(ref compare_with) = launch.compare_with {
-                cmd.arg(compare_with);
-            }
-
-            if let Some(port) = launch.port {
-                cmd.arg("--port").arg(port.to_string());
-            }
-
-            if let Some(ref host) = launch.host {
-                cmd.arg("--host").arg(host);
-            }
-
-            if launch.no_open {
-                cmd.arg("--no-open");
-            }
-
-            if launch.keep_alive {
-                cmd.arg("--keep-alive");
-            }
-
-            if launch.background {
-                cmd.arg("--background");
-            }
-
-            for extra in &launch.extra_args {
-                cmd.arg(extra);
-            }
-
-            let status = cmd
-                .stdin(std::process::Stdio::inherit())
-                .stdout(std::process::Stdio::inherit())
-                .stderr(std::process::Stdio::inherit())
-                .status()?;
-
-            if !status.success() {
-                std::process::exit(status.code().unwrap_or(1));
-            }
-        }
+        Command::Launch(ref launch) => run_launch(launch, cli.store.as_deref())?,
         Command::Comment(comment) => {
             let store = resolve_store(cli.store.as_deref())?;
             match comment.action {
@@ -103,14 +100,8 @@ fn run() -> anyhow::Result<()> {
                         .or(comment.change.as_deref())
                         .unwrap_or("@");
                     let workspace_root = get_workspace_root()?;
-                    let thread_id = add_comment(
-                        &store,
-                        &workspace_root,
-                        rev,
-                        &add.file,
-                        add.at,
-                        add.content,
-                    )?;
+                    let thread_id =
+                        add_comment(&store, &workspace_root, rev, &add.file, add.at, add.content)?;
                     println!("{thread_id}");
                     eprintln!("Comment thread created: {thread_id}");
                 }

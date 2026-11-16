@@ -1,9 +1,7 @@
 /target
+/crates/tellit-ui/dist
+/crates/tellit-ui/.stage
 .direnv/
-node_modules/
-frontend/node_modules/
-frontend/dist/
-frontend/public/site-data/
 .comments/
 .tellit/
 .envrc

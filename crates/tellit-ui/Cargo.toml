@@ -1,0 +1,21 @@
+[package]
+name = "tellit-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+js-sys = "0.3"
+leptos = { version = "0.8", features = ["csr"] }
+serde_json.workspace = true
+tellit-types.workspace = true
+thiserror = { workspace = true, features = ["std"] }
+wasm-bindgen.workspace = true
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Event",
+    "EventSource",
+    "MessageEvent",
+    "Response",
+    "Window",
+] }

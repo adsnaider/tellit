@@ -1,5 +1,9 @@
+//! Core CLI argument definitions, `.tellit/` review store persistence, and local HTTP server.
+
+pub mod server;
+
+use core::str::FromStr;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -113,7 +117,10 @@ pub struct ChangeCommitsGetResponse {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "tellit", about = "Code review diff viewer and commenting tool for Jujutsu (jj)")]
+#[command(
+    name = "tellit",
+    about = "Code review diff viewer and commenting tool for Jujutsu (jj)"
+)]
 pub struct Cli {
     #[arg(
         long,
@@ -136,7 +143,7 @@ pub enum Command {
     Comment(CommentArgs),
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub struct LaunchArgs {
     #[arg(help = "Commit-ish, change ID, or revision to review (default: @)")]
     pub commit_ish: Option<String>,
@@ -158,9 +165,6 @@ pub struct LaunchArgs {
 
     #[arg(long, help = "Run in background and print JSON info")]
     pub background: bool,
-
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    pub extra_args: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -186,7 +190,10 @@ pub enum CommentAction {
     Reply(Reply),
     #[command(about = "Retrieve comments, commit hashes, or thread IDs")]
     Get(Get),
-    #[command(name = "get-all", about = "Get thread IDs for a change, commit, or revision as a JSON array")]
+    #[command(
+        name = "get-all",
+        about = "Get thread IDs for a change, commit, or revision as a JSON array"
+    )]
     GetAll(GetAllArgs),
     #[command(about = "Approve or disapprove a commit or change")]
     Approve(ApproveArgs),
@@ -212,7 +219,11 @@ pub struct Add {
     #[arg(long, short, help = "Comment content")]
     pub content: String,
 
-    #[arg(long, short = 'r', help = "Target revision (overrides global --change)")]
+    #[arg(
+        long,
+        short = 'r',
+        help = "Target revision (overrides global --change)"
+    )]
     pub rev: Option<String>,
 }
 
@@ -233,7 +244,11 @@ impl Resolve {
         self.thread
             .as_deref()
             .or(self.thread_pos.as_deref())
-            .ok_or_else(|| anyhow::anyhow!("Thread ID is required (pass via -t/--thread or positional argument)"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Thread ID is required (pass via -t/--thread or positional argument)"
+                )
+            })
     }
 }
 
@@ -257,14 +272,22 @@ impl Reply {
         self.thread
             .as_deref()
             .or(self.thread_pos.as_deref())
-            .ok_or_else(|| anyhow::anyhow!("Thread ID is required (pass via -t/--thread or positional argument)"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Thread ID is required (pass via -t/--thread or positional argument)"
+                )
+            })
     }
 
     pub fn get_content(&self) -> Result<&str> {
         self.content
             .as_deref()
             .or(self.content_pos.as_deref())
-            .ok_or_else(|| anyhow::anyhow!("Content is required (pass via -c/--content or positional argument)"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Content is required (pass via -c/--content or positional argument)"
+                )
+            })
     }
 }
 
@@ -285,7 +308,10 @@ pub enum GetTarget {
     #[command(about = "Get thread IDs for a git commit hash")]
     Commit(GetCommitArgs),
 
-    #[command(name = "all", about = "Get thread IDs for a change, commit, or revision as a JSON array")]
+    #[command(
+        name = "all",
+        about = "Get thread IDs for a change, commit, or revision as a JSON array"
+    )]
     All(GetAllArgs),
 }
 
@@ -469,66 +495,6 @@ pub fn resolve_store(custom_store: Option<&Path>) -> Result<PathBuf> {
     Ok(tellit_store)
 }
 
-pub fn locate_web_cli() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("TELLIT_WEB_CLI") {
-        let p = PathBuf::from(path);
-        if p.exists() {
-            return Ok(p);
-        }
-    }
-    if let Ok(dir) = std::env::var("TELLIT_WEB_DIR") {
-        let p = PathBuf::from(&dir).join("dist/cli/index.js");
-        if p.exists() {
-            return Ok(p);
-        }
-        let p2 = PathBuf::from(&dir).join("cli/index.js");
-        if p2.exists() {
-            return Ok(p2);
-        }
-        let p3 = PathBuf::from(&dir).join("index.js");
-        if p3.exists() {
-            return Ok(p3);
-        }
-    }
-
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            let candidates = [
-                exe_dir.join("../share/tellit/web/dist/cli/index.js"),
-                exe_dir.join("../share/tellit/dist/cli/index.js"),
-                exe_dir.join("../dist/cli/index.js"),
-            ];
-            for cand in candidates {
-                if cand.exists() {
-                    return Ok(cand);
-                }
-            }
-        }
-    }
-
-    // Check development paths (walk up from current directory)
-    if let Ok(cur) = std::env::current_dir() {
-        let mut d = cur.as_path();
-        for _ in 0..6 {
-            let candidate = d.join("frontend/dist/cli/index.js");
-            if candidate.exists() {
-                return Ok(candidate);
-            }
-            let candidate2 = d.join("dist/cli/index.js");
-            if candidate2.exists() {
-                return Ok(candidate2);
-            }
-            if let Some(parent) = d.parent() {
-                d = parent;
-            } else {
-                break;
-            }
-        }
-    }
-
-    anyhow::bail!("Could not locate tellit web CLI (dist/cli/index.js). Try setting TELLIT_WEB_DIR or TELLIT_WEB_CLI.")
-}
-
 pub fn get_rev_info(rev: &str) -> Result<(String, String)> {
     let stdout = run_jj(&[
         "log",
@@ -584,7 +550,11 @@ pub fn find_thread_file(store: &Path, thread_query: &str) -> Result<FoundThread>
             if stem == "approval" {
                 continue;
             }
-            let parent_commit = match path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) {
+            let parent_commit = match path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+            {
                 Some(s) => s,
                 None => continue,
             };
@@ -659,8 +629,12 @@ pub fn add_comment(
 
     let thread_id = Uuid::new_v4().to_string();
     let thread_dir = store.join(&change_id).join(&commit_id);
-    std::fs::create_dir_all(&thread_dir)
-        .with_context(|| format!("Failed to create thread directory: {}", thread_dir.display()))?;
+    std::fs::create_dir_all(&thread_dir).with_context(|| {
+        format!(
+            "Failed to create thread directory: {}",
+            thread_dir.display()
+        )
+    })?;
 
     let thread_file = thread_dir.join(format!("{}.json", thread_id));
     let thread_data = ThreadData {
@@ -689,8 +663,12 @@ pub fn reply_comment(store: &Path, thread_id_query: &str, content: String) -> Re
 
     let updated_bytes = serde_json::to_vec_pretty(&thread_data)
         .context("Failed to serialize updated thread data")?;
-    std::fs::write(&found.path, updated_bytes)
-        .with_context(|| format!("Failed to write updated thread file: {}", found.path.display()))?;
+    std::fs::write(&found.path, updated_bytes).with_context(|| {
+        format!(
+            "Failed to write updated thread file: {}",
+            found.path.display()
+        )
+    })?;
 
     Ok(found.thread_id)
 }
@@ -711,8 +689,12 @@ pub fn resolve_comment(
 
     let updated_bytes = serde_json::to_vec_pretty(&thread_data)
         .context("Failed to serialize updated thread data")?;
-    std::fs::write(&found.path, updated_bytes)
-        .with_context(|| format!("Failed to write updated thread file: {}", found.path.display()))?;
+    std::fs::write(&found.path, updated_bytes).with_context(|| {
+        format!(
+            "Failed to write updated thread file: {}",
+            found.path.display()
+        )
+    })?;
 
     Ok((found.thread_id, new_resolved))
 }
@@ -762,10 +744,10 @@ fn matched_change_dirs(store: &Path, change_query: &str) -> Result<Vec<PathBuf>>
             }
         }
     }
-    if change_query.len() < 6 {
-        if let Some(exact) = exact_match {
-            return Ok(vec![exact]);
-        }
+    if change_query.len() < 6
+        && let Some(exact) = exact_match
+    {
+        return Ok(vec![exact]);
     }
     matched_dirs.sort();
     Ok(matched_dirs)
@@ -775,10 +757,10 @@ fn is_approval_file_approved(approval_file: &Path) -> bool {
     if !approval_file.is_file() {
         return false;
     }
-    if let Ok(bytes) = std::fs::read(approval_file) {
-        if let Ok(data) = serde_json::from_slice::<ApprovalData>(&bytes) {
-            return data.approved;
-        }
+    if let Ok(bytes) = std::fs::read(approval_file)
+        && let Ok(data) = serde_json::from_slice::<ApprovalData>(&bytes)
+    {
+        return data.approved;
     }
     // Non-JSON marker files represent legacy unrevoked approvals.
     true
@@ -812,7 +794,9 @@ pub fn get_change_approved_commits(store: &Path, change_query: &str) -> Result<V
     for change_dir in matched_change_dirs(store, change_query)? {
         for entry in std::fs::read_dir(&change_dir)? {
             let entry = entry?;
-            if entry.file_type()?.is_dir() && is_approval_file_approved(&entry.path().join("approval.json")) {
+            if entry.file_type()?.is_dir()
+                && is_approval_file_approved(&entry.path().join("approval.json"))
+            {
                 approved_commits.push(entry.file_name().to_string_lossy().to_string());
             }
         }
@@ -863,12 +847,12 @@ pub fn get_commit_threads(store: &Path, commit_query: &str) -> Result<Vec<String
             if commit_dir_name == commit_query || commit_dir_name.starts_with(commit_query) {
                 for file_entry in std::fs::read_dir(entry.path())?.filter_map(|e| e.ok()) {
                     let path = file_entry.path();
-                    if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
-                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                            if stem != "approval" {
-                                thread_ids.push(stem.to_string());
-                            }
-                        }
+                    if path.is_file()
+                        && path.extension().and_then(|s| s.to_str()) == Some("json")
+                        && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                        && stem != "approval"
+                    {
+                        thread_ids.push(stem.to_string());
                     }
                 }
             }
@@ -903,19 +887,19 @@ pub fn get_change_threads(store: &Path, change_query: &str) -> Result<Vec<Thread
                         if thread_id == "approval" {
                             continue;
                         }
-                        if let Ok(bytes) = std::fs::read(&path) {
-                            if let Ok(thread_data) = serde_json::from_slice::<ThreadData>(&bytes) {
-                                threads.push(ThreadInfo {
-                                    thread_id,
-                                    change_id: change_id.clone(),
-                                    commit_id: commit_id.clone(),
-                                    git_commit_hash: commit_id.clone(),
-                                    filepath: thread_data.filepath,
-                                    line_range: thread_data.line_range,
-                                    comments: thread_data.comments,
-                                    resolved: thread_data.resolved,
-                                });
-                            }
+                        if let Ok(bytes) = std::fs::read(&path)
+                            && let Ok(thread_data) = serde_json::from_slice::<ThreadData>(&bytes)
+                        {
+                            threads.push(ThreadInfo {
+                                thread_id,
+                                change_id: change_id.clone(),
+                                commit_id: commit_id.clone(),
+                                git_commit_hash: commit_id.clone(),
+                                filepath: thread_data.filepath,
+                                line_range: thread_data.line_range,
+                                comments: thread_data.comments,
+                                resolved: thread_data.resolved,
+                            });
                         }
                     }
                 }
@@ -960,19 +944,19 @@ pub fn get_commit_thread_infos(store: &Path, commit_query: &str) -> Result<Vec<T
                         if thread_id == "approval" {
                             continue;
                         }
-                        if let Ok(bytes) = std::fs::read(&path) {
-                            if let Ok(thread_data) = serde_json::from_slice::<ThreadData>(&bytes) {
-                                threads.push(ThreadInfo {
-                                    thread_id,
-                                    change_id: change_id.clone(),
-                                    commit_id: commit_id.clone(),
-                                    git_commit_hash: commit_id.clone(),
-                                    filepath: thread_data.filepath,
-                                    line_range: thread_data.line_range,
-                                    comments: thread_data.comments,
-                                    resolved: thread_data.resolved,
-                                });
-                            }
+                        if let Ok(bytes) = std::fs::read(&path)
+                            && let Ok(thread_data) = serde_json::from_slice::<ThreadData>(&bytes)
+                        {
+                            threads.push(ThreadInfo {
+                                thread_id,
+                                change_id: change_id.clone(),
+                                commit_id: commit_id.clone(),
+                                git_commit_hash: commit_id.clone(),
+                                filepath: thread_data.filepath,
+                                line_range: thread_data.line_range,
+                                comments: thread_data.comments,
+                                resolved: thread_data.resolved,
+                            });
                         }
                     }
                 }
@@ -1104,7 +1088,11 @@ pub fn set_commit_approval(
             "change_id ++ \"\n\" ++ commit_id",
         ]) {
             Ok(out) => {
-                let lines: Vec<&str> = out.lines().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                let lines: Vec<&str> = out
+                    .lines()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 if lines.len() >= 2 {
                     (lines[0].to_string(), lines[1].to_string())
                 } else {
@@ -1201,12 +1189,30 @@ mod tests {
 
     #[test]
     fn test_line_range_parsing() {
-        assert_eq!(LineRange::from_str("10").unwrap(), LineRange { start: 10, end: 10 });
-        assert_eq!(LineRange::from_str("10..20").unwrap(), LineRange { start: 10, end: 20 });
-        assert_eq!(LineRange::from_str("10..=20").unwrap(), LineRange { start: 10, end: 20 });
-        assert_eq!(LineRange::from_str("10-20").unwrap(), LineRange { start: 10, end: 20 });
-        assert_eq!(LineRange::from_str("10:20").unwrap(), LineRange { start: 10, end: 20 });
-        assert_eq!(LineRange::from_str("10,20").unwrap(), LineRange { start: 10, end: 20 });
+        assert_eq!(
+            LineRange::from_str("10").unwrap(),
+            LineRange { start: 10, end: 10 }
+        );
+        assert_eq!(
+            LineRange::from_str("10..20").unwrap(),
+            LineRange { start: 10, end: 20 }
+        );
+        assert_eq!(
+            LineRange::from_str("10..=20").unwrap(),
+            LineRange { start: 10, end: 20 }
+        );
+        assert_eq!(
+            LineRange::from_str("10-20").unwrap(),
+            LineRange { start: 10, end: 20 }
+        );
+        assert_eq!(
+            LineRange::from_str("10:20").unwrap(),
+            LineRange { start: 10, end: 20 }
+        );
+        assert_eq!(
+            LineRange::from_str("10,20").unwrap(),
+            LineRange { start: 10, end: 20 }
+        );
         assert!(LineRange::from_str("20..10").is_err());
         assert!(LineRange::from_str("abc").is_err());
     }
@@ -1230,7 +1236,11 @@ mod tests {
             comments: vec!["Initial comment".to_string()],
             resolved: false,
         };
-        std::fs::write(&thread_file, serde_json::to_vec_pretty(&initial_data).unwrap()).unwrap();
+        std::fs::write(
+            &thread_file,
+            serde_json::to_vec_pretty(&initial_data).unwrap(),
+        )
+        .unwrap();
 
         // Test find exact
         let found = find_thread_file(&store, thread_id).unwrap();
@@ -1279,7 +1289,11 @@ mod tests {
 
         // Test approval operations
         assert!(!is_commit_approved(&store, commit_hash));
-        assert!(get_change_approved_commits(&store, "change123").unwrap().is_empty());
+        assert!(
+            get_change_approved_commits(&store, "change123")
+                .unwrap()
+                .is_empty()
+        );
         set_commit_approval(&store, Some(commit_hash), false).unwrap();
         assert!(is_commit_approved(&store, commit_hash));
         assert_eq!(
@@ -1294,7 +1308,11 @@ mod tests {
         // Test disapprove
         set_commit_approval(&store, Some(commit_hash), true).unwrap();
         assert!(!is_commit_approved(&store, commit_hash));
-        assert!(get_change_approved_commits(&store, "change123").unwrap().is_empty());
+        assert!(
+            get_change_approved_commits(&store, "change123")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

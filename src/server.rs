@@ -1,0 +1,761 @@
+//! Local `axum` HTTP and Server-Sent Events server backing `tellit launch`.
+//!
+//! Serves the embedded Leptos WebAssembly bundle (or an external asset directory specified via
+//! `TELLIT_WEB_DIR`), reports Jujutsu workspace detection at `GET /api/jj/status`, and streams
+//! browser connection heartbeats at `GET /api/heartbeat`.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use std::path::PathBuf;
+//! use tellit_cli::server::{ServerConfig, start_server};
+//!
+//! # async fn demo() -> Result<(), tellit_cli::server::ServerError> {
+//! let server = start_server(ServerConfig::new(PathBuf::from("."))).await?;
+//! println!("Listening on {}", server.url);
+//! server.shutdown();
+//! server.wait().await?;
+//! # Ok(())
+//! # }
+//! ```
+
+extern crate alloc;
+
+mod assets;
+mod background;
+
+pub use background::{BACKGROUND_CHILD_ENV, BackgroundServerInfo, spawn_background_child};
+
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::sync::Arc;
+use core::convert::Infallible;
+use core::future::Future;
+use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+use core::pin::Pin;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::task::{Context, Poll};
+use core::time::Duration;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use axum::extract::{Path as AxumPath, State};
+use axum::http::{HeaderValue, header};
+use axum::response::sse::{Event, Sse};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Json, Router};
+use tellit_types::{HeartbeatEvent, JjStatusResponse};
+use thiserror::Error;
+use tokio::net::TcpListener;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio_stream::Stream;
+
+/// Default preferred TCP port when `--port` is not specified.
+pub const DEFAULT_PORT: u16 = 4966;
+
+/// Default loopback address bound when `--host` is omitted.
+pub const DEFAULT_HOST: &str = "127.0.0.1";
+
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const DEFAULT_DISCONNECT_GRACE: Duration = Duration::from_millis(250);
+const MAX_ETXTBSY_RETRIES: u32 = 10;
+
+/// Errors returned when configuring, binding, or running the `tellit` HTTP server.
+#[derive(Debug, Error)]
+pub enum ServerError {
+    /// Hostname or IP literal passed to `--host` could not be resolved.
+    #[error("failed to resolve bind host '{host}': {source}")]
+    InvalidHost {
+        /// Unresolvable host value supplied by the caller.
+        host: String,
+        /// Underlying name resolution error.
+        #[source]
+        source: io::Error,
+    },
+    /// Every port from `start_port` through `65535` was already in use.
+    #[error("no available TCP port found starting from {start_port}")]
+    PortExhausted {
+        /// Initial port where the fallback scan began.
+        start_port: u16,
+    },
+    /// Socket, process, or filesystem I/O error.
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    /// JSON serialization or deserialization failure during background startup.
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    /// Detached background server exited with an error before completing startup.
+    #[error("{0}")]
+    BackgroundStartup(String),
+    /// Detached background server did not report readiness before the timeout elapsed.
+    #[error("timed out waiting for background tellit server to start")]
+    BackgroundTimeout,
+}
+
+/// Configuration for launching an in-process `tellit` HTTP server.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::PathBuf;
+/// use tellit_cli::server::{DEFAULT_HOST, ServerConfig};
+///
+/// let config = ServerConfig::new(PathBuf::from("/tmp/repo")).with_port(Some(0));
+/// assert_eq!(config.host, DEFAULT_HOST);
+/// assert_eq!(config.preferred_port, Some(0));
+/// ```
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    /// Repository or working directory inspected by Jujutsu endpoints.
+    pub repo_path: PathBuf,
+    /// Host address or hostname to bind.
+    pub host: String,
+    /// Preferred TCP port (`Some(0)` binds an OS-assigned ephemeral port; `None` starts at [`DEFAULT_PORT`]).
+    pub preferred_port: Option<u16>,
+    /// Keep the server alive after all `/api/heartbeat` browser clients disconnect.
+    pub keep_alive: bool,
+    /// Optional filesystem directory overriding embedded WebAssembly UI assets.
+    pub web_dir: Option<PathBuf>,
+    /// Interval between SSE ping frames on `/api/heartbeat`.
+    pub heartbeat_interval: Duration,
+    /// Grace window before shutting down after the last `/api/heartbeat` client disconnects.
+    pub disconnect_grace: Duration,
+    /// Suppress port-fallback diagnostic messages on `stderr`.
+    pub quiet: bool,
+}
+
+impl ServerConfig {
+    /// Creates a server configuration rooted at `repo_path` with standard defaults.
+    ///
+    /// Reads `TELLIT_WEB_DIR` from the environment if set to an existing directory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::PathBuf;
+    /// use tellit_cli::server::ServerConfig;
+    ///
+    /// let config = ServerConfig::new(PathBuf::from("."));
+    /// assert!(!config.keep_alive);
+    /// ```
+    #[must_use]
+    pub fn new(repo_path: PathBuf) -> Self {
+        let web_dir = std::env::var_os("TELLIT_WEB_DIR")
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir());
+
+        Self {
+            repo_path,
+            host: String::from(DEFAULT_HOST),
+            preferred_port: None,
+            keep_alive: false,
+            web_dir,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            disconnect_grace: DEFAULT_DISCONNECT_GRACE,
+            quiet: false,
+        }
+    }
+
+    /// Sets the preferred TCP port.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::PathBuf;
+    /// use tellit_cli::server::ServerConfig;
+    ///
+    /// let config = ServerConfig::new(PathBuf::from(".")).with_port(Some(5000));
+    /// assert_eq!(config.preferred_port, Some(5000));
+    /// ```
+    #[must_use]
+    pub const fn with_port(mut self, port: Option<u16>) -> Self {
+        self.preferred_port = port;
+        self
+    }
+
+    /// Overrides the bind host when `host` is non-empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::PathBuf;
+    /// use tellit_cli::server::ServerConfig;
+    ///
+    /// let config = ServerConfig::new(PathBuf::from(".")).with_host(Some("localhost"));
+    /// assert_eq!(config.host, "localhost");
+    /// ```
+    #[must_use]
+    pub fn with_host(mut self, host: Option<&str>) -> Self {
+        if let Some(trimmed) = host.map(str::trim).filter(|s| !s.is_empty()) {
+            self.host = String::from(trimmed);
+        }
+        self
+    }
+
+    /// Configures whether the server stays running after browser tabs close.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::PathBuf;
+    /// use tellit_cli::server::ServerConfig;
+    ///
+    /// let config = ServerConfig::new(PathBuf::from(".")).with_keep_alive(true);
+    /// assert!(config.keep_alive);
+    /// ```
+    #[must_use]
+    pub const fn with_keep_alive(mut self, keep_alive: bool) -> Self {
+        self.keep_alive = keep_alive;
+        self
+    }
+
+    /// Overrides the static web asset directory on disk.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::PathBuf;
+    /// use tellit_cli::server::ServerConfig;
+    ///
+    /// let config = ServerConfig::new(PathBuf::from(".")).with_web_dir(Some(PathBuf::from("/tmp/dist")));
+    /// assert_eq!(config.web_dir, Some(PathBuf::from("/tmp/dist")));
+    /// ```
+    #[must_use]
+    pub fn with_web_dir(mut self, web_dir: Option<PathBuf>) -> Self {
+        self.web_dir = web_dir;
+        self
+    }
+
+    /// Sets the `/api/heartbeat` ping interval and post-disconnect shutdown grace period.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use core::time::Duration;
+    /// use std::path::PathBuf;
+    /// use tellit_cli::server::ServerConfig;
+    ///
+    /// let config = ServerConfig::new(PathBuf::from("."))
+    ///     .with_heartbeat_timings(Duration::from_millis(50), Duration::from_millis(25));
+    /// assert_eq!(config.heartbeat_interval, Duration::from_millis(50));
+    /// ```
+    #[must_use]
+    pub const fn with_heartbeat_timings(
+        mut self,
+        heartbeat_interval: Duration,
+        disconnect_grace: Duration,
+    ) -> Self {
+        self.heartbeat_interval = heartbeat_interval;
+        self.disconnect_grace = disconnect_grace;
+        self
+    }
+
+    /// Silences stderr notices during port fallback scanning.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::PathBuf;
+    /// use tellit_cli::server::ServerConfig;
+    ///
+    /// let config = ServerConfig::new(PathBuf::from(".")).with_quiet(true);
+    /// assert!(config.quiet);
+    /// ```
+    #[must_use]
+    pub const fn with_quiet(mut self, quiet: bool) -> Self {
+        self.quiet = quiet;
+        self
+    }
+}
+
+/// Cloneable handle that triggers graceful shutdown on a [`RunningServer`].
+#[derive(Clone)]
+pub struct ShutdownHandle {
+    tx: watch::Sender<bool>,
+}
+
+impl ShutdownHandle {
+    /// Signals the associated [`RunningServer`] to stop accepting connections and exit.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn demo(server: tellit_cli::server::RunningServer) {
+    /// let handle = server.shutdown_handle();
+    /// handle.shutdown();
+    /// # }
+    /// ```
+    pub fn shutdown(&self) {
+        let _ = self.tx.send(true);
+    }
+}
+
+/// Handle to a bound, actively serving `tellit` HTTP server task.
+pub struct RunningServer {
+    /// Local socket address bound by the server.
+    pub addr: SocketAddr,
+    /// Bound TCP port.
+    pub port: u16,
+    /// User-facing HTTP URL for opening or querying the server.
+    pub url: String,
+    shutdown_tx: watch::Sender<bool>,
+    task: JoinHandle<io::Result<()>>,
+}
+
+impl RunningServer {
+    /// Returns a cloneable [`ShutdownHandle`] that can stop this server from another task.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn demo(server: tellit_cli::server::RunningServer) {
+    /// let handle = server.shutdown_handle();
+    /// handle.shutdown();
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle {
+            tx: self.shutdown_tx.clone(),
+        }
+    }
+
+    /// Returns `true` when the server is bound to a non-loopback address reachable externally.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn demo(server: tellit_cli::server::RunningServer) {
+    /// if server.is_external_bind() {
+    ///     eprintln!("bound externally on {}", server.addr);
+    /// }
+    /// # }
+    /// ```
+    #[must_use]
+    pub const fn is_external_bind(&self) -> bool {
+        is_external_bind_addr(self.addr)
+    }
+
+    /// Signals the HTTP server to stop accepting connections and shut down gracefully.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn demo(server: tellit_cli::server::RunningServer) {
+    /// server.shutdown();
+    /// # }
+    /// ```
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+
+    /// Waits until the server finishes shutting down.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::Io`] if the underlying `axum::serve` loop fails or panics.
+    pub async fn wait(self) -> Result<(), ServerError> {
+        match self.task.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(ServerError::Io(err)),
+            Err(join_err) => Err(ServerError::Io(io::Error::other(join_err))),
+        }
+    }
+}
+
+struct AppState {
+    repo_path: PathBuf,
+    web_dir: Option<PathBuf>,
+    keep_alive: bool,
+    heartbeat_interval: Duration,
+    disconnect_grace: Duration,
+    active_clients: AtomicUsize,
+    disconnect_epoch: AtomicU64,
+    shutdown_tx: watch::Sender<bool>,
+}
+
+struct BoundListener {
+    listener: TcpListener,
+    addr: SocketAddr,
+    url: String,
+}
+
+fn format_display_url(raw_host: &str, bound_addr: SocketAddr) -> String {
+    let port = bound_addr.port();
+    let trimmed = raw_host.trim();
+    if bound_addr.ip().is_unspecified() || trimmed.eq_ignore_ascii_case("localhost") {
+        return alloc::format!("http://localhost:{port}");
+    }
+
+    match bound_addr.ip() {
+        IpAddr::V4(ip) if trimmed.parse::<IpAddr>().is_ok() => {
+            alloc::format!("http://{ip}:{port}")
+        }
+        IpAddr::V6(ip) if trimmed.trim_matches(['[', ']']).parse::<IpAddr>().is_ok() => {
+            alloc::format!("http://[{ip}]:{port}")
+        }
+        _ => alloc::format!("http://{trimmed}:{port}"),
+    }
+}
+
+async fn resolve_bind_ip(raw_host: &str) -> Result<IpAddr, ServerError> {
+    let trimmed = raw_host.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("localhost") {
+        return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    let unbracketed = trimmed.trim_matches(['[', ']']);
+    if let Ok(ip) = unbracketed.parse::<IpAddr>() {
+        return Ok(ip);
+    }
+
+    let mut addrs = tokio::net::lookup_host((trimmed, 0))
+        .await
+        .map_err(|source| ServerError::InvalidHost {
+            host: String::from(trimmed),
+            source,
+        })?;
+
+    addrs
+        .next()
+        .map(|sock| sock.ip())
+        .ok_or_else(|| ServerError::InvalidHost {
+            host: String::from(trimmed),
+            source: io::Error::new(io::ErrorKind::AddrNotAvailable, "no addresses resolved"),
+        })
+}
+
+async fn bind_with_fallback(
+    raw_host: &str,
+    preferred_port: Option<u16>,
+    quiet: bool,
+) -> Result<BoundListener, ServerError> {
+    let ip = resolve_bind_ip(raw_host).await?;
+
+    if preferred_port == Some(0) {
+        let listener = TcpListener::bind(SocketAddr::new(ip, 0)).await?;
+        let addr = listener.local_addr()?;
+        let url = format_display_url(raw_host, addr);
+        return Ok(BoundListener {
+            listener,
+            addr,
+            url,
+        });
+    }
+
+    let start_port = preferred_port.unwrap_or(DEFAULT_PORT);
+    for port in start_port..=u16::MAX {
+        match TcpListener::bind(SocketAddr::new(ip, port)).await {
+            Ok(listener) => {
+                let addr = listener.local_addr()?;
+                let url = format_display_url(raw_host, addr);
+                return Ok(BoundListener {
+                    listener,
+                    addr,
+                    url,
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+                if !quiet && port < u16::MAX {
+                    eprintln!("Port {port} is busy, trying {}...", port + 1);
+                }
+            }
+            Err(err) => return Err(ServerError::Io(err)),
+        }
+    }
+
+    Err(ServerError::PortExhausted { start_port })
+}
+
+/// Runs `jj --no-pager --ignore-working-copy root` inside `repo_path` to check Jujutsu status.
+async fn detect_jj_status(repo_path: &Path) -> JjStatusResponse {
+    let mut attempt = 0u32;
+    loop {
+        let result = tokio::process::Command::new("jj")
+            .args(["--no-pager", "--ignore-working-copy", "root"])
+            .current_dir(repo_path)
+            .kill_on_drop(true)
+            .output()
+            .await;
+
+        match result {
+            Ok(output) if output.status.success() => {
+                let root = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                if root.is_empty() {
+                    return JjStatusResponse::not_jj();
+                }
+                return JjStatusResponse::jj(root);
+            }
+            Ok(_) => return JjStatusResponse::not_jj(),
+            Err(err)
+                if err.kind() == io::ErrorKind::ExecutableFileBusy
+                    && attempt < MAX_ETXTBSY_RETRIES =>
+            {
+                tokio::time::sleep(Duration::from_millis(1u64 << attempt.min(5))).await;
+                attempt += 1;
+            }
+            Err(_) => return JjStatusResponse::not_jj(),
+        }
+    }
+}
+
+async fn get_jj_status(State(state): State<Arc<AppState>>) -> Json<JjStatusResponse> {
+    Json(detect_jj_status(&state.repo_path).await)
+}
+
+/// Stream emitting an initial `connected` event followed by periodic `heartbeat` events,
+/// triggering server auto-shutdown on drop when `keep_alive` is disabled and no tabs remain.
+struct HeartbeatStream {
+    state: Arc<AppState>,
+    sent_initial: bool,
+    closed: bool,
+    interval: tokio::time::Interval,
+    shutdown_fut: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl HeartbeatStream {
+    fn new(state: Arc<AppState>) -> Self {
+        state.disconnect_epoch.fetch_add(1, Ordering::SeqCst);
+        state.active_clients.fetch_add(1, Ordering::SeqCst);
+        let mut interval = tokio::time::interval(state.heartbeat_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut shutdown_rx = state.shutdown_tx.subscribe();
+        let shutdown_fut = Box::pin(async move {
+            while !*shutdown_rx.borrow_and_update() {
+                if shutdown_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            state,
+            sent_initial: false,
+            closed: false,
+            interval,
+            shutdown_fut,
+        }
+    }
+}
+
+impl Stream for HeartbeatStream {
+    type Item = Result<Event, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.closed {
+            return Poll::Ready(None);
+        }
+
+        if self.shutdown_fut.as_mut().poll(cx).is_ready() {
+            self.closed = true;
+            return Poll::Ready(None);
+        }
+
+        if !self.sent_initial {
+            self.sent_initial = true;
+            // Consume the immediate first tick of `tokio::time::interval` so the first
+            // periodic ping waits a full `heartbeat_interval`.
+            let _ = self.interval.poll_tick(cx);
+            return Poll::Ready(Some(Ok(
+                Event::default().data(HeartbeatEvent::Connected.as_str())
+            )));
+        }
+
+        match self.interval.poll_tick(cx) {
+            Poll::Ready(_) => Poll::Ready(Some(Ok(
+                Event::default().data(HeartbeatEvent::Ping.as_str())
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for HeartbeatStream {
+    fn drop(&mut self) {
+        let previous = self.state.active_clients.fetch_sub(1, Ordering::SeqCst);
+        if !self.state.keep_alive && previous == 1 {
+            let epoch = self
+                .state
+                .disconnect_epoch
+                .fetch_add(1, Ordering::SeqCst)
+                .wrapping_add(1);
+            let state = Arc::clone(&self.state);
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    tokio::time::sleep(state.disconnect_grace).await;
+                    if state.active_clients.load(Ordering::SeqCst) == 0
+                        && state.disconnect_epoch.load(Ordering::SeqCst) == epoch
+                    {
+                        let _ = state.shutdown_tx.send(true);
+                    }
+                });
+            }
+        }
+    }
+}
+
+async fn get_heartbeat(State(state): State<Arc<AppState>>) -> Response {
+    let stream = HeartbeatStream::new(state);
+    let mut response = Sse::new(stream).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-transform"),
+    );
+    response
+}
+
+async fn get_index(State(state): State<Arc<AppState>>) -> Response {
+    let asset = assets::load_asset("index.html", state.web_dir.as_deref());
+    assets::into_http_response(asset)
+}
+
+async fn get_static_asset(
+    State(state): State<Arc<AppState>>,
+    AxumPath(path): AxumPath<String>,
+) -> Response {
+    let asset = assets::load_asset(&path, state.web_dir.as_deref());
+    assets::into_http_response(asset)
+}
+
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/", get(get_index))
+        .route("/index.html", get(get_index))
+        .route("/api/jj/status", get(get_jj_status))
+        .route("/api/heartbeat", get(get_heartbeat))
+        .route("/{*path}", get(get_static_asset))
+        .with_state(state)
+}
+
+/// Binds the TCP listener (with `AddrInUse` fallback) and spawns the `axum` server task.
+///
+/// # Errors
+///
+/// Returns [`ServerError`] if host resolution fails, all candidate ports are occupied,
+/// or socket binding fails with a non-recoverable I/O error.
+pub async fn start_server(config: ServerConfig) -> Result<RunningServer, ServerError> {
+    let bound = bind_with_fallback(&config.host, config.preferred_port, config.quiet).await?;
+    let port = bound.addr.port();
+
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let state = Arc::new(AppState {
+        repo_path: config.repo_path,
+        web_dir: config.web_dir,
+        keep_alive: config.keep_alive,
+        heartbeat_interval: config.heartbeat_interval,
+        disconnect_grace: config.disconnect_grace,
+        active_clients: AtomicUsize::new(0),
+        disconnect_epoch: AtomicU64::new(0),
+        shutdown_tx: shutdown_tx.clone(),
+    });
+
+    let router = build_router(state);
+    let listener = bound.listener;
+
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                while !*shutdown_rx.borrow_and_update() {
+                    if shutdown_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await
+    });
+
+    Ok(RunningServer {
+        addr: bound.addr,
+        port,
+        url: bound.url,
+        shutdown_tx,
+        task,
+    })
+}
+
+/// Returns `true` when `addr` binds a non-loopback interface reachable over the network.
+///
+/// # Examples
+///
+/// ```
+/// use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+/// use tellit_cli::server::is_external_bind_addr;
+///
+/// let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4966);
+/// let wildcard = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 4966);
+/// assert!(!is_external_bind_addr(loopback));
+/// assert!(is_external_bind_addr(wildcard));
+/// ```
+#[must_use]
+pub const fn is_external_bind_addr(addr: SocketAddr) -> bool {
+    !addr.ip().is_loopback()
+}
+
+/// Waits for an operating system termination signal (`SIGINT` or Unix `SIGTERM`).
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn demo() {
+/// tellit_cli::server::wait_for_shutdown_signal().await;
+/// # }
+/// ```
+pub async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_display_url_handles_ipv4_ipv6_and_wildcards() {
+        let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4966);
+        assert_eq!(format_display_url("127.0.0.1", v4), "http://127.0.0.1:4966");
+        assert_eq!(format_display_url("localhost", v4), "http://localhost:4966");
+        assert_eq!(
+            format_display_url(" LOCALHOST ", v4),
+            "http://localhost:4966"
+        );
+
+        let any_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 4966);
+        assert_eq!(
+            format_display_url("0.0.0.0", any_v4),
+            "http://localhost:4966"
+        );
+
+        let any_v6 = SocketAddr::new(IpAddr::V6(core::net::Ipv6Addr::UNSPECIFIED), 4966);
+        assert_eq!(format_display_url("::", any_v6), "http://localhost:4966");
+        assert_eq!(format_display_url("::0", any_v6), "http://localhost:4966");
+        assert_eq!(format_display_url("[::0]", any_v6), "http://localhost:4966");
+
+        let v6 = SocketAddr::new(IpAddr::V6(core::net::Ipv6Addr::LOCALHOST), 4966);
+        assert_eq!(format_display_url("::1", v6), "http://[::1]:4966");
+        assert_eq!(format_display_url("[::1]", v6), "http://[::1]:4966");
+    }
+
+    #[test]
+    fn external_bind_addr_detection() {
+        let v4_loop = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4966);
+        let v6_loop = SocketAddr::new(IpAddr::V6(core::net::Ipv6Addr::LOCALHOST), 4966);
+        let v4_any = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 4966);
+        let v6_any = SocketAddr::new(IpAddr::V6(core::net::Ipv6Addr::UNSPECIFIED), 4966);
+
+        assert!(!is_external_bind_addr(v4_loop));
+        assert!(!is_external_bind_addr(v6_loop));
+        assert!(is_external_bind_addr(v4_any));
+        assert!(is_external_bind_addr(v6_any));
+    }
+}

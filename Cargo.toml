@@ -37,10 +37,13 @@ anyhow = "1.0"
 axum = "0.8"
 clap = { version = "4.6.7", features = ["derive"] }
 mime_guess = "2.0"
+notify = "8.2"
 open = "5.4"
 rust-embed = { version = "8.14", features = ["debug-embed"] }
 serde = { workspace = true, features = ["std"] }
 serde_json.workspace = true
+similar = { version = "3.2", features = ["inline"] }
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 tellit-types.workspace = true
 thiserror = { workspace = true, features = ["std"] }
 tokio = { version = "1.44", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }

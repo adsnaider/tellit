@@ -23,11 +23,14 @@ extern crate alloc;
 
 mod assets;
 mod background;
+mod diff_parser;
+mod jujutsu;
+mod watch;
 
 pub use background::{BACKGROUND_CHILD_ENV, BackgroundServerInfo, spawn_background_child};
 
 use alloc::boxed::Box;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use core::convert::Infallible;
 use core::future::Future;
@@ -37,20 +40,28 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderValue, header};
+use axum::extract::{Path as AxumPath, Query, State};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
-use tellit_types::{HeartbeatEvent, JjStatusResponse};
+use jujutsu::{JujutsuError, JujutsuService};
+use serde::Deserialize;
+use tellit_types::{
+    ApiErrorResponse, ApproveCommitRequest, ApproveCommitResponse, CreateCommentRequest,
+    CreateCommentResponse, HeartbeatEvent, JjChangesResponse, JjCommentsResponse,
+    JjCommitsResponse, JjDiffResponse, JjStatusResponse, ReplyCommentRequest, ReplyCommentResponse,
+    ResolveCommentRequest, ResolveCommentResponse,
+};
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::watch as tokio_watch;
 use tokio::task::JoinHandle;
 use tokio_stream::Stream;
+use watch::WatchHub;
 
 /// Default preferred TCP port when `--port` is not specified.
 pub const DEFAULT_PORT: u16 = 4966;
@@ -60,7 +71,6 @@ pub const DEFAULT_HOST: &str = "127.0.0.1";
 
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_DISCONNECT_GRACE: Duration = Duration::from_millis(250);
-const MAX_ETXTBSY_RETRIES: u32 = 10;
 
 /// Errors returned when configuring, binding, or running the `tellit` HTTP server.
 #[derive(Debug, Error)]
@@ -110,6 +120,12 @@ pub enum ServerError {
 pub struct ServerConfig {
     /// Repository or working directory inspected by Jujutsu endpoints.
     pub repo_path: PathBuf,
+    /// Optional custom `.tellit/` review store directory override.
+    pub store_path: Option<PathBuf>,
+    /// Optional initial target revision passed to `tellit launch`.
+    pub commit_ish: Option<String>,
+    /// Optional comparison base revision passed to `tellit launch`.
+    pub compare_with: Option<String>,
     /// Host address or hostname to bind.
     pub host: String,
     /// Preferred TCP port (`Some(0)` binds an OS-assigned ephemeral port; `None` starts at [`DEFAULT_PORT`]).
@@ -148,6 +164,9 @@ impl ServerConfig {
 
         Self {
             repo_path,
+            store_path: None,
+            commit_ish: None,
+            compare_with: None,
             host: String::from(DEFAULT_HOST),
             preferred_port: None,
             keep_alive: false,
@@ -156,6 +175,25 @@ impl ServerConfig {
             disconnect_grace: DEFAULT_DISCONNECT_GRACE,
             quiet: false,
         }
+    }
+
+    /// Overrides the `.tellit/` review store directory.
+    #[must_use]
+    pub fn with_store_path(mut self, store_path: Option<PathBuf>) -> Self {
+        self.store_path = store_path;
+        self
+    }
+
+    /// Sets the initial target and comparison revisions resolved by `GET /api/jj/status`.
+    #[must_use]
+    pub fn with_initial_revisions(
+        mut self,
+        commit_ish: Option<String>,
+        compare_with: Option<String>,
+    ) -> Self {
+        self.commit_ish = commit_ish;
+        self.compare_with = compare_with;
+        self
     }
 
     /// Sets the preferred TCP port.
@@ -273,7 +311,7 @@ impl ServerConfig {
 /// Cloneable handle that triggers graceful shutdown on a [`RunningServer`].
 #[derive(Clone)]
 pub struct ShutdownHandle {
-    tx: watch::Sender<bool>,
+    tx: tokio_watch::Sender<bool>,
 }
 
 impl ShutdownHandle {
@@ -300,7 +338,7 @@ pub struct RunningServer {
     pub port: u16,
     /// User-facing HTTP URL for opening or querying the server.
     pub url: String,
-    shutdown_tx: watch::Sender<bool>,
+    shutdown_tx: tokio_watch::Sender<bool>,
     task: JoinHandle<io::Result<()>>,
 }
 
@@ -366,14 +404,17 @@ impl RunningServer {
 }
 
 struct AppState {
-    repo_path: PathBuf,
+    jj: JujutsuService,
+    watch: Arc<WatchHub>,
+    commit_ish: Option<String>,
+    compare_with: Option<String>,
     web_dir: Option<PathBuf>,
     keep_alive: bool,
     heartbeat_interval: Duration,
     disconnect_grace: Duration,
     active_clients: AtomicUsize,
     disconnect_epoch: AtomicU64,
-    shutdown_tx: watch::Sender<bool>,
+    shutdown_tx: tokio_watch::Sender<bool>,
 }
 
 struct BoundListener {
@@ -469,40 +510,148 @@ async fn bind_with_fallback(
     Err(ServerError::PortExhausted { start_port })
 }
 
-/// Runs `jj --no-pager --ignore-working-copy root` inside `repo_path` to check Jujutsu status.
-async fn detect_jj_status(repo_path: &Path) -> JjStatusResponse {
-    let mut attempt = 0u32;
-    loop {
-        let result = tokio::process::Command::new("jj")
-            .args(["--no-pager", "--ignore-working-copy", "root"])
-            .current_dir(repo_path)
-            .kill_on_drop(true)
-            .output()
-            .await;
+struct ApiError(JujutsuError);
 
-        match result {
-            Ok(output) if output.status.success() => {
-                let root = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                if root.is_empty() {
-                    return JjStatusResponse::not_jj();
-                }
-                return JjStatusResponse::jj(root);
-            }
-            Ok(_) => return JjStatusResponse::not_jj(),
-            Err(err)
-                if err.kind() == io::ErrorKind::ExecutableFileBusy
-                    && attempt < MAX_ETXTBSY_RETRIES =>
-            {
-                tokio::time::sleep(Duration::from_millis(1u64 << attempt.min(5))).await;
-                attempt += 1;
-            }
-            Err(_) => return JjStatusResponse::not_jj(),
-        }
+impl From<JujutsuError> for ApiError {
+    fn from(err: JujutsuError) -> Self {
+        Self(err)
     }
 }
 
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let status = match &self.0 {
+            JujutsuError::InvalidInput(_) => StatusCode::BAD_REQUEST,
+            JujutsuError::NotFound(_) => StatusCode::NOT_FOUND,
+            JujutsuError::CommandSpawn { .. }
+            | JujutsuError::CommandFailed { .. }
+            | JujutsuError::Store(_)
+            | JujutsuError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (
+            status,
+            Json(ApiErrorResponse {
+                error: self.0.to_string(),
+            }),
+        )
+            .into_response()
+    }
+}
+
+#[derive(Deserialize)]
+struct ChangesQuery {
+    query: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DiffQuery {
+    target: Option<String>,
+    commit: Option<String>,
+    base: Option<String>,
+    #[serde(rename = "ignoreRebase")]
+    ignore_rebase: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct CommentsQuery {
+    target: Option<String>,
+    commit: Option<String>,
+    base: Option<String>,
+}
+
 async fn get_jj_status(State(state): State<Arc<AppState>>) -> Json<JjStatusResponse> {
-    Json(detect_jj_status(&state.repo_path).await)
+    Json(
+        state
+            .jj
+            .detect_status(state.commit_ish.as_deref(), state.compare_with.as_deref())
+            .await,
+    )
+}
+
+async fn get_jj_changes(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ChangesQuery>,
+) -> Result<Json<JjChangesResponse>, ApiError> {
+    Ok(Json(state.jj.get_changes(query.query.as_deref()).await?))
+}
+
+async fn get_jj_change_commits(
+    State(state): State<Arc<AppState>>,
+    AxumPath(change_id): AxumPath<String>,
+) -> Result<Json<JjCommitsResponse>, ApiError> {
+    let commits = state.jj.get_commits_for_change(&change_id).await?;
+    Ok(Json(JjCommitsResponse { commits }))
+}
+
+async fn get_jj_diff(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DiffQuery>,
+) -> Result<Json<JjDiffResponse>, ApiError> {
+    let target = query.target.or(query.commit).unwrap_or_default();
+    let ignore_rebase = query.ignore_rebase.unwrap_or(true);
+    let diff = state
+        .jj
+        .get_diff(&target, query.base.as_deref(), ignore_rebase)
+        .await?;
+    Ok(Json(diff))
+}
+
+async fn get_jj_comments(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<CommentsQuery>,
+) -> Result<Json<JjCommentsResponse>, ApiError> {
+    let target = query.target.or(query.commit).unwrap_or_default();
+    let threads = state
+        .jj
+        .get_comments_for_diff(&target, query.base.as_deref())
+        .await?;
+    Ok(Json(JjCommentsResponse { threads }))
+}
+
+async fn post_jj_comment(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateCommentRequest>,
+) -> Result<Json<CreateCommentResponse>, ApiError> {
+    let thread_id = state
+        .jj
+        .add_comment(&req.commit_id, &req.file_path, req.line_range, &req.content)
+        .await?;
+    state.watch.broadcast_comments_changed();
+    Ok(Json(CreateCommentResponse { thread_id }))
+}
+
+async fn post_jj_comment_reply(
+    State(state): State<Arc<AppState>>,
+    AxumPath(thread_id): AxumPath<String>,
+    Json(req): Json<ReplyCommentRequest>,
+) -> Result<Json<ReplyCommentResponse>, ApiError> {
+    let canonical_id = state.jj.reply_comment(&thread_id, &req.content).await?;
+    state.watch.broadcast_comments_changed();
+    Ok(Json(ReplyCommentResponse {
+        thread_id: canonical_id,
+    }))
+}
+
+async fn post_jj_comment_resolve(
+    State(state): State<Arc<AppState>>,
+    AxumPath(thread_id): AxumPath<String>,
+    Json(req): Json<ResolveCommentRequest>,
+) -> Result<Json<ResolveCommentResponse>, ApiError> {
+    let response = state.jj.resolve_comment(&thread_id, req.unresolve).await?;
+    state.watch.broadcast_comments_changed();
+    Ok(Json(response))
+}
+
+async fn post_jj_approve(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ApproveCommitRequest>,
+) -> Result<Json<ApproveCommitResponse>, ApiError> {
+    let response = state
+        .jj
+        .set_approval(&req.commit_id, req.disapprove)
+        .await?;
+    state.watch.broadcast_comments_changed();
+    Ok(Json(response))
 }
 
 /// Stream emitting an initial `connected` event followed by periodic `heartbeat` events,
@@ -605,6 +754,16 @@ async fn get_heartbeat(State(state): State<Arc<AppState>>) -> Response {
     response
 }
 
+async fn get_watch(State(state): State<Arc<AppState>>) -> Response {
+    let stream = state.watch.subscribe();
+    let mut response = Sse::new(stream).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-transform"),
+    );
+    response
+}
+
 async fn get_index(State(state): State<Arc<AppState>>) -> Response {
     let asset = assets::load_asset("index.html", state.web_dir.as_deref());
     assets::into_http_response(asset)
@@ -623,7 +782,27 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/", get(get_index))
         .route("/index.html", get(get_index))
         .route("/api/jj/status", get(get_jj_status))
+        .route("/api/jj/changes", get(get_jj_changes))
+        .route(
+            "/api/jj/changes/{change_id}/commits",
+            get(get_jj_change_commits),
+        )
+        .route("/api/jj/diff", get(get_jj_diff))
+        .route(
+            "/api/jj/comments",
+            get(get_jj_comments).post(post_jj_comment),
+        )
+        .route(
+            "/api/jj/comments/{thread_id}/reply",
+            post(post_jj_comment_reply),
+        )
+        .route(
+            "/api/jj/comments/{thread_id}/resolve",
+            post(post_jj_comment_resolve),
+        )
+        .route("/api/jj/approve", post(post_jj_approve))
         .route("/api/heartbeat", get(get_heartbeat))
+        .route("/api/watch", get(get_watch))
         .route("/{*path}", get(get_static_asset))
         .with_state(state)
 }
@@ -638,9 +817,20 @@ pub async fn start_server(config: ServerConfig) -> Result<RunningServer, ServerE
     let bound = bind_with_fallback(&config.host, config.preferred_port, config.quiet).await?;
     let port = bound.addr.port();
 
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let (shutdown_tx, mut shutdown_rx) = tokio_watch::channel(false);
+    let jj = JujutsuService::new(config.repo_path.clone(), config.store_path);
+    let store_dir = jj.store_dir();
+    let watch = WatchHub::start(
+        config.repo_path,
+        store_dir,
+        shutdown_tx.clone(),
+        config.quiet,
+    );
     let state = Arc::new(AppState {
-        repo_path: config.repo_path,
+        jj,
+        watch,
+        commit_ish: config.commit_ish,
+        compare_with: config.compare_with,
         web_dir: config.web_dir,
         keep_alive: config.keep_alive,
         heartbeat_interval: config.heartbeat_interval,

@@ -370,7 +370,7 @@ pub struct GetCommitArgs {
     pub threads: bool,
 }
 
-/// Runs `jj` with `args` and returns its trimmed standard output.
+/// Runs `jj` with `args` in the current working directory and returns its trimmed stdout.
 ///
 /// Prepends `--no-pager` and `--ignore-working-copy` unless already present. Operation-pinned
 /// invocations (`--at-op` or `--at-operation`) omit `--ignore-working-copy` because Jujutsu
@@ -388,7 +388,45 @@ pub struct GetCommitArgs {
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 pub fn run_jj(args: &[&str]) -> Result<String> {
-    run_jj_with_bin(Path::new("jj"), args)
+    run_jj_with_bin(Path::new("jj"), None, args, true)
+}
+
+/// Runs `jj` inside `repo_dir` with `args` and returns its trimmed standard output.
+///
+/// # Errors
+///
+/// Returns an error if spawning `jj` fails or `jj` exits with a non-zero status.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+///
+/// let root = tellit_cli::run_jj_in(Path::new("."), &["root"])?;
+/// assert!(!root.is_empty());
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn run_jj_in(repo_dir: &Path, args: &[&str]) -> Result<String> {
+    run_jj_with_bin(Path::new("jj"), Some(repo_dir), args, true)
+}
+
+/// Runs `jj` inside `repo_dir` and strips only trailing newlines, preserving leading graph spaces.
+///
+/// # Errors
+///
+/// Returns an error if spawning `jj` fails or `jj` exits with a non-zero status.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+///
+/// let log = tellit_cli::run_jj_raw_in(Path::new("."), &["log", "-n", "1"])?;
+/// assert!(!log.is_empty());
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn run_jj_raw_in(repo_dir: &Path, args: &[&str]) -> Result<String> {
+    run_jj_with_bin(Path::new("jj"), Some(repo_dir), args, false)
 }
 
 /// Prepends `--no-pager` and `--ignore-working-copy` to `args` when compatible and not already set.
@@ -420,10 +458,19 @@ const MAX_ETXTBSY_RETRIES: u32 = 10;
 /// written script's file descriptor across `fork` and `execvp`, triggering
 /// `ETXTBSY` even after the writer closed its handle. Retrying with bounded
 /// backoff gives the child process time to close the inherited descriptor.
-fn spawn_jj_output(jj_bin: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+fn spawn_jj_output(
+    jj_bin: &Path,
+    repo_dir: Option<&Path>,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
     let mut attempt = 0u32;
     loop {
-        match std::process::Command::new(jj_bin).args(args).output() {
+        let mut cmd = std::process::Command::new(jj_bin);
+        cmd.args(args);
+        if let Some(dir) = repo_dir {
+            cmd.current_dir(dir);
+        }
+        match cmd.output() {
             Ok(output) => return Ok(output),
             Err(err)
                 if err.kind() == std::io::ErrorKind::ExecutableFileBusy
@@ -437,9 +484,14 @@ fn spawn_jj_output(jj_bin: &Path, args: &[&str]) -> std::io::Result<std::process
     }
 }
 
-fn run_jj_with_bin(jj_bin: &Path, args: &[&str]) -> Result<String> {
+fn run_jj_with_bin(
+    jj_bin: &Path,
+    repo_dir: Option<&Path>,
+    args: &[&str],
+    trim_leading: bool,
+) -> Result<String> {
     let effective_args = effective_jj_args(args);
-    let output = spawn_jj_output(jj_bin, &effective_args).with_context(|| {
+    let output = spawn_jj_output(jj_bin, repo_dir, &effective_args).with_context(|| {
         format!(
             "Failed to execute '{}'. Is jj installed and available in PATH?",
             jj_bin.display()
@@ -449,7 +501,12 @@ fn run_jj_with_bin(jj_bin: &Path, args: &[&str]) -> Result<String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("jj error: {}", stderr.trim());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let raw = String::from_utf8_lossy(&output.stdout);
+    if trim_leading {
+        Ok(raw.trim().to_string())
+    } else {
+        Ok(raw.trim_end_matches(['\r', '\n']).to_string())
+    }
 }
 
 pub fn get_workspace_root() -> Result<PathBuf> {
@@ -457,12 +514,62 @@ pub fn get_workspace_root() -> Result<PathBuf> {
     Ok(PathBuf::from(root))
 }
 
+/// Resolves the Jujutsu workspace root containing `repo_dir`.
+///
+/// # Errors
+///
+/// Returns an error if `repo_dir` is not inside a Jujutsu workspace or `jj` fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+///
+/// let root = tellit_cli::get_workspace_root_in(Path::new("."))?;
+/// assert!(root.is_absolute());
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn get_workspace_root_in(repo_dir: &Path) -> Result<PathBuf> {
+    let root = run_jj_in(repo_dir, &["root"])?;
+    Ok(PathBuf::from(root))
+}
+
 pub fn resolve_store(custom_store: Option<&Path>) -> Result<PathBuf> {
     if let Some(store) = custom_store {
         return Ok(store.to_path_buf());
     }
-
     let workspace_root = get_workspace_root()?;
+    resolve_store_from_workspace_root(&workspace_root)
+}
+
+/// Resolves the `.tellit/` store directory for `repo_dir` without reading process-global CWD.
+///
+/// Follows `.jj/repo` pointer files in secondary Jujutsu workspaces back to the primary
+/// repository root so all workspaces share one `.tellit/` store unless `custom_store` is set.
+///
+/// # Errors
+///
+/// Returns an error if `repo_dir` is not a Jujutsu workspace (when `custom_store` is `None`)
+/// or if reading/canonicalizing a secondary workspace pointer fails.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// let custom = tellit_cli::resolve_store_in(Path::new("/repo"), Some(Path::new("/tmp/store")))?;
+/// assert_eq!(custom, Path::new("/tmp/store"));
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn resolve_store_in(repo_dir: &Path, custom_store: Option<&Path>) -> Result<PathBuf> {
+    if let Some(store) = custom_store {
+        return Ok(store.to_path_buf());
+    }
+    let workspace_root = get_workspace_root_in(repo_dir)?;
+    resolve_store_from_workspace_root(&workspace_root)
+}
+
+fn resolve_store_from_workspace_root(workspace_root: &Path) -> Result<PathBuf> {
     let jj_repo = workspace_root.join(".jj").join("repo");
 
     let repo_root = if jj_repo.is_file() {
@@ -488,25 +595,70 @@ pub fn resolve_store(custom_store: Option<&Path>) -> Result<PathBuf> {
             })?
             .to_path_buf()
     } else {
-        workspace_root
+        workspace_root.to_path_buf()
     };
 
-    let tellit_store = repo_root.join(".tellit");
-    Ok(tellit_store)
+    Ok(repo_root.join(".tellit"))
+}
+
+/// Resolved Jujutsu change ID and Git commit hash for a revision expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionIds {
+    /// Full Jujutsu change ID.
+    pub change_id: String,
+    /// Full Git commit hash.
+    pub commit_id: String,
 }
 
 pub fn get_rev_info(rev: &str) -> Result<(String, String)> {
+    let rev_arg = format!("--revision={rev}");
     let stdout = run_jj(&[
         "log",
-        "-r",
-        rev,
+        &rev_arg,
+        "--limit=1",
         "--no-graph",
         "-T",
-        "change_id ++ \"\n\" ++ commit_id",
+        "change_id ++ \"\n\" ++ commit_id ++ \"\n\"",
     ])?;
+    parse_rev_info_output(rev, &stdout).map(|ids| (ids.change_id, ids.commit_id))
+}
+
+/// Resolves `rev` inside `repo_dir` to its Jujutsu change ID and Git commit hash.
+///
+/// # Errors
+///
+/// Returns an error if `rev` cannot be resolved by `jj log`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+///
+/// let ids = tellit_cli::get_rev_info_in(Path::new("."), "@")?;
+/// assert!(!ids.change_id.is_empty());
+/// assert!(!ids.commit_id.is_empty());
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn get_rev_info_in(repo_dir: &Path, rev: &str) -> Result<RevisionIds> {
+    let rev_arg = format!("--revision={rev}");
+    let stdout = run_jj_in(
+        repo_dir,
+        &[
+            "log",
+            &rev_arg,
+            "--limit=1",
+            "--no-graph",
+            "-T",
+            "change_id ++ \"\n\" ++ commit_id ++ \"\n\"",
+        ],
+    )?;
+    parse_rev_info_output(rev, &stdout)
+}
+
+fn parse_rev_info_output(rev: &str, stdout: &str) -> Result<RevisionIds> {
     let lines: Vec<&str> = stdout
         .lines()
-        .map(|s| s.trim())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
     if lines.len() < 2 {
@@ -516,7 +668,10 @@ pub fn get_rev_info(rev: &str) -> Result<(String, String)> {
             stdout
         );
     }
-    Ok((lines[0].to_string(), lines[1].to_string()))
+    Ok(RevisionIds {
+        change_id: lines[0].to_string(),
+        commit_id: lines[1].to_string(),
+    })
 }
 
 #[derive(Debug)]
@@ -611,15 +766,80 @@ pub fn add_comment(
     at: Option<LineRange>,
     content: String,
 ) -> Result<String> {
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| workspace_root.to_path_buf());
     let (change_id, commit_id) = get_rev_info(rev)?;
+    write_comment_thread(
+        store,
+        workspace_root,
+        &current_dir,
+        &change_id,
+        &commit_id,
+        file,
+        at,
+        content,
+    )
+}
 
+/// Creates a `.tellit/` comment thread resolving `rev` and relative `file` paths inside `workspace_root`.
+///
+/// # Errors
+///
+/// Returns an error if `rev` cannot be resolved in `workspace_root` or writing the JSON file fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+///
+/// let id = tellit_cli::add_comment_in(
+///     Path::new("/repo/.tellit"),
+///     Path::new("/repo"),
+///     "@",
+///     Path::new("src/lib.rs"),
+///     None,
+///     String::from("Looks good"),
+/// )?;
+/// assert!(!id.is_empty());
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn add_comment_in(
+    store: &Path,
+    workspace_root: &Path,
+    rev: &str,
+    file: &Path,
+    at: Option<LineRange>,
+    content: String,
+) -> Result<String> {
+    let ids = get_rev_info_in(workspace_root, rev)?;
+    write_comment_thread(
+        store,
+        workspace_root,
+        workspace_root,
+        &ids.change_id,
+        &ids.commit_id,
+        file,
+        at,
+        content,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_comment_thread(
+    store: &Path,
+    workspace_root: &Path,
+    base_dir: &Path,
+    change_id: &str,
+    commit_id: &str,
+    file: &Path,
+    at: Option<LineRange>,
+    content: String,
+) -> Result<String> {
     let rel_filepath = if file.is_absolute() {
         file.strip_prefix(workspace_root)
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| file.to_string_lossy().to_string())
     } else {
-        let current_dir = std::env::current_dir().unwrap_or_else(|_| workspace_root.to_path_buf());
-        let abs = current_dir.join(file);
+        let abs = base_dir.join(file);
         if let Ok(rel) = abs.strip_prefix(workspace_root) {
             rel.to_string_lossy().to_string()
         } else {
@@ -628,7 +848,7 @@ pub fn add_comment(
     };
 
     let thread_id = Uuid::new_v4().to_string();
-    let thread_dir = store.join(&change_id).join(&commit_id);
+    let thread_dir = store.join(change_id).join(commit_id);
     std::fs::create_dir_all(&thread_dir).with_context(|| {
         format!(
             "Failed to create thread directory: {}",
@@ -636,7 +856,7 @@ pub fn add_comment(
         )
     })?;
 
-    let thread_file = thread_dir.join(format!("{}.json", thread_id));
+    let thread_file = thread_dir.join(format!("{thread_id}.json"));
     let thread_data = ThreadData {
         filepath: rel_filepath,
         line_range: at,
@@ -1067,75 +1287,137 @@ pub fn is_change_approved(store: &Path, change_query: &str) -> bool {
     })
 }
 
+/// Result of recording or revoking commit approval in a `.tellit/` store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalOutcome {
+    /// Resolved Jujutsu change ID.
+    pub change_id: String,
+    /// Resolved Git commit hash.
+    pub commit_id: String,
+    /// Resulting approval state (`true` when approved).
+    pub approved: bool,
+}
+
 pub fn set_commit_approval(
     store: &Path,
     target: Option<&str>,
     disapprove: bool,
 ) -> Result<(String, String, bool)> {
+    let outcome = set_commit_approval_with_dir(None, store, target, disapprove)?;
+    Ok((outcome.change_id, outcome.commit_id, outcome.approved))
+}
+
+/// Records or revokes commit approval in `store`, resolving Jujutsu revisions relative to `repo_dir`.
+///
+/// # Errors
+///
+/// Returns an error if `target` cannot be resolved in `repo_dir` or `store`, or if writing
+/// `approval.json` fails.
+///
+/// # Examples
+///
+/// ```
+/// let dir = tempfile::tempdir()?;
+/// let store = dir.path().join(".tellit");
+/// std::fs::create_dir_all(store.join("chg12345").join("commit6789"))?;
+///
+/// let out = tellit_cli::set_commit_approval_in(dir.path(), &store, Some("commit6789"), false)?;
+/// assert!(out.approved);
+/// assert_eq!(out.change_id, "chg12345");
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn set_commit_approval_in(
+    repo_dir: &Path,
+    store: &Path,
+    target: Option<&str>,
+    disapprove: bool,
+) -> Result<ApprovalOutcome> {
+    set_commit_approval_with_dir(Some(repo_dir), store, target, disapprove)
+}
+
+fn set_commit_approval_with_dir(
+    repo_dir: Option<&Path>,
+    store: &Path,
+    target: Option<&str>,
+    disapprove: bool,
+) -> Result<ApprovalOutcome> {
     let rev = target.unwrap_or("@");
 
-    // 1. Resolve rev using Jujutsu log
-    let (change_id, commit_id) = match get_rev_info(rev) {
-        Ok(info) => info,
-        Err(_) => match run_jj(&[
-            "log",
-            "-r",
-            &format!("change_id({})", rev),
-            "-n",
-            "1",
-            "--no-graph",
-            "-T",
-            "change_id ++ \"\n\" ++ commit_id",
-        ]) {
-            Ok(out) => {
-                let lines: Vec<&str> = out
-                    .lines()
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if lines.len() >= 2 {
-                    (lines[0].to_string(), lines[1].to_string())
-                } else {
-                    anyhow::bail!("Failed to resolve revision or change '{}'", rev);
+    let rev_lookup = match repo_dir {
+        Some(dir) => get_rev_info_in(dir, rev),
+        None => get_rev_info(rev).map(|(change_id, commit_id)| RevisionIds {
+            change_id,
+            commit_id,
+        }),
+    };
+
+    let (change_id, commit_id) = match rev_lookup {
+        Ok(info) => (info.change_id, info.commit_id),
+        Err(_) => {
+            let change_rev_arg = format!("--revision=change_id({rev})");
+            let log_res = run_jj_with_bin(
+                Path::new("jj"),
+                repo_dir,
+                &[
+                    "log",
+                    &change_rev_arg,
+                    "--limit=1",
+                    "--no-graph",
+                    "-T",
+                    "change_id ++ \"\n\" ++ commit_id",
+                ],
+                true,
+            );
+            match log_res {
+                Ok(out) => {
+                    let lines: Vec<&str> = out
+                        .lines()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if lines.len() >= 2 {
+                        (lines[0].to_string(), lines[1].to_string())
+                    } else {
+                        anyhow::bail!("Failed to resolve revision or change '{}'", rev);
+                    }
                 }
-            }
-            Err(_) => {
-                // Search store as fallback
-                let mut found: Option<(String, String)> = None;
-                if store.exists() {
-                    for entry in WalkDir::new(store)
-                        .min_depth(2)
-                        .max_depth(2)
-                        .into_iter()
-                        .filter_map(|e| e.ok())
-                    {
-                        if entry.file_type().is_dir() {
-                            let commit_name = entry.file_name().to_string_lossy();
-                            let change_name = entry
-                                .path()
-                                .parent()
-                                .and_then(|p| p.file_name())
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            if commit_name == rev
-                                || (rev.len() >= 6 && commit_name.starts_with(rev))
-                                || change_name == rev
-                                || (rev.len() >= 6 && change_name.starts_with(rev))
-                            {
-                                found = Some((change_name, commit_name.to_string()));
-                                break;
+                Err(_) => {
+                    let mut found: Option<(String, String)> = None;
+                    if store.exists() {
+                        for entry in WalkDir::new(store)
+                            .min_depth(2)
+                            .max_depth(2)
+                            .into_iter()
+                            .filter_map(|e| e.ok())
+                        {
+                            if entry.file_type().is_dir() {
+                                let commit_name = entry.file_name().to_string_lossy();
+                                let change_name = entry
+                                    .path()
+                                    .parent()
+                                    .and_then(|p| p.file_name())
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                if commit_name == rev
+                                    || (rev.len() >= 6 && commit_name.starts_with(rev))
+                                    || change_name == rev
+                                    || (rev.len() >= 6 && change_name.starts_with(rev))
+                                {
+                                    found = Some((change_name, commit_name.to_string()));
+                                    break;
+                                }
                             }
                         }
                     }
+                    found.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Could not resolve target '{}' to a Jujutsu revision or store commit",
+                            rev
+                        )
+                    })?
                 }
-                found.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Could not resolve target '{}' to a Jujutsu revision or store commit",
-                        rev
-                    )
-                })?
             }
-        },
+        }
     };
 
     let commit_dir = store.join(&change_id).join(&commit_id);
@@ -1163,7 +1445,11 @@ pub fn set_commit_approval(
                 }
             }
         }
-        Ok((change_id, commit_id, false))
+        Ok(ApprovalOutcome {
+            change_id,
+            commit_id,
+            approved: false,
+        })
     } else {
         std::fs::create_dir_all(&commit_dir)?;
         let now_secs = std::time::SystemTime::now()
@@ -1178,7 +1464,11 @@ pub fn set_commit_approval(
         };
         let bytes = serde_json::to_vec_pretty(&data)?;
         std::fs::write(&approval_file, bytes)?;
-        Ok((change_id, commit_id, true))
+        Ok(ApprovalOutcome {
+            change_id,
+            commit_id,
+            approved: true,
+        })
     }
 }
 
@@ -1501,19 +1791,23 @@ esac
 ";
         write_mock_jj_script(&script_path, script);
 
-        let stdout = run_jj_with_bin(&script_path, &["root"]).unwrap();
+        let stdout = run_jj_with_bin(&script_path, None, &["root"], true).unwrap();
         assert_eq!(stdout, "/tmp/mock-workspace");
 
-        let pinned = run_jj_with_bin(&script_path, &["--at-op", "@-", "log"]).unwrap();
+        let raw_stdout = run_jj_with_bin(&script_path, None, &["root"], false).unwrap();
+        assert_eq!(raw_stdout, "\n  /tmp/mock-workspace  ");
+
+        let pinned = run_jj_with_bin(&script_path, None, &["--at-op", "@-", "log"], true).unwrap();
         assert_eq!(pinned, "pinned-op-output");
 
-        let err = run_jj_with_bin(&script_path, &["fail"]).unwrap_err();
+        let err = run_jj_with_bin(&script_path, None, &["fail"], true).unwrap_err();
         assert_eq!(
             err.to_string(),
             "jj error: Error: Revision `badrev` does not exist"
         );
 
-        let missing_err = run_jj_with_bin(&dir.path().join("missing-jj"), &["root"]).unwrap_err();
+        let missing_err =
+            run_jj_with_bin(&dir.path().join("missing-jj"), None, &["root"], true).unwrap_err();
         assert!(missing_err.to_string().contains("Failed to execute"));
     }
 
@@ -1537,7 +1831,7 @@ esac
                 std::thread::sleep(core::time::Duration::from_millis(5));
                 drop(hold_write);
             });
-            let stdout = run_jj_with_bin(&transient_path, &["root"]).unwrap();
+            let stdout = run_jj_with_bin(&transient_path, None, &["root"], true).unwrap();
             assert_eq!(stdout, "/tmp/mock-workspace");
         });
 
@@ -1550,7 +1844,7 @@ esac
                 .append(true)
                 .open(&busy_path)
                 .unwrap();
-            let err = run_jj_with_bin(&busy_path, &["root"]).unwrap_err();
+            let err = run_jj_with_bin(&busy_path, None, &["root"], true).unwrap_err();
             assert_eq!(
                 err.downcast_ref::<std::io::Error>().map(|e| e.kind()),
                 Some(std::io::ErrorKind::ExecutableFileBusy)
@@ -1562,14 +1856,19 @@ esac
         std::thread::scope(|s| {
             s.spawn(|| {
                 while !stop.load(Ordering::Relaxed) {
-                    let _ = run_jj_with_bin(Path::new("tellit-missing-jj-race-probe"), &["root"]);
+                    let _ = run_jj_with_bin(
+                        Path::new("tellit-missing-jj-race-probe"),
+                        None,
+                        &["root"],
+                        true,
+                    );
                 }
             });
 
             for i in 0..20 {
                 let path = dir.path().join(format!("mock-jj-{i}"));
                 write_mock_jj_script(&path, simple_script);
-                let stdout = run_jj_with_bin(&path, &["root"]).unwrap();
+                let stdout = run_jj_with_bin(&path, None, &["root"], true).unwrap();
                 assert_eq!(stdout, "/tmp/mock-workspace");
             }
             stop.store(true, Ordering::Relaxed);

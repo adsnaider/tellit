@@ -11,7 +11,12 @@ use std::process::Command;
 
 use reqwest::StatusCode;
 use tellit_cli::server::{BackgroundServerInfo, ServerConfig, start_server};
-use tellit_types::{HeartbeatEvent, JjStatusResponse};
+use tellit_types::{
+    ApproveCommitRequest, ApproveCommitResponse, CommentSide, CreateCommentRequest,
+    CreateCommentResponse, HeartbeatEvent, JjChangesResponse, JjCommentsResponse,
+    JjCommitsResponse, JjDiffResponse, JjStatusResponse, LineRangeSpec, ReplyCommentRequest,
+    ReplyCommentResponse, ResolveCommentRequest, ResolveCommentResponse, WatchEvent, WatchSource,
+};
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -594,4 +599,386 @@ async fn cli_launch_background_reports_startup_failure_on_invalid_host() {
         stderr.contains("unresolvable-host.invalid"),
         "expected host failure details on stderr, got: {stderr}"
     );
+}
+
+fn run_jj_test(repo_dir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new("jj")
+        .env("JJ_CONFIG", "/dev/null")
+        .args(["--no-pager"])
+        .args(args)
+        .current_dir(repo_dir)
+        .output()
+        .expect("jj must run in integration test");
+    assert!(
+        out.status.success(),
+        "jj {:?} failed: stderr={}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn setup_jj_test_repo() -> tempfile::TempDir {
+    let dir = tempdir().unwrap();
+    run_jj_test(dir.path(), &["git", "init"]);
+    run_jj_test(
+        dir.path(),
+        &["config", "set", "--repo", "user.name", "Test User"],
+    );
+    run_jj_test(
+        dir.path(),
+        &["config", "set", "--repo", "user.email", "test@example.com"],
+    );
+    dir
+}
+
+fn extract_watch_events(raw: &str) -> Vec<WatchEvent> {
+    raw.lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|payload| serde_json::from_str::<WatchEvent>(payload.trim()).ok())
+        .collect()
+}
+
+#[tokio::test]
+async fn jj_changes_evolog_rebase_isolation_and_clean_rebase_approval_endpoints() {
+    let repo = setup_jj_test_repo();
+    let root = repo.path();
+
+    // Base commit A on trunk.
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/upstream.txt"), "v1\n").unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn greet() -> i32 { 1 }\n").unwrap();
+    run_jj_test(root, &["describe", "-m", "base"]);
+    let base_a_commit = run_jj_test(root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+
+    // Feature change B (revision #1 -> #2).
+    run_jj_test(root, &["new", "-m", "feat: greet"]);
+    fs::write(root.join("src/lib.rs"), "pub fn greet() -> i32 { 2 }\n").unwrap();
+    let b_change_id = run_jj_test(root, &["log", "-r", "@", "--no-graph", "-T", "change_id"]);
+    let b_v1_commit = run_jj_test(root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+
+    fs::write(root.join("src/lib.rs"), "pub fn greet() -> i32 { 42 }\n").unwrap();
+    run_jj_test(root, &["status"]);
+    let b_v2_commit = run_jj_test(root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    assert_ne!(b_v1_commit, b_v2_commit);
+
+    // Advance upstream with an unrelated file change, then rebase B onto it cleanly.
+    run_jj_test(root, &["new", &base_a_commit, "-m", "upstream: bump"]);
+    fs::write(root.join("src/upstream.txt"), "v2\n").unwrap();
+    run_jj_test(root, &["status"]);
+    let upstream_a2_commit =
+        run_jj_test(root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+
+    run_jj_test(
+        root,
+        &["rebase", "-r", &b_change_id, "-d", &upstream_a2_commit],
+    );
+    let b_v3_commit = run_jj_test(
+        root,
+        &["log", "-r", &b_change_id, "--no-graph", "-T", "commit_id"],
+    );
+    assert_ne!(b_v2_commit, b_v3_commit);
+
+    let server = start_server(
+        ServerConfig::new(root.to_path_buf())
+            .with_port(Some(0))
+            .with_keep_alive(true),
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+
+    // 1. Query single change via ?query=
+    let single_resp: JjChangesResponse = client
+        .get(format!("{}/api/jj/changes?query={b_change_id}", server.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(single_resp.changes.len(), 1);
+    assert_eq!(single_resp.changes[0].change_id, b_change_id);
+
+    // 2. Approve revision #2 (`b_v2_commit`) and verify clean-rebase approval carries onto #3 (`b_v3_commit`).
+    let approve_resp: ApproveCommitResponse = client
+        .post(format!("{}/api/jj/approve", server.url))
+        .json(&ApproveCommitRequest {
+            commit_id: b_v2_commit.clone(),
+            disapprove: false,
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(approve_resp.approved);
+
+    let commits_resp: JjCommitsResponse = client
+        .get(format!(
+            "{}/api/jj/changes/{b_change_id}/commits",
+            server.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let head_commit = commits_resp
+        .commits
+        .iter()
+        .find(|c| c.commit_id == b_v3_commit)
+        .expect("rebased commit must be in evolog");
+    assert!(!head_commit.approved);
+    assert!(head_commit.clean_rebase_approved);
+    assert_eq!(
+        head_commit.clean_rebase_source_commit_id.as_deref(),
+        Some(b_v2_commit.as_str())
+    );
+
+    // `GET /api/jj/changes` reflects clean_rebase_approved on the change graph row too.
+    let graph_resp: JjChangesResponse = client
+        .get(format!("{}/api/jj/changes", server.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let graph_change = graph_resp
+        .changes
+        .iter()
+        .find(|c| c.change_id == b_change_id)
+        .expect("feature change must appear in jj log graph");
+    assert!(graph_change.clean_rebase_approved);
+
+    // 3. Rebase-isolated interdiff between `b_v2_commit` and `b_v3_commit` hides `src/upstream.txt`.
+    let isolated_diff: JjDiffResponse = client
+        .get(format!(
+            "{}/api/jj/diff?target={b_v3_commit}&base={b_v2_commit}&ignoreRebase=true",
+            server.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(isolated_diff.is_rebase_diff);
+    assert!(isolated_diff.rebase_ignored);
+    assert!(!isolated_diff.rebase_conflict);
+    assert_eq!(isolated_diff.files[0].path, "Commit Message");
+    assert!(
+        !isolated_diff
+            .files
+            .iter()
+            .any(|f| f.path == "src/upstream.txt")
+    );
+    assert!(isolated_diff.is_empty);
+
+    // With `ignoreRebase=false`, the upstream rebase changes appear.
+    let full_interdiff: JjDiffResponse = client
+        .get(format!(
+            "{}/api/jj/diff?target={b_v3_commit}&base={b_v2_commit}&ignoreRebase=false",
+            server.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(full_interdiff.is_rebase_diff);
+    assert!(!full_interdiff.rebase_ignored);
+    assert!(
+        full_interdiff
+            .files
+            .iter()
+            .any(|f| f.path == "src/upstream.txt")
+    );
+
+    // Parent diff includes virtual Commit Message and highlighted `src/lib.rs`.
+    let parent_diff: JjDiffResponse = client
+        .get(format!("{}/api/jj/diff?target={b_v3_commit}", server.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(parent_diff.files[0].path, "Commit Message");
+    let lib_file = parent_diff
+        .files
+        .iter()
+        .find(|f| f.path == "src/lib.rs")
+        .expect("src/lib.rs must appear in parent diff");
+    assert!(!lib_file.chunks[0].lines[0].syntax_spans.is_empty());
+
+    server.shutdown();
+    server.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn jj_comments_crud_and_watch_sse_stream_work_end_to_end() {
+    let repo = setup_jj_test_repo();
+    let root = repo.path();
+
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    run_jj_test(root, &["describe", "-m", "init"]);
+    let base_commit = run_jj_test(root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+
+    run_jj_test(root, &["new", "-m", "feat: edit main"]);
+    fs::write(
+        root.join("src/main.rs"),
+        "fn main() {\n    println!(\"hi\");\n}\n",
+    )
+    .unwrap();
+    let target_commit_1 = run_jj_test(root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+
+    fs::write(
+        root.join("src/main.rs"),
+        "fn main() {\n    println!(\"hello\");\n}\n",
+    )
+    .unwrap();
+    let target_commit_2 = run_jj_test(root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    assert_ne!(base_commit, target_commit_1);
+    assert_ne!(target_commit_1, target_commit_2);
+
+    let server = start_server(
+        ServerConfig::new(root.to_path_buf())
+            .with_port(Some(0))
+            .with_keep_alive(true),
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+
+    // Connect `/api/watch` and confirm initial Connected event.
+    let mut watch_resp = client
+        .get(format!("{}/api/watch", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(watch_resp.status(), StatusCode::OK);
+    let first_chunk = tokio::time::timeout(Duration::from_secs(2), watch_resp.chunk())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        extract_watch_events(&String::from_utf8_lossy(&first_chunk)),
+        vec![WatchEvent::Connected]
+    );
+
+    // Create thread on `target_commit_1` (will map to Old when comparing target_commit_1 -> target_commit_2).
+    let created_old: CreateCommentResponse = client
+        .post(format!("{}/api/jj/comments", server.url))
+        .json(&CreateCommentRequest {
+            commit_id: target_commit_1.clone(),
+            file_path: String::from("src/main.rs"),
+            line_range: Some(LineRangeSpec { start: 2, end: 2 }),
+            content: String::from("nit on v1"),
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Watch SSE stream must receive CommentsChanged.
+    let watch_chunk = tokio::time::timeout(Duration::from_secs(2), watch_resp.chunk())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        extract_watch_events(&String::from_utf8_lossy(&watch_chunk))
+            .contains(&WatchEvent::CommentsChanged)
+    );
+
+    // Reply and resolve.
+    let reply_resp: ReplyCommentResponse = client
+        .post(format!(
+            "{}/api/jj/comments/{}/reply",
+            server.url, created_old.thread_id
+        ))
+        .json(&ReplyCommentRequest {
+            content: String::from("Fixed in v2"),
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reply_resp.thread_id, created_old.thread_id);
+
+    let resolve_resp: ResolveCommentResponse = client
+        .post(format!(
+            "{}/api/jj/comments/{}/resolve",
+            server.url, created_old.thread_id
+        ))
+        .json(&ResolveCommentRequest { unresolve: false })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(resolve_resp.resolved);
+
+    let comments_resp: JjCommentsResponse = client
+        .get(format!(
+            "{}/api/jj/comments?target={target_commit_2}&base={target_commit_1}",
+            server.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(comments_resp.threads.len(), 1);
+    assert_eq!(comments_resp.threads[0].side, CommentSide::Old);
+    assert!(comments_resp.threads[0].resolved);
+    assert_eq!(
+        comments_resp.threads[0].comments,
+        vec!["nit on v1", "Fixed in v2"]
+    );
+
+    // Touch a working tree file and confirm WatchEvent::Reload(WorkingTree) arrives on `/api/watch`.
+    fs::write(root.join("src/main.rs"), "fn main() { /* edited */ }\n").unwrap();
+    let mut saw_working_reload = false;
+    let mut seen_events = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, watch_resp.chunk()).await {
+            Ok(Ok(Some(chunk))) => {
+                let events = extract_watch_events(&String::from_utf8_lossy(&chunk));
+                if events.contains(&WatchEvent::Reload {
+                    source: WatchSource::WorkingTree,
+                }) {
+                    saw_working_reload = true;
+                    break;
+                }
+                seen_events.extend(events);
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(err)) => panic!("watch stream read error: {err}"),
+            Err(_) => break,
+        }
+    }
+    assert!(
+        saw_working_reload,
+        "did not observe WorkingTree reload; seen events: {seen_events:?}"
+    );
+
+    drop(watch_resp);
+    server.shutdown();
+    server.wait().await.unwrap();
 }

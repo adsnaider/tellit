@@ -3,14 +3,21 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::str::FromStr;
 
-use tellit_types::{HeartbeatEvent, JjStatusResponse};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use tellit_types::{
+    ApiErrorResponse, ApproveCommitRequest, ApproveCommitResponse, HeartbeatEvent,
+    JjChangesResponse, JjCommentsResponse, JjCommitsResponse, JjDiffResponse, JjStatusResponse,
+    WatchEvent,
+};
 use thiserror::Error;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Event, EventSource, MessageEvent, Response};
+use web_sys::{Event, EventSource, Headers, MessageEvent, RequestInit, Response};
 
 /// Errors produced when communicating with the local `tellit` HTTP server.
 #[derive(Debug, Error)]
@@ -22,12 +29,12 @@ pub enum ApiError {
     #[error("network request failed: {0}")]
     Transport(String),
     /// Server responded with a non-success HTTP status code.
-    #[error("request failed with HTTP {status} {status_text}")]
+    #[error("{message} (HTTP {status})")]
     HttpStatus {
         /// Numeric HTTP status code.
         status: u16,
-        /// Status reason phrase reported by the browser response.
-        status_text: String,
+        /// Server-supplied error message or browser status text.
+        message: String,
     },
     /// Server response body was not valid JSON matching the expected type.
     #[error("invalid JSON response: {0}")]
@@ -42,27 +49,30 @@ fn format_js_error(value: &wasm_bindgen::JsValue) -> String {
         .unwrap_or_else(|| String::from("unknown browser error"))
 }
 
-/// Fetches `GET /api/jj/status` from the local `tellit` server.
-///
-/// # Errors
-///
-/// Returns [`ApiError`] if no browser window exists, the HTTP request fails,
-/// the server returns a non-2xx status, or the body fails JSON deserialization.
-pub async fn fetch_jj_status() -> Result<JjStatusResponse, ApiError> {
+fn encode_uri_component(raw: &str) -> String {
+    js_sys::encode_uri_component(raw)
+        .as_string()
+        .unwrap_or_else(|| String::from(raw))
+}
+
+async fn send_request<T: DeserializeOwned>(
+    url: &str,
+    init: Option<&RequestInit>,
+) -> Result<T, ApiError> {
     let window = web_sys::window().ok_or(ApiError::MissingWindow)?;
-    let resp_value = JsFuture::from(window.fetch_with_str("/api/jj/status"))
+    let promise = match init {
+        Some(opts) => window.fetch_with_str_and_init(url, opts),
+        None => window.fetch_with_str(url),
+    };
+    let resp_value = JsFuture::from(promise)
         .await
         .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
     let response: Response = resp_value
         .dyn_into()
         .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
 
-    if !response.ok() {
-        return Err(ApiError::HttpStatus {
-            status: response.status(),
-            status_text: response.status_text(),
-        });
-    }
+    let status = response.status();
+    let status_text = response.status_text();
 
     let text_promise = response
         .text()
@@ -72,22 +82,195 @@ pub async fn fetch_jj_status() -> Result<JjStatusResponse, ApiError> {
         .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
     let body = text_value.as_string().unwrap_or_default();
 
+    if !response.ok() {
+        let parsed_msg = serde_json::from_str::<ApiErrorResponse>(&body)
+            .ok()
+            .map(|e| e.error)
+            .filter(|s| !s.trim().is_empty());
+        let message = parsed_msg.unwrap_or_else(|| {
+            if status_text.is_empty() {
+                String::from("request failed")
+            } else {
+                status_text
+            }
+        });
+        return Err(ApiError::HttpStatus { status, message });
+    }
+
     Ok(serde_json::from_str(&body)?)
 }
 
-/// Active `EventSource` subscription to `GET /api/heartbeat` that closes cleanly on drop.
-pub struct HeartbeatSubscription {
+async fn fetch_json<T: DeserializeOwned>(url: &str) -> Result<T, ApiError> {
+    send_request(url, None).await
+}
+
+async fn post_json<Req: Serialize, Resp: DeserializeOwned>(
+    url: &str,
+    payload: &Req,
+) -> Result<Resp, ApiError> {
+    let json_body = serde_json::to_string(payload)?;
+    let headers = Headers::new().map_err(|err| ApiError::Transport(format_js_error(&err)))?;
+    headers
+        .set("Content-Type", "application/json")
+        .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
+
+    let init = RequestInit::new();
+    init.set_method("POST");
+    init.set_headers(&headers);
+    init.set_body(&wasm_bindgen::JsValue::from_str(&json_body));
+
+    send_request(url, Some(&init)).await
+}
+
+/// Fetches `GET /api/jj/status` from the local `tellit` server.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if no browser window exists, the HTTP request fails,
+/// the server returns a non-2xx status, or the body fails JSON deserialization.
+pub async fn fetch_jj_status() -> Result<JjStatusResponse, ApiError> {
+    fetch_json("/api/jj/status").await
+}
+
+/// Fetches `GET /api/jj/changes` (or `GET /api/jj/changes?query=...` when `query` is provided).
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if the HTTP request fails or the response JSON is invalid.
+pub async fn fetch_jj_changes(query: Option<&str>) -> Result<JjChangesResponse, ApiError> {
+    let url = match query.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(q) => alloc::format!("/api/jj/changes?query={}", encode_uri_component(q)),
+        None => String::from("/api/jj/changes"),
+    };
+    fetch_json(&url).await
+}
+
+/// Fetches `GET /api/jj/changes/{change_id}/commits` for a Jujutsu change.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if the HTTP request fails or the response JSON is invalid.
+pub async fn fetch_jj_commits(change_id: &str) -> Result<JjCommitsResponse, ApiError> {
+    let url = alloc::format!(
+        "/api/jj/changes/{}/commits",
+        encode_uri_component(change_id)
+    );
+    fetch_json(&url).await
+}
+
+/// Fetches `GET /api/jj/diff` for `target`, optionally compared against `base`.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if the HTTP request fails or the response JSON is invalid.
+pub async fn fetch_jj_diff(
+    target: &str,
+    base: Option<&str>,
+    ignore_rebase: bool,
+) -> Result<JjDiffResponse, ApiError> {
+    let mut params: Vec<String> = alloc::vec![
+        alloc::format!("target={}", encode_uri_component(target)),
+        alloc::format!("ignoreRebase={ignore_rebase}"),
+    ];
+    if let Some(base_ref) = normalize_interdiff_base(base, target) {
+        params.push(alloc::format!("base={}", encode_uri_component(base_ref)));
+    }
+    let url = alloc::format!("/api/jj/diff?{}", params.join("&"));
+    fetch_json(&url).await
+}
+
+/// Fetches `GET /api/jj/comments` for `target` and optional `base` commit.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if the HTTP request fails or the response JSON is invalid.
+pub async fn fetch_jj_comments(
+    target: &str,
+    base: Option<&str>,
+) -> Result<JjCommentsResponse, ApiError> {
+    let mut params: Vec<String> =
+        alloc::vec![alloc::format!("target={}", encode_uri_component(target))];
+    if let Some(base_ref) = normalize_interdiff_base(base, target) {
+        params.push(alloc::format!("base={}", encode_uri_component(base_ref)));
+    }
+    let url = alloc::format!("/api/jj/comments?{}", params.join("&"));
+    fetch_json(&url).await
+}
+
+/// Sends `POST /api/jj/approve` to approve or revoke approval on `commit_id`.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if the HTTP request fails or the response JSON is invalid.
+pub async fn post_jj_approve(
+    commit_id: &str,
+    disapprove: bool,
+) -> Result<ApproveCommitResponse, ApiError> {
+    let req = ApproveCommitRequest {
+        commit_id: String::from(commit_id),
+        disapprove,
+    };
+    post_json("/api/jj/approve", &req).await
+}
+
+fn normalize_interdiff_base<'a>(base: Option<&'a str>, target: &str) -> Option<&'a str> {
+    let trimmed = base.map(str::trim).filter(|s| !s.is_empty())?;
+    let trimmed_target = target.trim();
+    if trimmed == "parent"
+        || (!trimmed_target.is_empty()
+            && (trimmed == alloc::format!("{trimmed_target}^")
+                || trimmed == alloc::format!("{trimmed_target}-")))
+    {
+        return None;
+    }
+    Some(trimmed)
+}
+
+/// Active `EventSource` subscription that unregisters handlers and closes on drop.
+pub struct SseSubscription {
     source: EventSource,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
     _on_error: Closure<dyn FnMut(Event)>,
 }
 
-impl Drop for HeartbeatSubscription {
+impl Drop for SseSubscription {
     fn drop(&mut self) {
         self.source.set_onmessage(None);
         self.source.set_onerror(None);
         self.source.close();
     }
+}
+
+fn subscribe_sse(
+    url: &str,
+    mut on_payload: impl FnMut(&str) + 'static,
+    mut on_error_cb: impl FnMut(&EventSource) + 'static,
+) -> Result<SseSubscription, ApiError> {
+    if web_sys::window().is_none() {
+        return Err(ApiError::MissingWindow);
+    }
+
+    let source = EventSource::new(url).map_err(|err| ApiError::Transport(format_js_error(&err)))?;
+
+    let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |msg: MessageEvent| {
+        if let Some(payload) = msg.data().as_string() {
+            on_payload(&payload);
+        }
+    });
+
+    let error_source = source.clone();
+    let on_error = Closure::<dyn FnMut(Event)>::new(move |_err: Event| {
+        on_error_cb(&error_source);
+    });
+
+    source.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    source.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+
+    Ok(SseSubscription {
+        source,
+        _on_message: on_message,
+        _on_error: on_error,
+    })
 }
 
 /// Opens an `EventSource` connection to `/api/heartbeat` and invokes callbacks on state changes.
@@ -99,34 +282,41 @@ impl Drop for HeartbeatSubscription {
 pub fn subscribe_heartbeat(
     mut on_event: impl FnMut(HeartbeatEvent) + 'static,
     mut on_disconnect: impl FnMut() + 'static,
-) -> Result<HeartbeatSubscription, ApiError> {
-    if web_sys::window().is_none() {
-        return Err(ApiError::MissingWindow);
-    }
+) -> Result<SseSubscription, ApiError> {
+    subscribe_sse(
+        "/api/heartbeat",
+        move |payload| {
+            if let Ok(event) = HeartbeatEvent::from_str(payload) {
+                on_event(event);
+            }
+        },
+        move |source| {
+            source.close();
+            on_disconnect();
+        },
+    )
+}
 
-    let source = EventSource::new("/api/heartbeat")
-        .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
-
-    let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |msg: MessageEvent| {
-        if let Some(payload) = msg.data().as_string()
-            && let Ok(event) = HeartbeatEvent::from_str(&payload)
-        {
-            on_event(event);
-        }
-    });
-
-    let error_source = source.clone();
-    let on_error = Closure::<dyn FnMut(Event)>::new(move |_err: Event| {
-        error_source.close();
-        on_disconnect();
-    });
-
-    source.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    source.set_onerror(Some(on_error.as_ref().unchecked_ref()));
-
-    Ok(HeartbeatSubscription {
-        source,
-        _on_message: on_message,
-        _on_error: on_error,
-    })
+/// Opens an `EventSource` connection to `/api/watch` for live repository and comment updates.
+///
+/// # Errors
+///
+/// Returns [`ApiError::MissingWindow`] when running outside a browser window or
+/// [`ApiError::Transport`] if constructing the `EventSource` fails.
+pub fn subscribe_watch(
+    mut on_event: impl FnMut(WatchEvent) + 'static,
+    mut on_error: impl FnMut() + 'static,
+) -> Result<SseSubscription, ApiError> {
+    subscribe_sse(
+        "/api/watch",
+        move |payload| {
+            if let Ok(event) = serde_json::from_str::<WatchEvent>(payload) {
+                on_event(event);
+            }
+        },
+        move |_source| {
+            // Allow EventSource to reconnect automatically on transient drops while surfacing error state.
+            on_error();
+        },
+    )
 }

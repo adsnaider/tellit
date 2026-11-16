@@ -32,6 +32,8 @@ fn run_launch(launch: &LaunchArgs, store: Option<&Path>) -> anyhow::Result<()> {
     };
 
     let config = ServerConfig::new(repo_path)
+        .with_store_path(store.map(Path::to_path_buf))
+        .with_initial_revisions(launch.commit_ish.clone(), launch.compare_with.clone())
         .with_port(launch.port)
         .with_host(launch.host.as_deref())
         .with_keep_alive(launch.keep_alive || is_background_child)

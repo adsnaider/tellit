@@ -58,6 +58,7 @@
             rustfmt
             clippy
             nodejs
+            dprint
           ];
         };
       }

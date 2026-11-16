@@ -1,4 +1,12 @@
-import { type BaseMode, type DiffResponse, type JjChange, type JjGraphRow } from '../../types/diff';
+import {
+  type BaseMode,
+  type DiffResponse,
+  type GeneratedStatusResponse,
+  type JjChange,
+  type JjCommit,
+  type JjGraphRow,
+} from '../../types/diff';
+import { makeStandaloneCommitRow } from '../utils/jjGraph';
 
 export interface JjStatusResponse {
   isJj: boolean;
@@ -37,21 +45,21 @@ function isDiffResponse(value: unknown): value is DiffResponse {
   return isRecord(value) && typeof value.commit === 'string' && Array.isArray(value.files);
 }
 
+function isGeneratedStatusResponse(value: unknown): value is GeneratedStatusResponse {
+  return (
+    isRecord(value) &&
+    typeof value.path === 'string' &&
+    typeof value.ref === 'string' &&
+    typeof value.isGenerated === 'boolean' &&
+    (value.source === 'path' || value.source === 'content')
+  );
+}
+
 export function normalizeJjBaseCommitId(base?: string): string | undefined {
   if (!base || base === 'parent' || base.endsWith('^') || base.endsWith('-')) {
     return undefined;
   }
   return base;
-}
-
-function makeStandaloneCommitRow(change: JjChange): JjGraphRow {
-  return {
-    type: 'commit',
-    key: change.commitId,
-    graphCols: [change.isWorkingCopy ? '@' : change.isImmutable ? '◆' : '○'],
-    downCols: [],
-    change,
-  };
 }
 
 export async function readApiErrorMessage(res: Response, fallbackMessage: string): Promise<string> {
@@ -119,6 +127,52 @@ export async function fetchJjChanges(
   return { changes, graphRows };
 }
 
+export async function fetchJjCommitsForChange(
+  changeId: string,
+  signal?: AbortSignal,
+): Promise<JjCommit[]> {
+  const res = await fetch(
+    `/api/jj/changes/${encodeURIComponent(changeId)}/commits`,
+    signal ? { signal } : undefined,
+  );
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, 'Failed to fetch commits for change'));
+  }
+
+  const payload: unknown = await res.json();
+  if (!isRecord(payload) || !Array.isArray(payload.commits)) {
+    return [];
+  }
+  return payload.commits as JjCommit[];
+}
+
+export async function approveJjRevision(
+  commitId: string,
+  disapprove: boolean,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const res = await fetch('/api/jj/approve', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ commitId, disapprove }),
+    ...(signal ? { signal } : {}),
+  });
+  if (!res.ok) {
+    throw new Error(
+      await readApiErrorMessage(
+        res,
+        disapprove ? 'Failed to revoke approval' : 'Failed to approve revision',
+      ),
+    );
+  }
+
+  const payload: unknown = await res.json();
+  if (!isRecord(payload)) {
+    return !disapprove;
+  }
+  return typeof payload.approved === 'boolean' ? payload.approved : !disapprove;
+}
+
 export async function fetchDiff(options: FetchDiffOptions = {}): Promise<DiffResponse> {
   const params = new URLSearchParams({
     ignoreWhitespace: String(options.ignoreWhitespace ?? true),
@@ -171,6 +225,27 @@ export async function fetchJjDiff(options: FetchJjDiffOptions): Promise<DiffResp
   const payload: unknown = await res.json();
   if (!isDiffResponse(payload)) {
     throw new Error('Invalid diff response');
+  }
+  return payload;
+}
+
+export async function fetchGeneratedStatus(
+  filePath: string,
+  ref: string,
+  signal?: AbortSignal,
+): Promise<GeneratedStatusResponse> {
+  const encodedPath = encodeURIComponent(filePath);
+  const res = await fetch(
+    `/api/generated-status/${encodedPath}?ref=${encodeURIComponent(ref)}`,
+    signal ? { signal } : undefined,
+  );
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, 'Failed to fetch generated status'));
+  }
+
+  const payload: unknown = await res.json();
+  if (!isGeneratedStatusResponse(payload)) {
+    throw new Error('Invalid generated status response');
   }
   return payload;
 }

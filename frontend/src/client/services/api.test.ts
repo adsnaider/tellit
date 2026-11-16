@@ -1,8 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  approveJjRevision,
   fetchDiff,
+  fetchGeneratedStatus,
   fetchJjChanges,
+  fetchJjCommitsForChange,
   fetchJjDiff,
   fetchJjStatus,
   normalizeJjBaseCommitId,
@@ -75,7 +78,7 @@ describe('API client helpers', () => {
     });
   });
 
-  describe('fetchJjChanges', () => {
+  describe('fetchJjChanges and fetchJjCommitsForChange', () => {
     it('fetches changes and synthesizes fallback graphRows when omitted', async () => {
       const change = {
         changeId: 'kkmpptxz12345678',
@@ -107,12 +110,79 @@ describe('API client helpers', () => {
       ]);
     });
 
+    it('fetches commits for a change ID', async () => {
+      const commits = [
+        {
+          commitId: '335eb579f263bb',
+          shortCommitId: '335eb57',
+          timestamp: '2026-11-16 12:22:54',
+          description: 'Add dprint config',
+          isWorkingCopy: false,
+          commentCount: 0,
+          unresolvedCommentCount: 0,
+          approved: true,
+        },
+      ];
+      vi.mocked(global.fetch).mockResolvedValueOnce(
+        new Response(JSON.stringify({ commits }), { status: 200 }),
+      );
+
+      await expect(fetchJjCommitsForChange('ltppwqry')).resolves.toEqual(commits);
+      expect(global.fetch).toHaveBeenCalledWith('/api/jj/changes/ltppwqry/commits', undefined);
+    });
+
     it('throws server error message on failure', async () => {
       vi.mocked(global.fetch).mockResolvedValueOnce(
         new Response(JSON.stringify({ error: 'Invalid revset' }), { status: 500 }),
       );
 
       await expect(fetchJjChanges('bad()')).rejects.toThrow('Invalid revset');
+    });
+  });
+
+  describe('approveJjRevision and fetchGeneratedStatus', () => {
+    it('posts approval and revoke requests to /api/jj/approve', async () => {
+      vi.mocked(global.fetch)
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ success: true, approved: true }), { status: 200 }),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ error: 'Cannot approve' }), { status: 500 }),
+        );
+
+      await expect(approveJjRevision('335eb579f263bb', false)).resolves.toBe(true);
+      expect(global.fetch).toHaveBeenCalledWith('/api/jj/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ commitId: '335eb579f263bb', disapprove: false }),
+      });
+
+      await expect(approveJjRevision('335eb579f263bb', true)).rejects.toThrow('Cannot approve');
+    });
+
+    it('fetches and validates generated file status', async () => {
+      vi.mocked(global.fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            path: 'src/gen/api.pb.ts',
+            ref: 'HEAD',
+            isGenerated: true,
+            source: 'content',
+          }),
+          { status: 200 },
+        ),
+      );
+
+      await expect(fetchGeneratedStatus('src/gen/api.pb.ts', 'HEAD')).resolves.toEqual({
+        path: 'src/gen/api.pb.ts',
+        ref: 'HEAD',
+        isGenerated: true,
+        source: 'content',
+      });
+      expect(global.fetch).toHaveBeenCalledWith(
+        '/api/generated-status/src%2Fgen%2Fapi.pb.ts?ref=HEAD',
+        undefined,
+      );
     });
   });
 

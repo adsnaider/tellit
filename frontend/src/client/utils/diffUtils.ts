@@ -1,6 +1,34 @@
 import { type DiffFile } from '../../types/diff';
 export { getLanguageFromPath } from './languageDetection';
 
+export function formatStatusBadge(status: DiffFile['status']): {
+  label: string;
+  classes: string;
+} {
+  switch (status) {
+    case 'added':
+      return {
+        label: 'A',
+        classes: 'bg-green-500/15 text-green-400 border-green-500/30',
+      };
+    case 'deleted':
+      return {
+        label: 'D',
+        classes: 'bg-red-500/15 text-red-400 border-red-500/30',
+      };
+    case 'renamed':
+      return {
+        label: 'R',
+        classes: 'bg-yellow-500/15 text-yellow-400 border-yellow-500/30',
+      };
+    case 'modified':
+      return {
+        label: 'M',
+        classes: 'bg-blue-500/15 text-blue-400 border-blue-500/30',
+      };
+  }
+}
+
 /**
  * Generate SHA-256 hash of diff content
  */

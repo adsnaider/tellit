@@ -1,4 +1,9 @@
-import { type JjChange } from '../../types/diff';
+import { type JjChange, type JjCommit } from '../../types/diff';
+
+export interface IndexedJjCommit {
+  commit: JjCommit;
+  commitNumber: number;
+}
 
 export function commitIdsMatch(a?: string, b?: string): boolean {
   if (!a || !b) return false;
@@ -67,4 +72,36 @@ export function pickInitialChange(
   }
 
   return changes.find((c) => !isEmptyUndescribedChange(c)) ?? changes[0];
+}
+
+export function isInterestingCommit(
+  commit: JjCommit,
+  options: { isLatest: boolean; targetCommitId?: string; baseCommitId?: string },
+): boolean {
+  if (options.isLatest) return true;
+  if (Boolean(commit.approved) || commit.commentCount > 0) return true;
+  if (commitIdsMatch(commit.commitId, options.targetCommitId)) return true;
+  return (
+    Boolean(options.baseCommitId) &&
+    options.baseCommitId !== 'parent' &&
+    commitIdsMatch(commit.commitId, options.baseCommitId)
+  );
+}
+
+export function filterInterestingCommits(
+  commits: JjCommit[],
+  options: { targetCommitId?: string; baseCommitId?: string } = {},
+): IndexedJjCommit[] {
+  const { targetCommitId, baseCommitId } = options;
+  return commits
+    .map((commit, originalIndex) => ({
+      commit,
+      commitNumber: originalIndex + 1,
+      isLatest: originalIndex === commits.length - 1,
+    }))
+    .filter(({ commit, isLatest }) =>
+      isInterestingCommit(commit, { isLatest, targetCommitId, baseCommitId }),
+    )
+    .map(({ commit, commitNumber }) => ({ commit, commitNumber }))
+    .reverse();
 }

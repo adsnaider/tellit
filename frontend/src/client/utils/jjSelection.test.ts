@@ -1,8 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
-import type { JjChange } from '../../types/diff';
+import type { JjChange, JjCommit } from '../../types/diff';
 
-import { commitIdsMatch, isEmptyUndescribedChange, pickInitialChange } from './jjSelection';
+import {
+  commitIdsMatch,
+  filterInterestingCommits,
+  isEmptyUndescribedChange,
+  pickInitialChange,
+} from './jjSelection';
 
 function makeChange(
   overrides: Partial<JjChange> & Pick<JjChange, 'changeId' | 'commitId'>,
@@ -15,6 +20,18 @@ function makeChange(
     hasDescription: true,
     timestamp: '2026-11-16 15:00:00',
     description: 'change',
+    commentCount: 0,
+    unresolvedCommentCount: 0,
+    ...overrides,
+  };
+}
+
+function makeCommit(overrides: Partial<JjCommit> & Pick<JjCommit, 'commitId'>): JjCommit {
+  return {
+    shortCommitId: overrides.commitId.slice(0, 7),
+    timestamp: '2026-11-16 15:00:00',
+    description: 'commit',
+    isWorkingCopy: false,
     commentCount: 0,
     unresolvedCommentCount: 0,
     ...overrides,
@@ -74,5 +91,22 @@ describe('jjSelection helpers', () => {
     });
 
     expect(pickInitialChange([first, second], '2222222')).toEqual(second);
+  });
+
+  it('filters unreviewed intermediate commits while keeping reviewed, selected, and latest commits', () => {
+    const commits: JjCommit[] = [
+      makeCommit({ commitId: '11111111aaaa', approved: true }),
+      makeCommit({ commitId: '22222222bbbb' }),
+      makeCommit({ commitId: '33333333cccc', commentCount: 2 }),
+      makeCommit({ commitId: '44444444dddd' }),
+      makeCommit({ commitId: '55555555eeee' }),
+    ];
+
+    const filtered = filterInterestingCommits(commits, {
+      baseCommitId: '4444444',
+      targetCommitId: '5555555',
+    });
+
+    expect(filtered.map((item) => item.commitNumber)).toEqual([5, 4, 3, 1]);
   });
 });

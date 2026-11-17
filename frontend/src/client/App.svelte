@@ -1,28 +1,51 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { SvelteSet } from 'svelte/reactivity';
 
+  import CommentsDrawer from './components/CommentsDrawer.svelte';
   import FileList from './components/FileList.svelte';
   import JjRevisionSelector from './components/JjRevisionSelector.svelte';
   import JjRevisionTree from './components/JjRevisionTree.svelte';
+  import TextDiffViewer from './components/TextDiffViewer.svelte';
   import {
+    type CommentThread,
+    type DiffCommentThread,
     type DiffFile,
     type DiffResponse,
+    type DiffSide,
+    type DiffViewMode,
+    type ExpandedLinesState,
+    type FileExpandedState,
     type JjChange,
     type JjCommit,
     type JjGraphRow,
+    type LineNumber,
+    type MergedChunk,
     type ViewedFileRecord,
   } from '../types/diff';
+  import { createId } from '../utils/createId';
+  import { DEFAULT_DIFF_VIEW_MODE, normalizeDiffViewMode } from '../utils/diffMode';
+  import { normalizeBaseMode } from '../utils/diffSelection';
+  import { DEFAULT_EDITOR_OPTION, resolveEditorOption } from '../utils/editorOptions';
   import {
+    addJjComment,
     approveJjRevision,
     fetchDiff,
+    fetchFileBlobText,
     fetchGeneratedStatus,
     fetchJjChanges,
+    fetchJjComments,
     fetchJjCommitsForChange,
     fetchJjDiff,
     fetchJjStatus,
+    fetchLineCount,
+    normalizeJjBaseCommitId,
+    openInEditor,
+    replyJjComment,
+    resolveJjComment,
   } from './services/api';
-  import { fetchClientSettings } from './services/userSettings';
+  import { storageService } from './services/StorageService';
+  import { fetchClientSettings, saveClientSettings } from './services/userSettings';
   import {
     APPEARANCE_STORAGE_KEY,
     applyResolvedTheme,
@@ -32,19 +55,99 @@
     type ThemePreference,
   } from './utils/appearanceTheme';
   import { normalizeAutoViewedPatterns } from './utils/autoViewedPatterns';
+  import { copyTextToClipboard } from './utils/clipboard';
+  import { hasMultipleCommentAuthors } from './utils/commentAuthors';
   import { formatStatusBadge } from './utils/diffUtils';
   import { getFileElementId } from './utils/domUtils';
+  import {
+    addExpandRange,
+    consolidateBetweenChunkRanges,
+    DEFAULT_EXPAND_COUNT,
+    getMergedChunksForFile,
+    isExpandableFile,
+    splitBlobLines,
+  } from './utils/expandedLines';
   import { makeStandaloneCommitRow } from './utils/jjGraph';
   import { commitIdsMatch, pickInitialChange } from './utils/jjSelection';
   import { connectLiveWatch } from './utils/liveWatch';
+  import { buildFileLineIndex, type FileLineIndex, isThreadOutdated } from './utils/outdatedComments';
+  import { getFallbackSyntaxTheme, isSyntaxThemeForResolvedTheme } from './utils/themeLoader';
   import {
     hydrateViewedState,
     setMultipleFilesViewed,
     toggleSingleFileViewed,
     type ViewedContextParams,
   } from './utils/viewedState';
+  import { createWordHighlightHandlers, setWordHighlightContext } from './utils/wordHighlight';
 
   const SIDEBAR_OPEN_STORAGE_KEY = 'difit.sidebarOpen';
+  const DIFF_VIEW_MODE_STORAGE_KEY = 'difit.diffViewMode';
+  const SHOW_RESOLVED_INLINE_STORAGE_KEY = 'tellit.showResolvedInline';
+  const EDITOR_SETTINGS_STORAGE_KEY = 'difit.editor';
+
+  interface EditorPreference {
+    id: string;
+    command: string;
+    argsTemplate: string;
+  }
+
+  function getInitialDiffViewMode(): DiffViewMode {
+    if (typeof window === 'undefined') return DEFAULT_DIFF_VIEW_MODE;
+    try {
+      const stored = window.localStorage.getItem(DIFF_VIEW_MODE_STORAGE_KEY);
+      if (stored) return normalizeDiffViewMode(stored);
+    } catch {
+      // Ignore storage access errors.
+    }
+    return DEFAULT_DIFF_VIEW_MODE;
+  }
+
+  function getInitialShowResolvedInline(): boolean {
+    if (typeof window === 'undefined') return true;
+    try {
+      const stored = window.localStorage.getItem(SHOW_RESOLVED_INLINE_STORAGE_KEY);
+      return stored === null ? true : stored === 'true';
+    } catch {
+      return true;
+    }
+  }
+
+  function getInitialEditorPreference(): EditorPreference {
+    if (typeof window !== 'undefined') {
+      try {
+        const raw = window.localStorage.getItem(EDITOR_SETTINGS_STORAGE_KEY);
+        if (raw) {
+          const parsed: unknown = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            const candidate = parsed as Partial<EditorPreference>;
+            if (typeof candidate.id === 'string') {
+              const preset = resolveEditorOption(candidate.id);
+              return {
+                id: candidate.id,
+                command: typeof candidate.command === 'string' ? candidate.command : preset.command,
+                argsTemplate:
+                  typeof candidate.argsTemplate === 'string'
+                    ? candidate.argsTemplate
+                    : preset.argsTemplate,
+              };
+            }
+          }
+        }
+      } catch {
+        // Fall back to default editor preset.
+      }
+    }
+    return {
+      id: DEFAULT_EDITOR_OPTION.id,
+      command: DEFAULT_EDITOR_OPTION.command,
+      argsTemplate: DEFAULT_EDITOR_OPTION.argsTemplate,
+    };
+  }
+
+  function getInitialSyntaxTheme(theme: ThemePreference): string {
+    const resolved = resolveThemePreference(theme);
+    return getFallbackSyntaxTheme(resolved)?.id ?? (resolved === 'light' ? 'github' : 'vsDark');
+  }
 
   function getInitialSidebarOpen(): boolean {
     if (typeof window === 'undefined') return true;
@@ -137,9 +240,12 @@
 
   let diffData = $state<DiffResponse | null>(null);
   let ignoreWhitespace = $state(true);
+  let diffMode = $state<DiffViewMode>(getInitialDiffViewMode());
   let sidebarOpen = $state(getInitialSidebarOpen());
   let themePreference = $state<ThemePreference>(getInitialThemePreference());
   let colorVision = $state<ColorVisionMode>(getInitialColorVision());
+  let syntaxTheme = $state<string>(getInitialSyntaxTheme(getInitialThemePreference()));
+  let editorSetting = $state<EditorPreference>(getInitialEditorPreference());
 
   let revQueryError = $state<string | null>(null);
   let watchReloadPending = $state(false);
@@ -153,11 +259,43 @@
   let manuallyToggledPaths = new SvelteSet<string>();
   let fileHashesByPath = new Map<string, string>();
 
+  let expandedStateByFile = $state<ExpandedLinesState>({});
+  let isExpandLoading = $state(false);
+  const pendingExpandedFetches = new Map<string, Promise<FileExpandedState | null>>();
+  const prefetchedLineCountKeys = new Set<string>();
+
+  let rawThreads = $state<DiffCommentThread[]>([]);
+  let showResolvedInline = $state(getInitialShowResolvedInline());
+  let commentsDrawerOpen = $state(false);
+  let activeWholeFileCommentPath = $state<string | null>(null);
+  let highlightedThreadId = $state<string | null>(null);
+  let copiedFilePath = $state<string | null>(null);
+  let commentError = $state<string | null>(null);
+
+  let hoveredWord = $state<string | null>(null);
+  let pinnedWord = $state<string | null>(null);
+
   let activeRequestController: AbortController | null = null;
   let activeRequestId = 0;
+  let activeCommentsController: AbortController | null = null;
+  let activeCommentsRequestId = 0;
   let activeGeneratedController: AbortController | null = null;
   let diffRevisionId = 0;
   let viewedMutationChain: Promise<void> = Promise.resolve();
+  let highlightResetTimer: ReturnType<typeof setTimeout> | null = null;
+  let copiedFilePathTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const wordHighlightHandlers = createWordHighlightHandlers({
+    getEffectiveWord: () => pinnedWord ?? hoveredWord,
+    getPinnedWord: () => pinnedWord,
+    setHoveredWord: (word) => {
+      hoveredWord = word;
+    },
+    setPinnedWord: (word) => {
+      pinnedWord = word;
+    },
+  });
+  setWordHighlightContext(wordHighlightHandlers);
 
   function enqueueViewedMutation(task: () => Promise<void>): Promise<void> {
     const next = viewedMutationChain.then(task, task);
@@ -191,9 +329,80 @@
     diffData?.files.reduce((sum, file) => sum + file.deletions, 0) ?? 0,
   );
 
+  const mergedChunksByFile = $derived.by(() => {
+    const map = new Map<string, MergedChunk[]>();
+    if (!diffData) return map;
+    for (const file of diffData.files) {
+      map.set(file.path, getMergedChunksForFile(file, expandedStateByFile[file.path]));
+    }
+    return map;
+  });
+
+  const fileLineIndexByPath = $derived.by(() => {
+    const map = new Map<string, FileLineIndex>();
+    if (!diffData) return map;
+    for (const file of diffData.files) {
+      const mergedChunks = mergedChunksByFile.get(file.path) ?? file.chunks;
+      map.set(file.path, buildFileLineIndex({ ...file, chunks: mergedChunks }));
+    }
+    return map;
+  });
+
+  const normalizedThreads = $derived.by<CommentThread[]>(() =>
+    rawThreads.map((thread) => ({
+      id: thread.id,
+      file: thread.filePath,
+      line:
+        typeof thread.position.line === 'number'
+          ? thread.position.line
+          : ([thread.position.line.start, thread.position.line.end] as [number, number]),
+      side: thread.position.side,
+      createdAt: thread.createdAt,
+      updatedAt: thread.updatedAt,
+      codeContent: thread.codeSnapshot?.content,
+      isOutdated: isThreadOutdated(thread, fileLineIndexByPath.get(thread.filePath)),
+      messages: thread.messages,
+      resolved: thread.resolved,
+    })),
+  );
+
+  const showAuthorBadges = $derived(
+    hasMultipleCommentAuthors(normalizedThreads.flatMap((thread) => thread.messages)),
+  );
+
+  const unresolvedCommentCount = $derived(
+    normalizedThreads.filter((thread) => !thread.resolved).length,
+  );
+
+  const threadsByFile = $derived.by(() => {
+    const map = new Map<string, CommentThread[]>();
+    for (const thread of normalizedThreads) {
+      if (!showResolvedInline && thread.resolved) {
+        continue;
+      }
+      const list = map.get(thread.file);
+      if (list) {
+        list.push(thread);
+      } else {
+        map.set(thread.file, [thread]);
+      }
+    }
+    return map;
+  });
+
+  const openInEditorAvailable = $derived(
+    diffData?.openInEditorAvailable !== false &&
+      editorSetting.id !== 'none' &&
+      editorSetting.command.trim() !== '' &&
+      editorSetting.argsTemplate.trim() !== '',
+  );
+
   $effect(() => {
     const resolved = resolveThemePreference(themePreference);
     applyResolvedTheme(resolved, colorVision);
+    if (!isSyntaxThemeForResolvedTheme(syntaxTheme, resolved)) {
+      syntaxTheme = getFallbackSyntaxTheme(resolved)?.id ?? syntaxTheme;
+    }
 
     if (themePreference !== 'auto' || typeof window === 'undefined') {
       return;
@@ -201,7 +410,11 @@
 
     const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
     const handleMediaChange = (event: MediaQueryListEvent) => {
-      applyResolvedTheme(event.matches ? 'dark' : 'light', colorVision);
+      const nextResolved = event.matches ? 'dark' : 'light';
+      applyResolvedTheme(nextResolved, colorVision);
+      if (!isSyntaxThemeForResolvedTheme(syntaxTheme, nextResolved)) {
+        syntaxTheme = getFallbackSyntaxTheme(nextResolved)?.id ?? syntaxTheme;
+      }
     };
     mediaQuery.addEventListener('change', handleMediaChange);
     return () => {
@@ -218,6 +431,45 @@
     }
   });
 
+  $effect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem(SHOW_RESOLVED_INLINE_STORAGE_KEY, String(showResolvedInline));
+    } catch {
+      // Ignore storage access errors.
+    }
+  });
+
+  async function loadJjCommentsForSelection(
+    targetCommit: string,
+    baseCommit?: string,
+    rethrowOnError = false,
+  ): Promise<void> {
+    if (!targetCommit || targetCommit === 'stdin') {
+      rawThreads = [];
+      return;
+    }
+
+    activeCommentsController?.abort();
+    const controller = new AbortController();
+    activeCommentsController = controller;
+    const reqId = ++activeCommentsRequestId;
+
+    try {
+      const threads = await fetchJjComments(targetCommit, baseCommit, controller.signal);
+      if (controller.signal.aborted || reqId !== activeCommentsRequestId) return;
+      rawThreads = threads;
+    } catch (err) {
+      if (isAbortError(err) || controller.signal.aborted || reqId !== activeCommentsRequestId) {
+        return;
+      }
+      if (rethrowOnError) {
+        throw err;
+      }
+      // Keep UI responsive if comment fetch fails on initial or background reload.
+    }
+  }
+
   function applyDiffResponse(nextDiff: DiffResponse) {
     diffData = nextDiff;
     const revisionId = ++diffRevisionId;
@@ -232,6 +484,15 @@
     fileHashesByPath = new Map();
     viewedFiles.clear();
     changedSinceViewedFiles.clear();
+    expandedStateByFile = {};
+    isExpandLoading = false;
+    pendingExpandedFetches.clear();
+    prefetchedLineCountKeys.clear();
+    activeWholeFileCommentPath = null;
+    highlightedThreadId = null;
+    commentError = null;
+    pinnedWord = null;
+
     for (const file of nextDiff.files) {
       if (file.isGenerated) {
         collapsedFiles.add(file.path);
@@ -242,6 +503,22 @@
     const isStdin =
       nextDiff.targetCommitish === 'stdin' || nextDiff.baseCommitish === 'stdin';
     const ref = nextDiff.targetCommitish || 'HEAD';
+
+    if (isJjRepo && !isStdin) {
+      rawThreads = [];
+      const targetCommit = jjTargetCommitId || nextDiff.targetCommitish || nextDiff.commit;
+      void loadJjCommentsForSelection(targetCommit, jjBaseCommitId);
+    } else {
+      activeCommentsController?.abort();
+      rawThreads = storageService.getCommentThreads(
+        context.baseCommitish,
+        context.targetCommitish,
+        context.currentCommitHash,
+        undefined,
+        context.repositoryId,
+        context.baseMode,
+      );
+    }
 
     void enqueueViewedMutation(async () => {
       if (genController.signal.aborted || revisionId !== diffRevisionId) return;
@@ -335,6 +612,35 @@
 
       if (clientSettings) {
         autoViewedPatterns = normalizeAutoViewedPatterns(clientSettings.autoViewedPatterns);
+        if (typeof clientSettings.diffViewMode === 'string') {
+          let hasLocalDiffMode = false;
+          try {
+            hasLocalDiffMode = Boolean(window.localStorage.getItem(DIFF_VIEW_MODE_STORAGE_KEY));
+          } catch {
+            // Ignore storage errors.
+          }
+          if (!hasLocalDiffMode) {
+            diffMode = normalizeDiffViewMode(clientSettings.diffViewMode);
+          }
+        }
+        if (
+          clientSettings.editor &&
+          typeof clientSettings.editor === 'object' &&
+          !Array.isArray(clientSettings.editor)
+        ) {
+          const candidate = clientSettings.editor as Partial<EditorPreference>;
+          if (typeof candidate.id === 'string') {
+            const preset = resolveEditorOption(candidate.id);
+            editorSetting = {
+              id: candidate.id,
+              command: typeof candidate.command === 'string' ? candidate.command : preset.command,
+              argsTemplate:
+                typeof candidate.argsTemplate === 'string'
+                  ? candidate.argsTemplate
+                  : preset.argsTemplate,
+            };
+          }
+        }
       }
 
       const isStdinDiff =
@@ -487,6 +793,15 @@
     }
   }
 
+  function refreshJjCommentsInBackground() {
+    if (!isJjRepo || !diffData) return;
+    const isStdin =
+      diffData.targetCommitish === 'stdin' || diffData.baseCommitish === 'stdin';
+    if (isStdin) return;
+    const targetCommit = jjTargetCommitId || diffData.targetCommitish || diffData.commit;
+    void loadJjCommentsForSelection(targetCommit, jjBaseCommitId);
+  }
+
   onMount(() => {
     const { signal, requestId } = startNewRequest();
     void bootstrapApp(signal, requestId);
@@ -497,13 +812,18 @@
       },
       onCommentsChanged: () => {
         void refreshJjMetadataInBackground();
+        refreshJjCommentsInBackground();
       },
     });
 
     return () => {
       disconnectLiveWatch();
       activeRequestController?.abort();
+      activeCommentsController?.abort();
       activeGeneratedController?.abort();
+      wordHighlightHandlers.dispose();
+      if (highlightResetTimer) clearTimeout(highlightResetTimer);
+      if (copiedFilePathTimer) clearTimeout(copiedFilePathTimer);
     };
   });
 
@@ -805,9 +1125,368 @@
     });
   }
 
+  function handleDiffModeChange(nextMode: DiffViewMode) {
+    diffMode = nextMode;
+    if (typeof window !== 'undefined') {
+      try {
+        window.localStorage.setItem(DIFF_VIEW_MODE_STORAGE_KEY, nextMode);
+      } catch {
+        // Ignore storage errors.
+      }
+    }
+    saveClientSettings({ diffViewMode: nextMode });
+  }
+
   function handleThemeChange(nextTheme: ThemePreference) {
     themePreference = nextTheme;
     persistThemePreference(nextTheme);
+  }
+
+  async function ensureExpandedFileContent(
+    file: DiffFile,
+    revisionIdSnapshot: number,
+  ): Promise<FileExpandedState | null> {
+    if (!diffData || !isExpandableFile(file)) return null;
+    const baseRef = diffData.baseCommitish;
+    const targetRef = diffData.targetCommitish;
+    if (baseRef === 'stdin' || targetRef === 'stdin') return null;
+
+    const existing = expandedStateByFile[file.path];
+    if (existing?.oldContent && existing?.newContent) {
+      return existing;
+    }
+
+    const pendingKey = `${revisionIdSnapshot}:${file.path}`;
+    const inFlight = pendingExpandedFetches.get(pendingKey);
+    if (inFlight) return inFlight;
+
+    const promise = (async (): Promise<FileExpandedState | null> => {
+      const nextState: FileExpandedState = {
+        ...existing,
+        expandedRanges: existing?.expandedRanges ?? [],
+      };
+
+      if (file.status !== 'added' && baseRef) {
+        try {
+          const text = await fetchFileBlobText(file.oldPath || file.path, baseRef);
+          if (revisionIdSnapshot !== diffRevisionId) return null;
+          const lines = splitBlobLines(text);
+          nextState.oldContent = lines;
+          nextState.oldTotalLines = lines.length;
+        } catch {
+          nextState.oldContent = [];
+          nextState.oldTotalLines = 0;
+        }
+      }
+
+      if (file.status !== 'deleted' && targetRef) {
+        try {
+          const text = await fetchFileBlobText(file.path, targetRef);
+          if (revisionIdSnapshot !== diffRevisionId) return null;
+          const lines = splitBlobLines(text);
+          nextState.newContent = lines;
+          nextState.newTotalLines = lines.length;
+        } catch {
+          nextState.newContent = [];
+          nextState.newTotalLines = 0;
+        }
+      }
+
+      return nextState;
+    })();
+
+    pendingExpandedFetches.set(pendingKey, promise);
+    try {
+      return await promise;
+    } finally {
+      pendingExpandedFetches.delete(pendingKey);
+    }
+  }
+
+  function handlePrefetchLineCount(file: DiffFile) {
+    if (!diffData || !isExpandableFile(file)) return;
+    const baseRef = diffData.baseCommitish;
+    const targetRef = diffData.targetCommitish;
+    if (baseRef === 'stdin' || targetRef === 'stdin') return;
+
+    const existing = expandedStateByFile[file.path];
+    if (existing?.oldTotalLines !== undefined || existing?.newTotalLines !== undefined) return;
+
+    const revisionIdSnapshot = diffRevisionId;
+    const key = `${revisionIdSnapshot}:${file.path}`;
+    if (prefetchedLineCountKeys.has(key)) return;
+    prefetchedLineCountKeys.add(key);
+
+    const oldRef = file.status !== 'added' ? baseRef : undefined;
+    const newRef = file.status !== 'deleted' ? targetRef : undefined;
+    if (!oldRef && !newRef) return;
+
+    void fetchLineCount(file.path, oldRef, newRef, file.oldPath)
+      .then((counts) => {
+        if (revisionIdSnapshot !== diffRevisionId) return;
+        const current = expandedStateByFile[file.path];
+        if (current?.oldTotalLines !== undefined || current?.newTotalLines !== undefined) return;
+        expandedStateByFile = {
+          ...expandedStateByFile,
+          [file.path]: {
+            ...current,
+            expandedRanges: current?.expandedRanges ?? [],
+            oldTotalLines: counts.oldLineCount,
+            newTotalLines: counts.newLineCount,
+          },
+        };
+      })
+      .catch(() => {
+        // Ignore prefetch line-count failures and allow manual expand.
+      });
+  }
+
+  async function handleExpandLines(
+    file: DiffFile,
+    chunkIndex: number,
+    direction: 'up' | 'down',
+    count: number = DEFAULT_EXPAND_COUNT,
+  ) {
+    const revisionIdSnapshot = diffRevisionId;
+    isExpandLoading = true;
+    try {
+      const loaded = await ensureExpandedFileContent(file, revisionIdSnapshot);
+      if (!loaded || revisionIdSnapshot !== diffRevisionId) return;
+      const current = expandedStateByFile[file.path];
+      const currentRanges = current?.expandedRanges ?? loaded.expandedRanges;
+      expandedStateByFile = {
+        ...expandedStateByFile,
+        [file.path]: {
+          oldContent: current?.oldContent ?? loaded.oldContent,
+          newContent: current?.newContent ?? loaded.newContent,
+          oldTotalLines: current?.oldTotalLines ?? loaded.oldTotalLines,
+          newTotalLines: current?.newTotalLines ?? loaded.newTotalLines,
+          expandedRanges: addExpandRange(currentRanges, chunkIndex, direction, count),
+        },
+      };
+    } finally {
+      if (revisionIdSnapshot === diffRevisionId) {
+        isExpandLoading = false;
+      }
+    }
+  }
+
+  async function handleExpandAllBetween(file: DiffFile, chunkIndex: number, hiddenLines: number) {
+    const revisionIdSnapshot = diffRevisionId;
+    isExpandLoading = true;
+    try {
+      const loaded = await ensureExpandedFileContent(file, revisionIdSnapshot);
+      if (!loaded || revisionIdSnapshot !== diffRevisionId) return;
+      const current = expandedStateByFile[file.path];
+      const currentRanges = current?.expandedRanges ?? loaded.expandedRanges;
+      expandedStateByFile = {
+        ...expandedStateByFile,
+        [file.path]: {
+          oldContent: current?.oldContent ?? loaded.oldContent,
+          newContent: current?.newContent ?? loaded.newContent,
+          oldTotalLines: current?.oldTotalLines ?? loaded.oldTotalLines,
+          newTotalLines: current?.newTotalLines ?? loaded.newTotalLines,
+          expandedRanges: consolidateBetweenChunkRanges(currentRanges, chunkIndex, hiddenLines),
+        },
+      };
+    } finally {
+      if (revisionIdSnapshot === diffRevisionId) {
+        isExpandLoading = false;
+      }
+    }
+  }
+
+  function persistNonJjThreads(nextThreads: DiffCommentThread[]) {
+    rawThreads = nextThreads;
+    if (!diffData) return;
+    const context = buildViewedContext(diffData);
+    storageService.saveCommentThreads(
+      context.baseCommitish,
+      context.targetCommitish,
+      nextThreads,
+      context.currentCommitHash,
+      undefined,
+      context.repositoryId,
+      context.baseMode,
+    );
+  }
+
+  async function handleAddComment(
+    filePath: string,
+    line: LineNumber | undefined,
+    body: string,
+    codeContent?: string,
+    side?: DiffSide,
+  ) {
+    if (isJjRepo && diffData) {
+      const normalizedBase = normalizeJjBaseCommitId(jjBaseCommitId);
+      const targetCommit =
+        side === 'old' && normalizedBase
+          ? normalizedBase
+          : jjTargetCommitId || diffData.targetCommitish || diffData.commit;
+      try {
+        await addJjComment({
+          commitId: targetCommit,
+          filePath,
+          line:
+            typeof line === 'number'
+              ? line
+              : Array.isArray(line)
+                ? { start: line[0], end: line[1] }
+                : undefined,
+          content: body,
+        });
+        commentError = null;
+        const activeTarget = jjTargetCommitId || diffData.targetCommitish || diffData.commit;
+        await loadJjCommentsForSelection(activeTarget, jjBaseCommitId);
+        void refreshJjMetadataInBackground();
+      } catch (err) {
+        const msg = err instanceof Error && err.message ? err.message : 'Failed to add comment';
+        commentError = msg;
+        throw new Error(msg, { cause: err });
+      }
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const id = createId();
+    const positionLine =
+      typeof line === 'number' ? line : Array.isArray(line) ? { start: line[0], end: line[1] } : 1;
+    const nextThread: DiffCommentThread = {
+      id,
+      filePath,
+      createdAt: now,
+      updatedAt: now,
+      position: { side: side ?? 'new', line: positionLine },
+      codeSnapshot: codeContent !== undefined ? { content: codeContent } : undefined,
+      messages: [{ id, body, author: 'User', createdAt: now, updatedAt: now }],
+    };
+    persistNonJjThreads([...rawThreads, nextThread]);
+  }
+
+  async function handleReplyToThread(threadId: string, body: string) {
+    if (isJjRepo && diffData) {
+      try {
+        await replyJjComment(threadId, body);
+        commentError = null;
+        const activeTarget = jjTargetCommitId || diffData.targetCommitish || diffData.commit;
+        await loadJjCommentsForSelection(activeTarget, jjBaseCommitId);
+        void refreshJjMetadataInBackground();
+      } catch (err) {
+        const msg =
+          err instanceof Error && err.message ? err.message : 'Failed to reply to comment';
+        commentError = msg;
+        throw new Error(msg, { cause: err });
+      }
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const nextThreads = rawThreads.map((thread) =>
+      thread.id === threadId
+        ? {
+            ...thread,
+            updatedAt: now,
+            messages: [
+              ...thread.messages,
+              { id: createId(), body, author: 'User', createdAt: now, updatedAt: now },
+            ],
+          }
+        : thread,
+    );
+    persistNonJjThreads(nextThreads);
+  }
+
+  async function handleToggleResolve(threadId: string, currentResolved: boolean) {
+    if (isJjRepo && diffData) {
+      try {
+        await resolveJjComment(threadId, currentResolved);
+        commentError = null;
+        const activeTarget = jjTargetCommitId || diffData.targetCommitish || diffData.commit;
+        await loadJjCommentsForSelection(activeTarget, jjBaseCommitId);
+        void refreshJjMetadataInBackground();
+      } catch (err) {
+        const msg =
+          err instanceof Error && err.message
+            ? err.message
+            : currentResolved
+              ? 'Failed to reopen comment'
+              : 'Failed to resolve comment';
+        commentError = msg;
+        throw new Error(msg, { cause: err });
+      }
+      return;
+    }
+
+    const nextThreads = rawThreads.map((thread) =>
+      thread.id === threadId
+        ? { ...thread, resolved: !currentResolved, updatedAt: new Date().toISOString() }
+        : thread,
+    );
+    persistNonJjThreads(nextThreads);
+  }
+
+  function handleRemoveThread(threadId: string) {
+    if (isJjRepo) return;
+    persistNonJjThreads(rawThreads.filter((thread) => thread.id !== threadId));
+  }
+
+  async function handleOpenInEditor(filePath: string, lineNumber: number) {
+    if (filePath === 'Commit Message') return;
+    try {
+      await openInEditor({ filePath, line: lineNumber, editor: editorSetting });
+      commentError = null;
+    } catch (err) {
+      commentError = err instanceof Error ? err.message : 'Failed to open file in editor';
+    }
+  }
+
+  async function handleCopyFilePath(filePath: string) {
+    try {
+      await copyTextToClipboard(filePath);
+      if (copiedFilePathTimer) clearTimeout(copiedFilePathTimer);
+      copiedFilePath = filePath;
+      copiedFilePathTimer = setTimeout(() => {
+        if (copiedFilePath === filePath) {
+          copiedFilePath = null;
+        }
+        copiedFilePathTimer = null;
+      }, 2000);
+    } catch (err) {
+      commentError = err instanceof Error ? err.message : 'Failed to copy file path';
+    }
+  }
+
+  function openWholeFileComment(filePath: string) {
+    if (collapsedFiles.has(filePath)) {
+      manuallyToggledPaths.add(filePath);
+      collapsedFiles.delete(filePath);
+    }
+    activeWholeFileCommentPath = activeWholeFileCommentPath === filePath ? null : filePath;
+  }
+
+  async function handleNavigateToThread(thread: CommentThread) {
+    if (!showResolvedInline && thread.resolved) {
+      showResolvedInline = true;
+    }
+    if (collapsedFiles.has(thread.file)) {
+      manuallyToggledPaths.add(thread.file);
+      collapsedFiles.delete(thread.file);
+    }
+    highlightedThreadId = thread.id;
+    if (highlightResetTimer) clearTimeout(highlightResetTimer);
+    highlightResetTimer = setTimeout(() => {
+      highlightedThreadId = null;
+      highlightResetTimer = null;
+    }, 2000);
+
+    await tick();
+    const threadEl = document.getElementById(`comment-thread-${thread.id}`);
+    if (threadEl) {
+      threadEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+    scrollToFile(thread.file);
   }
 
   function toggleFileCollapsed(path: string) {
@@ -855,7 +1534,17 @@
     <p class="text-github-text-secondary text-base">No diff data available</p>
   </div>
 {:else}
-  <div class="h-screen flex flex-col bg-github-bg-primary text-github-text-primary">
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div
+    class="h-screen flex flex-col bg-github-bg-primary text-github-text-primary"
+    onclick={(event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement && target.closest('.word-token'))) {
+        pinnedWord = null;
+      }
+    }}
+    onkeydown={() => {}}
+  >
     <header class="bg-github-bg-secondary border-b border-github-border px-4 py-2.5 flex flex-wrap items-center justify-between gap-3">
       <div class="flex flex-wrap items-center gap-3 min-w-0">
         <button
@@ -932,7 +1621,58 @@
         </button>
       </div>
 
-      <div class="flex flex-wrap items-center gap-4 text-xs text-github-text-secondary">
+      <div class="flex flex-wrap items-center gap-3 text-xs text-github-text-secondary">
+        <div
+          class="inline-flex rounded border border-github-border bg-github-bg-primary p-0.5"
+          role="group"
+          aria-label="Diff view mode"
+        >
+          <button
+            type="button"
+            onclick={() => handleDiffModeChange('split')}
+            aria-pressed={diffMode === 'split'}
+            class="px-2 py-0.5 rounded text-xs cursor-pointer transition-colors {diffMode === 'split'
+              ? 'bg-github-bg-tertiary text-github-text-primary font-medium'
+              : 'text-github-text-secondary hover:text-github-text-primary'}"
+          >
+            Split
+          </button>
+          <button
+            type="button"
+            onclick={() => handleDiffModeChange('unified')}
+            aria-pressed={diffMode === 'unified'}
+            class="px-2 py-0.5 rounded text-xs cursor-pointer transition-colors {diffMode === 'unified'
+              ? 'bg-github-bg-tertiary text-github-text-primary font-medium'
+              : 'text-github-text-secondary hover:text-github-text-primary'}"
+          >
+            Unified
+          </button>
+        </div>
+
+        <button
+          type="button"
+          onclick={() => {
+            commentsDrawerOpen = !commentsDrawerOpen;
+          }}
+          aria-expanded={commentsDrawerOpen}
+          aria-controls="comments-drawer"
+          aria-label="Toggle comments drawer"
+          class="px-2.5 py-1 rounded border flex items-center gap-1.5 cursor-pointer transition-colors {commentsDrawerOpen
+            ? 'bg-github-bg-primary border-blue-500/60 text-github-text-primary'
+            : 'bg-github-bg-tertiary border-github-border text-github-text-secondary hover:text-github-text-primary'}"
+        >
+          <span>Comments</span>
+          {#if normalizedThreads.length > 0}
+            <span
+              class="px-1.5 py-0 rounded-full text-[10px] font-semibold {unresolvedCommentCount > 0
+                ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30'
+                : 'bg-green-500/20 text-green-400 border border-green-500/30'}"
+            >
+              {unresolvedCommentCount > 0 ? `${unresolvedCommentCount} open` : 'All resolved'}
+            </span>
+          {/if}
+        </button>
+
         <div class="flex items-center gap-2 font-mono" aria-label="Diff summary">
           <span>{viewedFiles.size}/{diffData.files.length} viewed</span>
           <span class="text-green-400">+{totalAdditions}</span>
@@ -992,6 +1732,7 @@
             files={diffData.files}
             {viewedFiles}
             {changedSinceViewedFiles}
+            threads={normalizedThreads}
             onScrollToFile={scrollToFile}
             onToggleViewed={(file) => void handleToggleFileViewed(file)}
             onToggleFolderViewed={(folderFiles, nextViewed) =>
@@ -1001,6 +1742,25 @@
       {/if}
 
       <main class="flex-1 overflow-y-auto p-4 space-y-4">
+        {#if commentError}
+          <div
+            role="alert"
+            class="px-3 py-2 rounded-md border border-red-500/40 bg-red-500/10 text-xs text-red-300 flex items-center justify-between gap-3"
+          >
+            <span>{commentError}</span>
+            <button
+              type="button"
+              onclick={() => {
+                commentError = null;
+              }}
+              aria-label="Dismiss comment error"
+              class="px-2 py-0.5 rounded border border-red-500/30 text-red-200 hover:bg-red-500/20 shrink-0"
+            >
+              Dismiss
+            </button>
+          </div>
+        {/if}
+
         {#if error}
           <div
             role="alert"
@@ -1070,8 +1830,25 @@
                   {/if}
                 </button>
 
-                <div class="flex items-center gap-3 shrink-0">
-                  <label class="inline-flex items-center gap-1.5 text-xs text-github-text-secondary cursor-pointer select-none">
+                <div class="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onclick={() => void handleCopyFilePath(file.path)}
+                    title="Copy file path"
+                    class="px-2 py-0.5 text-xs rounded border border-github-border bg-github-bg-tertiary text-github-text-secondary hover:text-github-text-primary cursor-pointer"
+                  >
+                    {copiedFilePath === file.path ? 'Copied' : 'Copy'}
+                  </button>
+                  <button
+                    type="button"
+                    onclick={() => openWholeFileComment(file.path)}
+                    title="Comment on {file.path}"
+                    aria-label="Comment on {file.path}"
+                    class="px-2 py-0.5 text-xs rounded border border-github-border bg-github-bg-tertiary text-github-text-secondary hover:text-github-text-primary cursor-pointer"
+                  >
+                    Comment
+                  </button>
+                  <label class="inline-flex items-center gap-1.5 text-xs text-github-text-secondary cursor-pointer select-none ml-1">
                     <input
                       type="checkbox"
                       checked={isViewed}
@@ -1080,7 +1857,7 @@
                     />
                     <span>Viewed</span>
                   </label>
-                  <div class="font-mono text-xs flex items-center gap-2">
+                  <div class="font-mono text-xs flex items-center gap-2 ml-1">
                     <span class="text-green-400">+{file.additions}</span>
                     <span class="text-red-400">-{file.deletions}</span>
                   </div>
@@ -1088,45 +1865,65 @@
               </div>
 
               {#if !isCollapsed}
-                <div class="overflow-x-auto bg-github-bg-primary">
-                  <table class="w-full border-collapse font-mono text-xs">
-                    <tbody>
-                      {#each file.chunks as chunk, chunkIdx (chunkIdx)}
-                        <tr class="bg-github-bg-tertiary/70 text-github-text-muted">
-                          <td colspan="3" class="px-3 py-1 select-none">{chunk.header}</td>
-                        </tr>
-                        {#each chunk.lines as line, lineIdx (lineIdx)}
-                          {@const rowClass =
-                            line.type === 'add'
-                              ? 'bg-diff-addition-bg/45'
-                              : line.type === 'delete' || line.type === 'remove'
-                                ? 'bg-diff-deletion-bg/45'
-                                : ''}
-                          {@const prefix =
-                            line.type === 'add'
-                              ? '+'
-                              : line.type === 'delete' || line.type === 'remove'
-                                ? '-'
-                                : ' '}
-                          <tr class={rowClass}>
-                            <td class="w-12 px-2 py-0.5 text-right select-none text-github-text-muted border-r border-github-border/50">
-                              {line.oldLineNumber ?? ''}
-                            </td>
-                            <td class="w-12 px-2 py-0.5 text-right select-none text-github-text-muted border-r border-github-border/50">
-                              {line.newLineNumber ?? ''}
-                            </td>
-                            <td class="px-3 py-0.5 whitespace-pre text-github-text-primary">{prefix}{line.content}</td>
-                          </tr>
-                        {/each}
-                      {/each}
-                    </tbody>
-                  </table>
-                </div>
+                <TextDiffViewer
+                  {file}
+                  mergedChunks={mergedChunksByFile.get(file.path) ?? []}
+                  {diffMode}
+                  threads={threadsByFile.get(file.path) ?? []}
+                  {showAuthorBadges}
+                  {syntaxTheme}
+                  baseCommitish={diffData.baseCommitish}
+                  targetCommitish={diffData.targetCommitish}
+                  {openInEditorAvailable}
+                  {isExpandLoading}
+                  {isCollapsed}
+                  activeWholeFileComment={activeWholeFileCommentPath === file.path}
+                  {highlightedThreadId}
+                  onExpandLines={(targetFile, chunkIndex, direction, count) =>
+                    void handleExpandLines(targetFile, chunkIndex, direction, count)}
+                  onExpandAllBetween={(targetFile, chunkIndex, hiddenLines) =>
+                    void handleExpandAllBetween(targetFile, chunkIndex, hiddenLines)}
+                  onPrefetchLineCount={handlePrefetchLineCount}
+                  onAddComment={handleAddComment}
+                  onReplyToThread={handleReplyToThread}
+                  onToggleResolve={handleToggleResolve}
+                  onRemoveThread={isJjRepo ? undefined : handleRemoveThread}
+                  onOpenInEditor={(targetPath, lineNum) =>
+                    void handleOpenInEditor(targetPath, lineNum)}
+                  onCancelWholeFileComment={() => {
+                    activeWholeFileCommentPath = null;
+                  }}
+                />
               {/if}
             </article>
           {/each}
         {/if}
       </main>
+
+      <CommentsDrawer
+        isOpen={commentsDrawerOpen}
+        threads={normalizedThreads}
+        {showAuthorBadges}
+        {showResolvedInline}
+        {syntaxTheme}
+        promptContext={{
+          requestedBaseCommitish: diffData.requestedBaseCommitish,
+          requestedTargetCommitish: diffData.requestedTargetCommitish,
+          baseMode: normalizeBaseMode(diffData.requestedBaseMode),
+          resolvedBaseCommitish: diffData.baseCommitish,
+          resolvedTargetCommitish: diffData.targetCommitish,
+        }}
+        onClose={() => {
+          commentsDrawerOpen = false;
+        }}
+        onToggleShowResolvedInline={(next) => {
+          showResolvedInline = next;
+        }}
+        onNavigateToThread={(thread) => void handleNavigateToThread(thread)}
+        onReplyToThread={handleReplyToThread}
+        onToggleResolve={handleToggleResolve}
+        onRemoveThread={isJjRepo ? undefined : handleRemoveThread}
+      />
     </div>
   </div>
 {/if}

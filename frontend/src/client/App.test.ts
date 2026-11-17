@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { DiffResponse, JjChange, JjCommit } from '../types/diff';
+import type { DiffCommentThread, DiffResponse, JjChange, JjCommit } from '../types/diff';
 import { resetClientSettingsForTests } from './services/userSettings';
 import { VIEWED_HASH_VERSION } from './services/StorageService';
 
@@ -869,5 +869,558 @@ describe('App.svelte integration', () => {
       'aria-current',
       'true',
     );
+  });
+
+  it('renders inline .tellit/ threads on Commit Message and code lines, supports drag-comment, reply, resolve, drawer jump, expand, and open-in-editor', async () => {
+    const calledUrls: string[] = [];
+    let threads: DiffCommentThread[] = [
+      {
+        id: 't-commit-msg',
+        filePath: 'Commit Message',
+        createdAt: '2026-11-16T10:00:00.000Z',
+        updatedAt: '2026-11-16T10:00:00.000Z',
+        resolved: false,
+        position: { side: 'new', line: 1 },
+        messages: [
+          {
+            id: 't-commit-msg:0',
+            body: 'Clarify commit summary',
+            createdAt: '2026-11-16T10:00:00.000Z',
+            updatedAt: '2026-11-16T10:00:00.000Z',
+          },
+        ],
+      },
+    ];
+
+    const codeDiff: DiffResponse = {
+      commit: '335eb579f263bb',
+      baseCommitish: '335eb579f263bb^',
+      targetCommitish: '335eb579f263bb',
+      repositoryId: 'repo-1',
+      openInEditorAvailable: true,
+      files: [
+        sampleJjDiff.files[0]!,
+        {
+          path: 'src/feature.ts',
+          status: 'modified',
+          additions: 2,
+          deletions: 0,
+          chunks: [
+            {
+              header: '@@ -3,1 +3,3 @@',
+              oldStart: 3,
+              oldLines: 1,
+              newStart: 3,
+              newLines: 3,
+              lines: [
+                { type: 'normal', content: 'const a = 1;', oldLineNumber: 3, newLineNumber: 3 },
+                { type: 'add', content: 'const b = 2;', newLineNumber: 4 },
+                { type: 'add', content: 'const c = 3;', newLineNumber: 5 },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    vi.mocked(global.fetch).mockImplementation(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        calledUrls.push(url);
+        if (url === '/api/user-settings') {
+          if (init?.method === 'PUT') {
+            return new Response(JSON.stringify({ client: {} }), { status: 200 });
+          }
+          return new Response(JSON.stringify({ client: {} }), { status: 200 });
+        }
+        if (url === '/api/jj/status') {
+          return new Response(JSON.stringify({ isJj: true, repoRoot: '/workspace' }), {
+            status: 200,
+          });
+        }
+        if (url === '/api/jj/changes') {
+          return new Response(JSON.stringify({ changes: sampleChanges, graphRows: [] }), {
+            status: 200,
+          });
+        }
+        if (url === '/api/jj/changes/ltppwqry22222222/commits') {
+          return new Response(JSON.stringify({ commits: sampleCommits }), { status: 200 });
+        }
+        if (url.startsWith('/api/diff?') || url.startsWith('/api/jj/diff?target=335eb579f263bb')) {
+          return new Response(JSON.stringify(codeDiff), { status: 200 });
+        }
+        if (url.startsWith('/api/generated-status/')) {
+          return new Response(
+            JSON.stringify({
+              path: 'src/feature.ts',
+              ref: '335eb579f263bb',
+              isGenerated: false,
+              source: 'path',
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.startsWith('/api/line-count/src%2Ffeature.ts')) {
+          return new Response(JSON.stringify({ oldLineCount: 4, newLineCount: 6 }), {
+            status: 200,
+          });
+        }
+        if (url.startsWith('/api/blob/src%2Ffeature.ts')) {
+          return new Response('line 1\nline 2\nconst a = 1;\nline 4\n', { status: 200 });
+        }
+        if (url === '/api/jj/comments?commit=335eb579f263bb') {
+          return new Response(JSON.stringify({ threads }), { status: 200 });
+        }
+        if (url === '/api/jj/comments' && init?.method === 'POST') {
+          const body = JSON.parse(String(init.body)) as {
+            filePath: string;
+            line?: { start: number; end: number } | number;
+            content: string;
+          };
+          threads = [
+            ...threads,
+            {
+              id: 't-new-range',
+              filePath: body.filePath,
+              createdAt: '2026-11-16T10:05:00.000Z',
+              updatedAt: '2026-11-16T10:05:00.000Z',
+              resolved: false,
+              position: { side: 'new', line: body.line ?? 1 },
+              messages: [
+                {
+                  id: 't-new-range:0',
+                  body: body.content,
+                  createdAt: '2026-11-16T10:05:00.000Z',
+                  updatedAt: '2026-11-16T10:05:00.000Z',
+                },
+              ],
+            },
+          ];
+          return new Response(JSON.stringify({ success: true, threadId: 't-new-range' }), {
+            status: 200,
+          });
+        }
+        if (url === '/api/jj/comments/t-new-range/reply' && init?.method === 'POST') {
+          const body = JSON.parse(String(init.body)) as { content: string };
+          threads = threads.map((t) =>
+            t.id === 't-new-range'
+              ? {
+                  ...t,
+                  messages: [
+                    ...t.messages,
+                    {
+                      id: 't-new-range:1',
+                      body: body.content,
+                      createdAt: '2026-11-16T10:06:00.000Z',
+                      updatedAt: '2026-11-16T10:06:00.000Z',
+                    },
+                  ],
+                }
+              : t,
+          );
+          return new Response(JSON.stringify({ success: true }), { status: 200 });
+        }
+        if (url === '/api/jj/comments/t-new-range/resolve' && init?.method === 'POST') {
+          threads = threads.map((t) => (t.id === 't-new-range' ? { ...t, resolved: true } : t));
+          return new Response(JSON.stringify({ success: true, resolved: true }), { status: 200 });
+        }
+        if (url === '/api/open-in-editor' && init?.method === 'POST') {
+          return new Response(JSON.stringify({ success: true }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ error: `Unexpected URL: ${url}` }), { status: 404 });
+      },
+    );
+
+    const { container } = render(App);
+
+    await waitFor(() => {
+      expect(screen.getByText('Clarify commit summary')).toBeInTheDocument();
+      expect(screen.getByText('1 open')).toBeInTheDocument();
+    });
+
+    // Switch to Unified mode
+    await fireEvent.click(screen.getByRole('button', { name: 'Unified' }));
+    expect(container.querySelector('[data-diff-mode="unified"]')).toBeInTheDocument();
+    expect(localStorage.getItem('difit.diffViewMode')).toBe('unified');
+
+    // Expand hidden lines above chunk 0 in src/feature.ts
+    await fireEvent.click(screen.getByRole('button', { name: 'Expand all 2 hidden lines' }));
+    await waitFor(() => {
+      const expandedLine1Cell = container.querySelector(
+        'article[data-file-path="src/feature.ts"] td[data-side="new"][data-line-number="1"]',
+      );
+      expect(expandedLine1Cell).toBeInTheDocument();
+      expect(expandedLine1Cell?.closest('tr')?.textContent).toContain('line 1');
+    });
+
+    // Open in editor from line 4
+    await fireEvent.click(
+      screen.getByRole('button', { name: 'Open src/feature.ts line 4 in editor' }),
+    );
+    expect(calledUrls).toContain('/api/open-in-editor');
+
+    // Drag across lines 4..5 in src/feature.ts and submit a range comment
+    const line4Cell = container.querySelector('td[data-side="new"][data-line-number="4"]')!;
+    const line5Cell = container.querySelector('td[data-side="new"][data-line-number="5"]')!;
+    await fireEvent.mouseDown(line4Cell, { button: 0 });
+    await fireEvent.mouseEnter(line5Cell);
+    await fireEvent.mouseUp(window);
+
+    const commentInput = screen.getByLabelText('Comment on Lines 4–5');
+    await fireEvent.input(commentInput, { target: { value: 'Combine b and c' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Comment' }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Combine b and c')).toBeInTheDocument();
+      expect(screen.getByText('2 open')).toBeInTheDocument();
+    });
+
+    // Open Comments drawer, jump to the new thread, ensure unique inline DOM ids, reply, and resolve
+    await fireEvent.click(screen.getByRole('button', { name: 'Toggle comments drawer' }));
+    expect(screen.getByLabelText('Review comments drawer')).toBeInTheDocument();
+    expect(document.querySelectorAll('[id="comment-thread-t-commit-msg"]')).toHaveLength(1);
+    expect(document.querySelectorAll('[id="comment-thread-t-new-range"]')).toHaveLength(1);
+
+    const jumpButtons = screen.getAllByRole('button', { name: 'Jump' });
+    await fireEvent.click(jumpButtons[1]!);
+
+    // Reply inside the inline thread card
+    const replyTriggers = screen.getAllByRole('button', { name: 'Reply...' });
+    await fireEvent.click(replyTriggers[replyTriggers.length - 1]!);
+    await fireEvent.input(screen.getByLabelText('Reply to thread'), {
+      target: { value: 'Combined cleanly' },
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Reply' }));
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Combined cleanly').length).toBeGreaterThan(0);
+    });
+
+    // Resolve the thread
+    const resolveButtons = screen.getAllByRole('button', { name: 'Resolve' });
+    await fireEvent.click(resolveButtons[resolveButtons.length - 1]!);
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Toggle comments drawer' }).textContent).toContain(
+        '1 open',
+      );
+    });
+
+    // Ensure no legacy /api/comments endpoints were called in Jujutsu mode
+    const legacyCalls = calledUrls.filter(
+      (url) => url === '/api/comments' || url.startsWith('/api/comments-json'),
+    );
+    expect(legacyCalls).toEqual([]);
+  });
+
+  it('supports whole-file comments, commentsChanged SSE refresh, and interdiff old-side comments', async () => {
+    const postedComments: Array<{
+      commitId: string;
+      filePath: string;
+      line?: number | { start: number; end: number };
+      content: string;
+    }> = [];
+    let threads: DiffCommentThread[] = [];
+    let nextThreadSeq = 1;
+
+    const interDiff: DiffResponse = {
+      commit: '335eb579f263bb',
+      baseCommitish: '22222222222222',
+      targetCommitish: '335eb579f263bb',
+      repositoryId: 'repo-1',
+      files: [
+        {
+          path: 'src/feature.ts',
+          status: 'modified',
+          additions: 1,
+          deletions: 1,
+          chunks: [
+            {
+              header: '@@ -1,2 +1,2 @@',
+              oldStart: 1,
+              oldLines: 2,
+              newStart: 1,
+              newLines: 2,
+              lines: [
+                { type: 'delete', content: 'const legacy = true;', oldLineNumber: 1 },
+                { type: 'add', content: 'const legacy = false;', newLineNumber: 1 },
+                { type: 'normal', content: 'export {};', oldLineNumber: 2, newLineNumber: 2 },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    vi.mocked(global.fetch).mockImplementation(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url === '/api/user-settings') {
+          return new Response(JSON.stringify({ client: {} }), { status: 200 });
+        }
+        if (url === '/api/jj/status') {
+          return new Response(JSON.stringify({ isJj: true, repoRoot: '/workspace' }), {
+            status: 200,
+          });
+        }
+        if (url === '/api/jj/changes') {
+          return new Response(JSON.stringify({ changes: sampleChanges, graphRows: [] }), {
+            status: 200,
+          });
+        }
+        if (url === '/api/jj/changes/ltppwqry22222222/commits') {
+          return new Response(JSON.stringify({ commits: sampleCommits }), { status: 200 });
+        }
+        if (url.startsWith('/api/diff?') || url.startsWith('/api/jj/diff?')) {
+          return new Response(JSON.stringify(interDiff), { status: 200 });
+        }
+        if (url.startsWith('/api/generated-status/')) {
+          return new Response(
+            JSON.stringify({
+              path: 'src/feature.ts',
+              ref: '335eb579f263bb',
+              isGenerated: false,
+              source: 'path',
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.startsWith('/api/line-count/')) {
+          return new Response(JSON.stringify({ oldLineCount: 2, newLineCount: 2 }), {
+            status: 200,
+          });
+        }
+        if (url.startsWith('/api/jj/comments?')) {
+          return new Response(JSON.stringify({ threads }), { status: 200 });
+        }
+        if (url === '/api/jj/comments' && init?.method === 'POST') {
+          const body = JSON.parse(String(init.body)) as {
+            commitId: string;
+            filePath: string;
+            line?: number | { start: number; end: number };
+            content: string;
+          };
+          postedComments.push(body);
+          const id = `t-${nextThreadSeq++}`;
+          threads = [
+            ...threads,
+            {
+              id,
+              filePath: body.filePath,
+              createdAt: '2026-11-16T10:10:00.000Z',
+              updatedAt: '2026-11-16T10:10:00.000Z',
+              resolved: false,
+              position: {
+                side: body.commitId === '22222222222222' ? 'old' : 'new',
+                line: body.line ?? 1,
+              },
+              messages: [
+                {
+                  id: `${id}:0`,
+                  body: body.content,
+                  createdAt: '2026-11-16T10:10:00.000Z',
+                  updatedAt: '2026-11-16T10:10:00.000Z',
+                },
+              ],
+            },
+          ];
+          return new Response(JSON.stringify({ success: true, threadId: id }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ error: `Unexpected URL: ${url}` }), { status: 404 });
+      },
+    );
+
+    const { container } = render(App);
+
+    await waitFor(() => {
+      expect(screen.getByText('src/feature.ts')).toBeInTheDocument();
+    });
+
+    // Switch base revision (From) to prior commit 22222222222222 for interdiff
+    await fireEvent.click(screen.getByRole('button', { name: 'Diff base revision (From)' }));
+    await fireEvent.click(screen.getByRole('button', { name: /2222222/ }));
+
+    // Submit a whole-file comment from the file header (no line field in payload)
+    await fireEvent.click(screen.getByRole('button', { name: 'Comment on src/feature.ts' }));
+    await fireEvent.input(screen.getByRole('textbox', { name: 'Comment on src/feature.ts' }), {
+      target: { value: 'Whole file looks solid' },
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Comment' }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Whole file looks solid')).toBeInTheDocument();
+    });
+    expect(postedComments[0]).toEqual({
+      commitId: '335eb579f263bb',
+      filePath: 'src/feature.ts',
+      content: 'Whole file looks solid',
+    });
+
+    // Post an old-side comment in interdiff mode; targets base commit 22222222222222
+    const oldLine1Cell = container.querySelector('td[data-side="old"][data-line-number="1"]')!;
+    await fireEvent.mouseDown(oldLine1Cell, { button: 0 });
+    await fireEvent.mouseUp(window);
+    await fireEvent.input(screen.getByLabelText('Comment on Line 1 (old)'), {
+      target: { value: 'Why was legacy true before?' },
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Comment' }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Why was legacy true before?')).toBeInTheDocument();
+    });
+    expect(postedComments[1]).toEqual({
+      commitId: '22222222222222',
+      filePath: 'src/feature.ts',
+      line: 1,
+      content: 'Why was legacy true before?',
+    });
+
+    // Simulate external commentsChanged SSE push and verify background refresh
+    threads = [
+      ...threads,
+      {
+        id: 't-sse-added',
+        filePath: 'src/feature.ts',
+        createdAt: '2026-11-16T10:12:00.000Z',
+        updatedAt: '2026-11-16T10:12:00.000Z',
+        resolved: false,
+        position: { side: 'new', line: 1 },
+        messages: [
+          {
+            id: 't-sse-added:0',
+            body: 'Injected via SSE watcher',
+            createdAt: '2026-11-16T10:12:00.000Z',
+            updatedAt: '2026-11-16T10:12:00.000Z',
+          },
+        ],
+      },
+    ];
+    const watchStream = MockEventSource.instances.find((s) => s.url === '/api/watch')!;
+    watchStream.onmessage?.({
+      data: JSON.stringify({ type: 'commentsChanged' }),
+    } as MessageEvent);
+    await waitFor(() => {
+      expect(screen.getByText('Injected via SSE watcher')).toBeInTheDocument();
+    });
+  });
+
+  it('clears stale threads on jj change switch and copies resolved threads when Copy all is clicked', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+
+    const resolvedThreads: DiffCommentThread[] = [
+      {
+        id: 't-resolved-1',
+        filePath: 'dprint.json',
+        createdAt: '2026-11-16T09:00:00.000Z',
+        updatedAt: '2026-11-16T09:05:00.000Z',
+        resolved: true,
+        position: { side: 'new', line: 1 },
+        messages: [
+          {
+            id: 't-resolved-1:0',
+            body: 'Resolved note from ltppwqry',
+            createdAt: '2026-11-16T09:00:00.000Z',
+            updatedAt: '2026-11-16T09:05:00.000Z',
+          },
+        ],
+      },
+    ];
+
+    const workingCopyCommits: JjCommit[] = [
+      {
+        commitId: '44235e975acae6',
+        shortCommitId: '44235e9',
+        timestamp: '2026-11-16 15:47:08',
+        description: '(no description set)',
+        isWorkingCopy: true,
+        commentCount: 0,
+        unresolvedCommentCount: 0,
+      },
+    ];
+    const workingCopyDiff: DiffResponse = {
+      commit: '44235e975acae6',
+      baseCommitish: '335eb579f263bb',
+      targetCommitish: '44235e975acae6',
+      repositoryId: 'repo-1',
+      files: [],
+    };
+
+    vi.mocked(global.fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url === '/api/user-settings') {
+        return new Response(JSON.stringify({ client: {} }), { status: 200 });
+      }
+      if (url === '/api/jj/status') {
+        return new Response(JSON.stringify({ isJj: true, repoRoot: '/workspace' }), {
+          status: 200,
+        });
+      }
+      if (url === '/api/jj/changes') {
+        return new Response(JSON.stringify({ changes: sampleChanges, graphRows: [] }), {
+          status: 200,
+        });
+      }
+      if (url === '/api/jj/changes/ltppwqry22222222/commits') {
+        return new Response(JSON.stringify({ commits: sampleCommits }), { status: 200 });
+      }
+      if (url === '/api/jj/changes/mkyoqzmz11111111/commits') {
+        return new Response(JSON.stringify({ commits: workingCopyCommits }), { status: 200 });
+      }
+      if (url.startsWith('/api/diff?') || url.startsWith('/api/jj/diff?target=335eb579f263bb')) {
+        return new Response(JSON.stringify(sampleJjDiff), { status: 200 });
+      }
+      if (url.startsWith('/api/jj/diff?target=44235e975acae6')) {
+        return new Response(JSON.stringify(workingCopyDiff), { status: 200 });
+      }
+      if (url.startsWith('/api/generated-status/')) {
+        return new Response(
+          JSON.stringify({
+            path: 'dprint.json',
+            ref: '335eb579f263bb',
+            isGenerated: false,
+            source: 'path',
+          }),
+          { status: 200 },
+        );
+      }
+      if (url === '/api/jj/comments?commit=335eb579f263bb') {
+        return new Response(JSON.stringify({ threads: resolvedThreads }), { status: 200 });
+      }
+      if (url === '/api/jj/comments?commit=44235e975acae6') {
+        return new Response(JSON.stringify({ error: 'Comment service unavailable' }), {
+          status: 500,
+        });
+      }
+      return new Response(JSON.stringify({ error: `Unexpected URL: ${url}` }), { status: 404 });
+    });
+
+    render(App);
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Toggle comments drawer' })).toBeInTheDocument();
+    });
+
+    // Open drawer and verify "Copy all" copies resolved thread when unresolvedCount === 0
+    await fireEvent.click(screen.getByRole('button', { name: 'Toggle comments drawer' }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Copy all' })).toBeInTheDocument();
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Copy all' }));
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledWith(
+        expect.stringContaining('Resolved note from ltppwqry'),
+      );
+    });
+
+    // Switch to another change whose /api/jj/comments fails; stale threads must clear immediately
+    await fireEvent.click(screen.getByRole('button', { name: /mkyoqzmz/ }));
+    await waitFor(() => {
+      expect(screen.getByText('No changes in this revision')).toBeInTheDocument();
+      expect(screen.getByText('Comments (0)')).toBeInTheDocument();
+    });
   });
 });

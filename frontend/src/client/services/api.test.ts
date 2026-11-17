@@ -1,15 +1,22 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  addJjComment,
   approveJjRevision,
   fetchDiff,
+  fetchFileBlobText,
   fetchGeneratedStatus,
   fetchJjChanges,
+  fetchJjComments,
   fetchJjCommitsForChange,
   fetchJjDiff,
   fetchJjStatus,
+  fetchLineCount,
   normalizeJjBaseCommitId,
+  openInEditor,
   readApiErrorMessage,
+  replyJjComment,
+  resolveJjComment,
 } from './api';
 
 describe('API client helpers', () => {
@@ -234,6 +241,85 @@ describe('API client helpers', () => {
 
       await expect(fetchDiff()).rejects.toThrow('Invalid diff response');
       await expect(fetchJjDiff({ target: 'target1' })).rejects.toThrow('Invalid diff response');
+    });
+  });
+
+  describe('blob, line-count, open-in-editor, and jj comments helpers', () => {
+    it('fetches blob text, line counts, and triggers open-in-editor', async () => {
+      vi.mocked(global.fetch)
+        .mockResolvedValueOnce(new Response('line 1\nline 2\n', { status: 200 }))
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ oldLineCount: 20, newLineCount: 22 }), { status: 200 }),
+        )
+        .mockResolvedValueOnce(new Response(JSON.stringify({ success: true }), { status: 200 }));
+
+      await expect(fetchFileBlobText('src/a b.ts', 'abc123')).resolves.toBe('line 1\nline 2\n');
+      expect(global.fetch).toHaveBeenNthCalledWith(
+        1,
+        '/api/blob/src%2Fa%20b.ts?ref=abc123',
+        undefined,
+      );
+
+      await expect(fetchLineCount('src/new.ts', 'base1', 'head1', 'src/old.ts')).resolves.toEqual({
+        oldLineCount: 20,
+        newLineCount: 22,
+      });
+      expect(global.fetch).toHaveBeenNthCalledWith(
+        2,
+        '/api/line-count/src%2Fnew.ts?oldRef=base1&newRef=head1&oldPath=src%2Fold.ts',
+        undefined,
+      );
+
+      await openInEditor({ filePath: 'src/new.ts', line: 12 });
+      expect(global.fetch).toHaveBeenNthCalledWith(3, '/api/open-in-editor', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePath: 'src/new.ts', line: 12 }),
+      });
+    });
+
+    it('fetches, creates, replies to, and resolves jj comments', async () => {
+      const thread = {
+        id: 't1',
+        filePath: 'src/app.ts',
+        createdAt: '2026-11-16T00:00:00Z',
+        updatedAt: '2026-11-16T00:00:00Z',
+        position: { side: 'new', line: 5 },
+        messages: [],
+      };
+      vi.mocked(global.fetch)
+        .mockResolvedValueOnce(new Response(JSON.stringify({ threads: [thread] }), { status: 200 }))
+        .mockResolvedValueOnce(new Response(JSON.stringify({ threadId: 't2' }), { status: 200 }))
+        .mockResolvedValueOnce(new Response(JSON.stringify({ success: true }), { status: 200 }))
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ success: true, resolved: true }), { status: 200 }),
+        );
+
+      await expect(fetchJjComments('commit2', 'parent')).resolves.toEqual([thread]);
+      expect(global.fetch).toHaveBeenNthCalledWith(1, '/api/jj/comments?commit=commit2', undefined);
+
+      await expect(
+        addJjComment({
+          commitId: 'commit2',
+          filePath: 'src/app.ts',
+          line: { start: 10, end: 12 },
+          content: 'Check range',
+        }),
+      ).resolves.toBe('t2');
+
+      await replyJjComment('t2', 'Done');
+      expect(global.fetch).toHaveBeenNthCalledWith(3, '/api/jj/comments/t2/reply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: 'Done' }),
+      });
+
+      await expect(resolveJjComment('t2', false)).resolves.toBe(true);
+      expect(global.fetch).toHaveBeenNthCalledWith(4, '/api/jj/comments/t2/resolve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ unresolve: false }),
+      });
     });
   });
 });

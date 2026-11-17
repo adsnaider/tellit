@@ -1,13 +1,14 @@
 <script lang="ts">
   import { SvelteSet } from 'svelte/reactivity';
 
-  import { type DiffFile } from '../../types/diff';
+  import { type CommentThread, type DiffFile } from '../../types/diff';
   import { formatStatusBadge } from '../utils/diffUtils';
 
   interface Props {
     files: DiffFile[];
     viewedFiles: Set<string>;
     changedSinceViewedFiles: Set<string>;
+    threads?: CommentThread[];
     onScrollToFile: (path: string) => void;
     onToggleViewed: (file: DiffFile) => void;
     onToggleFolderViewed: (folderFiles: DiffFile[], nextViewed: boolean) => void;
@@ -25,6 +26,7 @@
     files,
     viewedFiles,
     changedSinceViewedFiles,
+    threads = [],
     onScrollToFile,
     onToggleViewed,
     onToggleFolderViewed,
@@ -125,6 +127,15 @@
   const allDirPaths = $derived(collectDirPaths(treeRoot));
   const hasCollapsedDirs = $derived(allDirPaths.some((dir) => collapsedDirs.has(dir)));
   const viewedCount = $derived(files.filter((file) => viewedFiles.has(file.path)).length);
+  const unresolvedByFile = $derived.by(() => {
+    const counts = new Map<string, number>();
+    for (const thread of threads) {
+      if (!thread.resolved) {
+        counts.set(thread.file, (counts.get(thread.file) ?? 0) + 1);
+      }
+    }
+    return counts;
+  });
 
   function toggleDir(path: string) {
     if (collapsedDirs.has(path)) {
@@ -238,6 +249,14 @@
           </span>
 
           <span class="font-mono text-[11px] shrink-0 flex items-center gap-1">
+            {#if (unresolvedByFile.get(file.path) ?? 0) > 0}
+              <span
+                class="px-1 py-0 text-[10px] rounded bg-yellow-500/15 border border-yellow-500/30 text-yellow-400"
+                title="{unresolvedByFile.get(file.path)} unresolved comment(s)"
+              >
+                {unresolvedByFile.get(file.path)}
+              </span>
+            {/if}
             {#if file.additions > 0}
               <span class="text-green-400">+{file.additions}</span>
             {/if}

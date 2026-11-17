@@ -1,5 +1,6 @@
 import {
   type BaseMode,
+  type DiffCommentThread,
   type DiffResponse,
   type GeneratedStatusResponse,
   type JjChange,
@@ -248,4 +249,159 @@ export async function fetchGeneratedStatus(
     throw new Error('Invalid generated status response');
   }
   return payload;
+}
+
+export async function fetchFileBlobText(
+  filePath: string,
+  ref: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const res = await fetch(
+    `/api/blob/${encodeURIComponent(filePath)}?ref=${encodeURIComponent(ref)}`,
+    signal ? { signal } : undefined,
+  );
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, 'Failed to fetch file content'));
+  }
+  return await res.text();
+}
+
+export async function fetchLineCount(
+  filePath: string,
+  oldRef?: string,
+  newRef?: string,
+  oldPath?: string,
+  signal?: AbortSignal,
+): Promise<{ oldLineCount?: number; newLineCount?: number }> {
+  const params = new URLSearchParams();
+  if (oldRef) params.set('oldRef', oldRef);
+  if (newRef) params.set('newRef', newRef);
+  if (oldPath && oldPath !== filePath) params.set('oldPath', oldPath);
+
+  const res = await fetch(
+    `/api/line-count/${encodeURIComponent(filePath)}?${params.toString()}`,
+    signal ? { signal } : undefined,
+  );
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, 'Failed to fetch line count'));
+  }
+
+  const payload: unknown = await res.json();
+  if (!isRecord(payload)) {
+    return {};
+  }
+  return {
+    ...(typeof payload.oldLineCount === 'number' ? { oldLineCount: payload.oldLineCount } : {}),
+    ...(typeof payload.newLineCount === 'number' ? { newLineCount: payload.newLineCount } : {}),
+  };
+}
+
+export async function openInEditor(
+  params: {
+    filePath: string;
+    line: number;
+    editor?: { id?: string; command?: string; argsTemplate?: string };
+  },
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch('/api/open-in-editor', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+    ...(signal ? { signal } : {}),
+  });
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, 'Failed to open file in editor'));
+  }
+}
+
+export async function fetchJjComments(
+  targetCommit: string,
+  baseCommit?: string,
+  signal?: AbortSignal,
+): Promise<DiffCommentThread[]> {
+  const params = new URLSearchParams({ commit: targetCommit });
+  const normalizedBase = normalizeJjBaseCommitId(baseCommit);
+  if (normalizedBase) {
+    params.set('base', normalizedBase);
+  }
+  const res = await fetch(`/api/jj/comments?${params.toString()}`, signal ? { signal } : undefined);
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, 'Failed to fetch comments'));
+  }
+
+  const payload: unknown = await res.json();
+  if (!isRecord(payload) || !Array.isArray(payload.threads)) {
+    return [];
+  }
+  return payload.threads as DiffCommentThread[];
+}
+
+export async function addJjComment(
+  params: {
+    commitId: string;
+    filePath: string;
+    line?: number | { start: number; end: number };
+    content: string;
+  },
+  signal?: AbortSignal,
+): Promise<string> {
+  const res = await fetch('/api/jj/comments', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+    ...(signal ? { signal } : {}),
+  });
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, 'Failed to add comment'));
+  }
+
+  const payload: unknown = await res.json();
+  if (isRecord(payload) && typeof payload.threadId === 'string') {
+    return payload.threadId;
+  }
+  return '';
+}
+
+export async function replyJjComment(
+  threadId: string,
+  content: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`/api/jj/comments/${encodeURIComponent(threadId)}/reply`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
+    ...(signal ? { signal } : {}),
+  });
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, 'Failed to reply to comment'));
+  }
+}
+
+export async function resolveJjComment(
+  threadId: string,
+  unresolve = false,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const res = await fetch(`/api/jj/comments/${encodeURIComponent(threadId)}/resolve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ unresolve }),
+    ...(signal ? { signal } : {}),
+  });
+  if (!res.ok) {
+    throw new Error(
+      await readApiErrorMessage(
+        res,
+        unresolve ? 'Failed to reopen comment' : 'Failed to resolve comment',
+      ),
+    );
+  }
+
+  const payload: unknown = await res.json();
+  if (isRecord(payload) && typeof payload.resolved === 'boolean') {
+    return payload.resolved;
+  }
+  return !unresolve;
 }

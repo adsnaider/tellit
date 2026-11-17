@@ -69,6 +69,8 @@ pub struct MergedChunk {
     pub hidden_lines_after: Option<u32>,
     /// Line indices inside [`MergedChunk::lines`] that came from `/api/blob` expansion rather than the original hunk.
     pub expanded_line_flags: Vec<bool>,
+    /// Original `(chunk_index, line_index)` coordinates for non-expanded lines.
+    pub line_sources: Vec<Option<(usize, usize)>>,
 }
 
 /// Map of file paths to their cached [`FileExpandedState`].
@@ -153,6 +155,7 @@ pub fn record_expand_all_before(
 struct ExpandedChunkLines {
     lines: Vec<DiffLine>,
     flags: Vec<bool>,
+    sources: Vec<Option<(usize, usize)>>,
     old_start: u32,
     new_start: u32,
 }
@@ -169,6 +172,7 @@ pub fn merge_chunks_for_file(
         let ExpandedChunkLines {
             lines,
             flags,
+            sources,
             old_start: start_old,
             new_start: start_new,
         } = expand_single_chunk(file, chunk, idx, state);
@@ -180,6 +184,7 @@ pub fn merge_chunks_for_file(
         {
             last.lines.extend(lines);
             last.expanded_line_flags.extend(flags);
+            last.line_sources.extend(sources);
             last.original_indices.push(idx);
             last.hidden_lines_after = hidden_after;
             update_merged_spans(last);
@@ -195,6 +200,7 @@ pub fn merge_chunks_for_file(
                 hidden_lines_before: hidden_before,
                 hidden_lines_after: hidden_after,
                 expanded_line_flags: flags,
+                line_sources: sources,
             };
             update_merged_spans(&mut item);
             merged.push(item);
@@ -310,11 +316,16 @@ fn expand_single_chunk(
     chunk_index: usize,
     state: Option<&FileExpandedState>,
 ) -> ExpandedChunkLines {
+    let orig_sources = |count: usize| -> Vec<Option<(usize, usize)>> {
+        (0..count).map(|li| Some((chunk_index, li))).collect()
+    };
+
     let Some(st) = state else {
         let len = chunk.lines.len();
         return ExpandedChunkLines {
             lines: chunk.lines.clone(),
             flags: alloc::vec![false; len],
+            sources: orig_sources(len),
             old_start: chunk.old_start,
             new_start: chunk.new_start,
         };
@@ -327,6 +338,7 @@ fn expand_single_chunk(
         return ExpandedChunkLines {
             lines: chunk.lines.clone(),
             flags: alloc::vec![false; len],
+            sources: orig_sources(len),
             old_start: chunk.old_start,
             new_start: chunk.new_start,
         };
@@ -337,6 +349,7 @@ fn expand_single_chunk(
 
     let mut out_lines = Vec::new();
     let mut out_flags = Vec::new();
+    let mut out_sources = Vec::new();
 
     if expanded_up > 0 {
         let prev = chunk_index.checked_sub(1).and_then(|p| file.chunks.get(p));
@@ -383,12 +396,14 @@ fn expand_single_chunk(
                 word_diff: Vec::new(),
             });
             out_flags.push(true);
+            out_sources.push(None);
         }
     }
 
-    for line in &chunk.lines {
+    for (li, line) in chunk.lines.iter().enumerate() {
         out_lines.push(line.clone());
         out_flags.push(false);
+        out_sources.push(Some((chunk_index, li)));
     }
 
     if expanded_down > 0 {
@@ -430,6 +445,7 @@ fn expand_single_chunk(
                 word_diff: Vec::new(),
             });
             out_flags.push(true);
+            out_sources.push(None);
         }
     }
 
@@ -445,6 +461,7 @@ fn expand_single_chunk(
     ExpandedChunkLines {
         lines: out_lines,
         flags: out_flags,
+        sources: out_sources,
         old_start: first_old,
         new_start: first_new,
     }

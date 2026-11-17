@@ -22,6 +22,25 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
+          nativeBuildInputs = [
+            pkgs.trunk
+            pkgs.wasm-bindgen-cli
+            pkgs.lld
+          ];
+          nativeCheckInputs = [
+            pkgs.git
+            pkgs.jujutsu
+          ];
+          preBuild = ''
+            (
+              cd crates/tellit-ui
+              HOME="$TMPDIR" TRUNK_TOOLS_WASM_BINDGEN="${pkgs.wasm-bindgen-cli.version}" \
+                trunk build --release --offline
+            )
+          '';
+          preCheck = ''
+            export HOME="$TMPDIR"
+          '';
           cargoBuildFlags = [
             "-p"
             "tellit-cli"

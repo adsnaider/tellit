@@ -6,7 +6,11 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use std::collections::HashSet;
 
-use tellit_types::{CommentSide, HeartbeatEvent, JjCommentThread, JjStatusResponse, LineRangeSpec};
+use tellit_types::{
+    AppearanceSettings, CommentSide, HeartbeatEvent, JjCommentThread, JjStatusResponse,
+    LineRangeSpec, ThemePreference,
+};
+use wasm_bindgen::JsCast;
 
 /// `localStorage` key controlling whether the left sidebar starts open.
 pub const SIDEBAR_OPEN_STORAGE_KEY: &str = "difit.sidebarOpen";
@@ -18,6 +22,8 @@ pub const REVISIONS_TREE_STORAGE_KEY: &str = "tellit.revisionsTreeOpen";
 pub const DIFF_MODE_STORAGE_KEY: &str = "tellit.diffViewMode";
 /// `localStorage` key controlling whether resolved comment threads appear inline in diffs.
 pub const SHOW_RESOLVED_INLINE_STORAGE_KEY: &str = "tellit.showResolvedInline";
+/// `localStorage` key caching client appearance and editor settings.
+pub const APPEARANCE_STORAGE_KEY: &str = "tellit.appearanceSettings";
 /// Minimum sidebar width in pixels.
 pub const SIDEBAR_MIN_WIDTH: u32 = 200;
 /// Maximum sidebar width in pixels.
@@ -163,17 +169,40 @@ pub const fn clamp_sidebar_width(width: u32) -> u32 {
     }
 }
 
-/// Builds a stable DOM element ID for scrolling to a file diff card.
-#[must_use]
-pub fn file_element_id(path: &str) -> String {
-    let mut out = String::from("file-");
-    for ch in path.chars() {
+fn push_sanitized_id(out: &mut String, raw: &str) {
+    for ch in raw.chars() {
         if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
             out.push(ch);
         } else {
             out.push('_');
         }
     }
+}
+
+/// Builds a stable DOM element ID for scrolling to a file diff card.
+#[must_use]
+pub fn file_element_id(path: &str) -> String {
+    let mut out = String::from("file-");
+    push_sanitized_id(&mut out, path);
+    out
+}
+
+/// Builds a stable DOM element ID for scrolling to one line inside a file diff.
+#[must_use]
+pub fn diff_line_element_id(
+    path: &str,
+    chunk_index: usize,
+    line_index: usize,
+    side: CommentSide,
+) -> String {
+    let side_tag = match side {
+        CommentSide::Old => "old",
+        CommentSide::New => "new",
+    };
+    let mut out = String::from("diffline-");
+    push_sanitized_id(&mut out, path);
+    out.push('-');
+    out.push_str(&alloc::format!("{chunk_index}-{line_index}-{side_tag}"));
     out
 }
 
@@ -315,13 +344,7 @@ pub fn save_diff_view_mode(mode: DiffViewMode) {
 #[must_use]
 pub fn thread_element_id(thread_id: &str) -> String {
     let mut out = String::from("comment-thread-");
-    for ch in thread_id.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
+    push_sanitized_id(&mut out, thread_id);
     out
 }
 
@@ -474,6 +497,218 @@ pub fn format_all_comments_prompt(
     }
 }
 
+/// Concrete light or dark theme active after resolving [`ThemePreference::Auto`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedTheme {
+    /// Dark color palette.
+    Dark,
+    /// Light color palette.
+    Light,
+}
+
+impl ResolvedTheme {
+    /// Returns the attribute value written to `document.documentElement` (`"dark"` or `"light"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+}
+
+/// Loads cached [`AppearanceSettings`] from `localStorage`, falling back to defaults.
+#[must_use]
+pub fn load_appearance_settings() -> AppearanceSettings {
+    local_storage()
+        .and_then(|s| s.get_item(APPEARANCE_STORAGE_KEY).ok().flatten())
+        .and_then(|raw| serde_json::from_str::<AppearanceSettings>(&raw).ok())
+        .map(AppearanceSettings::normalized)
+        .unwrap_or_default()
+}
+
+/// Persists `settings` into `localStorage`.
+pub fn save_appearance_settings(settings: &AppearanceSettings) {
+    if let (Some(storage), Ok(json)) = (local_storage(), serde_json::to_string(settings)) {
+        let _ = storage.set_item(APPEARANCE_STORAGE_KEY, &json);
+    }
+}
+
+/// Resolves `pref` into either [`ResolvedTheme::Dark`] or [`ResolvedTheme::Light`].
+#[must_use]
+pub fn resolve_theme_preference(pref: ThemePreference) -> ResolvedTheme {
+    match pref {
+        ThemePreference::Dark => ResolvedTheme::Dark,
+        ThemePreference::Light => ResolvedTheme::Light,
+        ThemePreference::Auto => {
+            let prefers_dark = web_sys::window()
+                .and_then(|w| w.match_media("(prefers-color-scheme: dark)").ok().flatten())
+                .is_none_or(|mq| mq.matches());
+            if prefers_dark {
+                ResolvedTheme::Dark
+            } else {
+                ResolvedTheme::Light
+            }
+        }
+    }
+}
+
+/// Applies theme, color vision mode, and font CSS variables onto `document.documentElement`.
+pub fn apply_appearance_to_document(settings: &AppearanceSettings) -> ResolvedTheme {
+    let resolved = resolve_theme_preference(settings.theme);
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return resolved;
+    };
+    let Some(root) = document.document_element() else {
+        return resolved;
+    };
+    let _ = root.set_attribute("data-theme", resolved.as_str());
+    let _ = root.set_attribute("data-color-vision", settings.color_vision.as_str());
+
+    if let Some(html_el) = root.dyn_ref::<web_sys::HtmlElement>() {
+        let style = html_el.style();
+        let clamped_size = settings.font_size.clamp(10, 20);
+        let _ = style.set_property("--app-font-size", &alloc::format!("{clamped_size}px"));
+        if !settings.font_family.trim().is_empty() {
+            let _ = style.set_property("--app-font-family", settings.font_family.trim());
+        }
+    }
+    resolved
+}
+
+/// Returns `true` when `filename` ends with a Markdown extension (`.md`, `.markdown`).
+#[must_use]
+pub fn is_markdown_file(filename: &str) -> bool {
+    let ext = filename.rsplit('.').next().unwrap_or("");
+    filename.contains('.')
+        && (ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"))
+}
+
+/// Returns `true` when `filename` ends with a recognized raster or vector image extension.
+#[must_use]
+pub fn is_image_file(filename: &str) -> bool {
+    if !filename.contains('.') {
+        return false;
+    }
+    let ext = filename.rsplit('.').next().unwrap_or("");
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "jpg"
+            | "jpeg"
+            | "png"
+            | "gif"
+            | "bmp"
+            | "svg"
+            | "webp"
+            | "ico"
+            | "tiff"
+            | "tif"
+            | "avif"
+            | "heic"
+            | "heif"
+    )
+}
+
+/// Parses newline-separated auto-viewed glob patterns, ignoring empty lines and `#` comments.
+#[must_use]
+pub fn parse_auto_viewed_patterns(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(String::from)
+        .collect()
+}
+
+/// Formats auto-viewed glob patterns into newline-delimited editor text.
+#[must_use]
+pub fn format_auto_viewed_patterns(patterns: &[String]) -> String {
+    patterns.join("\n")
+}
+
+/// Returns `true` when `file_path` matches at least one glob pattern in `patterns`.
+#[must_use]
+pub fn matches_auto_viewed_patterns(file_path: &str, patterns: &[String]) -> bool {
+    let basename = file_path.rsplit('/').next().unwrap_or(file_path);
+    patterns.iter().any(|pattern| {
+        let trimmed = pattern.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if !trimmed.contains('/') {
+            glob_match(trimmed, basename) || glob_match(trimmed, file_path)
+        } else {
+            glob_match(trimmed, file_path)
+        }
+    })
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    glob_match_chars(&p, &t)
+}
+
+fn glob_match_chars(pattern: &[char], text: &[char]) -> bool {
+    match pattern {
+        [] => text.is_empty(),
+        ['*', '*', '/', rest @ ..] => {
+            if glob_match_chars(rest, text) {
+                return true;
+            }
+            for idx in 0..text.len() {
+                if text[idx] == '/' && glob_match_chars(rest, &text[idx + 1..]) {
+                    return true;
+                }
+            }
+            false
+        }
+        ['*', '*', rest @ ..] => (0..=text.len()).any(|i| glob_match_chars(rest, &text[i..])),
+        ['*', rest @ ..] => {
+            for i in 0..=text.len() {
+                if glob_match_chars(rest, &text[i..]) {
+                    return true;
+                }
+                if i < text.len() && text[i] == '/' {
+                    break;
+                }
+            }
+            false
+        }
+        ['?', rest @ ..] => {
+            !text.is_empty() && text[0] != '/' && glob_match_chars(rest, &text[1..])
+        }
+        [ch, rest @ ..] => !text.is_empty() && text[0] == *ch && glob_match_chars(rest, &text[1..]),
+    }
+}
+
+/// Adjusts a dark-theme `#rrggbb` syntax foreground color for legible contrast on light backgrounds.
+#[must_use]
+pub fn theme_adjusted_fg(fg_hex: &str, theme: ResolvedTheme) -> String {
+    if theme == ResolvedTheme::Dark {
+        return String::from(fg_hex);
+    }
+    let hex = fg_hex.trim().strip_prefix('#').unwrap_or("");
+    if hex.len() != 6 {
+        return String::from(fg_hex);
+    }
+    let (Ok(r), Ok(g), Ok(b)) = (
+        u32::from_str_radix(&hex[0..2], 16),
+        u32::from_str_radix(&hex[2..4], 16),
+        u32::from_str_radix(&hex[4..6], 16),
+    ) else {
+        return String::from(fg_hex);
+    };
+    let luma = (299 * r + 587 * g + 114 * b) / 1000;
+    if luma <= 120 {
+        return String::from(fg_hex);
+    }
+    let target = 105u32;
+    let nr = (r * target / luma).min(255);
+    let ng = (g * target / luma).min(255);
+    let nb = (b * target / luma).min(255);
+    alloc::format!("#{nr:02x}{ng:02x}{nb:02x}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,5 +749,46 @@ mod tests {
             "cccc3333dddd4444",
         );
         assert!(all.starts_with("diff cccc3333dddd..aaaa1111bbbb\n\n"));
+    }
+
+    #[test]
+    fn detects_markdown_and_image_file_extensions() {
+        assert!(is_markdown_file("README.md"));
+        assert!(is_markdown_file("docs/GUIDE.MARKDOWN"));
+        assert!(!is_markdown_file("src/main.rs"));
+
+        assert!(is_image_file("assets/logo.PNG"));
+        assert!(is_image_file("icon.svg"));
+        assert!(!is_image_file("README.md"));
+    }
+
+    #[test]
+    fn matches_auto_viewed_glob_patterns() {
+        let raw = "*.lock\n  src/generated/** \n# ignore comment\n*.stories.tsx\n";
+        let patterns = parse_auto_viewed_patterns(raw);
+        assert_eq!(
+            patterns,
+            vec!["*.lock", "src/generated/**", "*.stories.tsx"]
+        );
+
+        assert!(matches_auto_viewed_patterns("Cargo.lock", &patterns));
+        assert!(matches_auto_viewed_patterns("nested/foo.lock", &patterns));
+        assert!(matches_auto_viewed_patterns(
+            "src/generated/types/api.rs",
+            &patterns
+        ));
+        assert!(matches_auto_viewed_patterns(
+            "ui/Button.stories.tsx",
+            &patterns
+        ));
+        assert!(!matches_auto_viewed_patterns("src/main.rs", &patterns));
+    }
+
+    #[test]
+    fn adjusts_bright_syntax_colors_for_light_theme() {
+        assert_eq!(theme_adjusted_fg("#eff1f5", ResolvedTheme::Dark), "#eff1f5");
+        let light = theme_adjusted_fg("#eff1f5", ResolvedTheme::Light);
+        assert_ne!(light, "#eff1f5");
+        assert!(light.starts_with('#') && light.len() == 7);
     }
 }

@@ -1139,3 +1139,77 @@ async fn blob_line_count_and_open_in_editor_enforce_safety_and_serve_content() {
     server.shutdown();
     server.wait().await.unwrap();
 }
+
+#[tokio::test]
+async fn user_settings_get_and_put_persist_and_validate_payloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("tellit").join("config.json");
+    let config = ServerConfig::new(dir.path().to_path_buf())
+        .with_port(Some(0))
+        .with_keep_alive(true)
+        .with_quiet(true)
+        .with_user_config_path(Some(cfg_path.clone()));
+    let server = start_server(config).await.unwrap();
+    let client = reqwest::Client::new();
+
+    // Missing config file yields version 1 with empty client object.
+    let initial: serde_json::Value = client
+        .get(format!("{}/api/user-settings", server.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(initial, serde_json::json!({ "version": 1, "client": {} }));
+
+    // PUT persists and shallow-merges client keys onto disk.
+    let put_resp: serde_json::Value = client
+        .put(format!("{}/api/user-settings", server.url))
+        .json(&serde_json::json!({
+            "client": {
+                "appearance": { "theme": "light", "fontSize": 15 },
+                "preserved": "yes"
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(put_resp["client"]["preserved"], "yes");
+    assert_eq!(put_resp["client"]["appearance"]["theme"], "light");
+
+    let merge_resp: serde_json::Value = client
+        .put(format!("{}/api/user-settings", server.url))
+        .json(&serde_json::json!({
+            "client": {
+                "appearance": { "theme": "dark", "fontSize": 16 }
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(merge_resp["client"]["preserved"], "yes");
+    assert_eq!(merge_resp["client"]["appearance"]["fontSize"], 16);
+
+    let on_disk: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    assert_eq!(on_disk, merge_resp);
+
+    // Non-object client patch returns 400 Bad Request.
+    let bad = client
+        .put(format!("{}/api/user-settings", server.url))
+        .json(&serde_json::json!({ "client": "invalid" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+    server.shutdown();
+    server.wait().await.unwrap();
+}

@@ -9,89 +9,14 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
-use tellit_types::{OpenInEditorRequest, OpenInEditorResponse};
+use tellit_types::{
+    EDITOR_PRESETS, EditorPreset, OpenInEditorRequest, OpenInEditorResponse, resolve_editor_preset,
+};
 use thiserror::Error;
 use tokio::process::Command;
 
 use super::diff_parser::COMMIT_MESSAGE_PATH;
 use super::jujutsu::validate_repo_relative_path;
-
-/// Built-in editor CLI preset recognized by `tellit`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EditorPreset {
-    /// Stable lowercase identifier (`vscode`, `cursor`, `zed`, etc.).
-    pub id: &'static str,
-    /// Human-readable label shown in settings.
-    pub label: &'static str,
-    /// Executable name launched directly without a shell.
-    pub command: &'static str,
-    /// Whitespace-separated argument template supporting `%file` and `%line`.
-    pub args_template: &'static str,
-}
-
-/// Supported built-in editor presets matching the original desktop/CLI defaults.
-pub const EDITOR_PRESETS: &[EditorPreset] = &[
-    EditorPreset {
-        id: "vscode",
-        label: "VS Code",
-        command: "code",
-        args_template: "-g %file:%line",
-    },
-    EditorPreset {
-        id: "cursor",
-        label: "Cursor",
-        command: "cursor",
-        args_template: "-g %file:%line",
-    },
-    EditorPreset {
-        id: "zed",
-        label: "Zed",
-        command: "zed",
-        args_template: "%file:%line",
-    },
-    EditorPreset {
-        id: "textmate",
-        label: "TextMate",
-        command: "mate",
-        args_template: "-l %line %file",
-    },
-    EditorPreset {
-        id: "bbedit",
-        label: "BBEdit",
-        command: "bbedit",
-        args_template: "+%line %file",
-    },
-    EditorPreset {
-        id: "emacs",
-        label: "Emacs",
-        command: "emacsclient",
-        args_template: "--no-wait +%line %file",
-    },
-    EditorPreset {
-        id: "macvim",
-        label: "MacVim",
-        command: "mvim",
-        args_template: "--remote-silent +%line %file",
-    },
-    EditorPreset {
-        id: "sublime",
-        label: "Sublime Text",
-        command: "subl",
-        args_template: "%file:%line",
-    },
-    EditorPreset {
-        id: "nova",
-        label: "Nova",
-        command: "nova",
-        args_template: "open %file -l %line",
-    },
-    EditorPreset {
-        id: "vim",
-        label: "Vim / Neovim",
-        command: "nvim",
-        args_template: "+%line %file",
-    },
-];
 
 const BLOCKED_INTERPRETER_NAMES: &[&str] = &[
     "sh",
@@ -160,10 +85,7 @@ pub struct EditorSpawnSpec {
 /// Looks up a built-in [`EditorPreset`] by case-insensitive identifier.
 #[must_use]
 pub fn resolve_preset(id: &str) -> Option<&'static EditorPreset> {
-    let normalized = id.trim();
-    EDITOR_PRESETS
-        .iter()
-        .find(|preset| preset.id.eq_ignore_ascii_case(normalized))
+    resolve_editor_preset(id)
 }
 
 /// Tokenizes an editor arguments template supporting single/double quotes and `\"` / `\\` escapes.

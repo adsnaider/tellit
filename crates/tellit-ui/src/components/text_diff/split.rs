@@ -17,16 +17,25 @@ pub struct SideBySideRow {
     pub old_is_expanded: bool,
     /// Whether `new_line` came from context expansion rather than the original diff hunk.
     pub new_is_expanded: bool,
+    /// Original `(chunk_index, line_index)` for `old_line` when not expanded.
+    pub old_source: Option<(usize, usize)>,
+    /// Original `(chunk_index, line_index)` for `new_line` when not expanded.
+    pub new_source: Option<(usize, usize)>,
 }
 
 /// Pairs contiguous delete and add runs row-for-row while keeping context lines aligned across both panes.
 #[must_use]
-pub fn pair_side_by_side_rows(lines: &[DiffLine], expanded_flags: &[bool]) -> Vec<SideBySideRow> {
+pub fn pair_side_by_side_rows(
+    lines: &[DiffLine],
+    expanded_flags: &[bool],
+    line_sources: &[Option<(usize, usize)>],
+) -> Vec<SideBySideRow> {
     let mut rows = Vec::with_capacity(lines.len());
     let mut i = 0usize;
 
     while i < lines.len() {
         let is_exp = |idx: usize| expanded_flags.get(idx).copied().unwrap_or(false);
+        let src = |idx: usize| line_sources.get(idx).copied().flatten();
         match lines[i].kind {
             DiffLineKind::Context => {
                 rows.push(SideBySideRow {
@@ -34,6 +43,8 @@ pub fn pair_side_by_side_rows(lines: &[DiffLine], expanded_flags: &[bool]) -> Ve
                     new_line: Some(lines[i].clone()),
                     old_is_expanded: is_exp(i),
                     new_is_expanded: is_exp(i),
+                    old_source: src(i),
+                    new_source: src(i),
                 });
                 i += 1;
             }
@@ -62,6 +73,8 @@ pub fn pair_side_by_side_rows(lines: &[DiffLine], expanded_flags: &[bool]) -> Ve
                         new_line: new_idx.map(|idx| lines[idx].clone()),
                         old_is_expanded: old_idx.is_some_and(is_exp),
                         new_is_expanded: new_idx.is_some_and(is_exp),
+                        old_source: old_idx.and_then(src),
+                        new_source: new_idx.and_then(src),
                     });
                 }
             }
@@ -71,6 +84,8 @@ pub fn pair_side_by_side_rows(lines: &[DiffLine], expanded_flags: &[bool]) -> Ve
                     new_line: Some(lines[i].clone()),
                     old_is_expanded: false,
                     new_is_expanded: is_exp(i),
+                    old_source: None,
+                    new_source: src(i),
                 });
                 i += 1;
             }
@@ -106,7 +121,8 @@ mod tests {
             mk(DiffLineKind::Context, Some(3), Some(4)),
         ];
         let flags = alloc::vec![true, false, false, false, false];
-        let paired = pair_side_by_side_rows(&lines, &flags);
+        let sources: Vec<Option<(usize, usize)>> = (0..5).map(|i| Some((0, i))).collect();
+        let paired = pair_side_by_side_rows(&lines, &flags, &sources);
 
         assert_eq!(paired.len(), 4);
         assert!(paired[0].old_is_expanded && paired[0].new_is_expanded);

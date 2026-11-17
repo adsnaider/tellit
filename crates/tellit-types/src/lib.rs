@@ -847,6 +847,98 @@ pub struct LineCountResponse {
     pub new_line_count: Option<usize>,
 }
 
+/// Special editor preset identifier representing disabled editor launching.
+pub const NONE_EDITOR_ID: &str = "none";
+
+/// Special editor preset identifier representing user-defined command and args template.
+pub const CUSTOM_EDITOR_ID: &str = "custom";
+
+/// Built-in editor CLI preset recognized by both the server and client settings UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditorPreset {
+    /// Stable lowercase identifier (`vscode`, `cursor`, `zed`, etc.).
+    pub id: &'static str,
+    /// Human-readable label shown in settings.
+    pub label: &'static str,
+    /// Executable name launched directly without a shell.
+    pub command: &'static str,
+    /// Whitespace-separated argument template supporting `%file` and `%line`.
+    pub args_template: &'static str,
+}
+
+/// Supported built-in editor presets matching the `tellit` CLI defaults.
+pub const EDITOR_PRESETS: &[EditorPreset] = &[
+    EditorPreset {
+        id: "vscode",
+        label: "VS Code",
+        command: "code",
+        args_template: "-g %file:%line",
+    },
+    EditorPreset {
+        id: "cursor",
+        label: "Cursor",
+        command: "cursor",
+        args_template: "-g %file:%line",
+    },
+    EditorPreset {
+        id: "zed",
+        label: "Zed",
+        command: "zed",
+        args_template: "%file:%line",
+    },
+    EditorPreset {
+        id: "textmate",
+        label: "TextMate",
+        command: "mate",
+        args_template: "-l %line %file",
+    },
+    EditorPreset {
+        id: "bbedit",
+        label: "BBEdit",
+        command: "bbedit",
+        args_template: "+%line %file",
+    },
+    EditorPreset {
+        id: "emacs",
+        label: "Emacs",
+        command: "emacsclient",
+        args_template: "--no-wait +%line %file",
+    },
+    EditorPreset {
+        id: "macvim",
+        label: "MacVim",
+        command: "mvim",
+        args_template: "--remote-silent +%line %file",
+    },
+    EditorPreset {
+        id: "sublime",
+        label: "Sublime Text",
+        command: "subl",
+        args_template: "%file:%line",
+    },
+    EditorPreset {
+        id: "nova",
+        label: "Nova",
+        command: "nova",
+        args_template: "open %file -l %line",
+    },
+    EditorPreset {
+        id: "vim",
+        label: "Vim / Neovim",
+        command: "nvim",
+        args_template: "+%line %file",
+    },
+];
+
+/// Looks up a built-in [`EditorPreset`] by case-insensitive identifier.
+#[must_use]
+pub fn resolve_editor_preset(id: &str) -> Option<&'static EditorPreset> {
+    let normalized = id.trim();
+    EDITOR_PRESETS
+        .iter()
+        .find(|preset| preset.id.eq_ignore_ascii_case(normalized))
+}
+
 /// Client editor configuration sent with `POST /api/open-in-editor`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -860,6 +952,18 @@ pub struct EditorSpecRequest {
     /// Custom argument template (`%file`, `%line`) when `id` is `"custom"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args_template: Option<String>,
+}
+
+impl EditorSpecRequest {
+    /// Constructs an [`EditorSpecRequest`] prefilled from a built-in [`EditorPreset`].
+    #[must_use]
+    pub fn from_preset(preset: EditorPreset) -> Self {
+        Self {
+            id: Some(String::from(preset.id)),
+            command: Some(String::from(preset.command)),
+            args_template: Some(String::from(preset.args_template)),
+        }
+    }
 }
 
 /// Request body accepted by `POST /api/open-in-editor`.
@@ -882,6 +986,110 @@ pub struct OpenInEditorRequest {
 pub struct OpenInEditorResponse {
     /// `true` once the editor process was spawned.
     pub success: bool,
+}
+
+/// Default UI font-family CSS stack when no custom font is selected.
+pub const DEFAULT_FONT_FAMILY: &str =
+    r#"-apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif"#;
+
+/// User theme selection for light, dark, or OS-matched color schemes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePreference {
+    /// GitHub-style dark theme.
+    #[default]
+    Dark,
+    /// GitHub-style light theme.
+    Light,
+    /// Follow the browser's `prefers-color-scheme` media query.
+    Auto,
+}
+
+impl ThemePreference {
+    /// Returns the canonical lowercase string identifier for storage and DOM attributes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+/// Color palette preference for diff addition and deletion highlights.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorVisionMode {
+    /// Standard green addition and red deletion highlights.
+    #[default]
+    Normal,
+    /// Accessible blue addition and orange deletion highlights.
+    Deuteranopia,
+}
+
+impl ColorVisionMode {
+    /// Returns the canonical lowercase string identifier for DOM attributes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Deuteranopia => "deuteranopia",
+        }
+    }
+}
+
+/// Client appearance, editor preset, and auto-viewed pattern preferences persisted in settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AppearanceSettings {
+    /// Base UI font size in pixels, clamped to `10..=20`.
+    pub font_size: u8,
+    /// CSS font-family stack applied across the interface.
+    pub font_family: String,
+    /// Theme mode (`dark`, `light`, or `auto`).
+    pub theme: ThemePreference,
+    /// Color vision palette (`normal` or `deuteranopia`).
+    pub color_vision: ColorVisionMode,
+    /// Preferred external editor preset or custom command used by `POST /api/open-in-editor`.
+    pub editor: EditorSpecRequest,
+    /// Glob patterns for files that should start marked as viewed automatically.
+    pub auto_viewed_patterns: Vec<String>,
+}
+
+impl AppearanceSettings {
+    /// Default VS Code editor preset matching `src/server/editor.rs`.
+    #[must_use]
+    pub fn default_editor() -> EditorSpecRequest {
+        EditorSpecRequest {
+            id: Some(String::from("vscode")),
+            command: Some(String::from("code")),
+            args_template: Some(String::from("-g %file:%line")),
+        }
+    }
+
+    /// Clamps `font_size` into the supported `10..=20` pixel range.
+    #[must_use]
+    pub fn normalized(mut self) -> Self {
+        self.font_size = self.font_size.clamp(10, 20);
+        if self.font_family.trim().is_empty() {
+            self.font_family = String::from(DEFAULT_FONT_FAMILY);
+        }
+        self
+    }
+}
+
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        Self {
+            font_size: 14,
+            font_family: String::from(DEFAULT_FONT_FAMILY),
+            theme: ThemePreference::Dark,
+            color_vision: ColorVisionMode::Normal,
+            editor: Self::default_editor(),
+            auto_viewed_patterns: Vec::new(),
+        }
+    }
 }
 
 /// Structured error payload returned by `/api/*` endpoints on failure.
@@ -983,5 +1191,18 @@ mod tests {
             let decoded: WatchEvent = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, event);
         }
+    }
+
+    #[test]
+    fn appearance_settings_defaults_and_roundtrips() {
+        let defaults = AppearanceSettings::default();
+        let json = serde_json::to_string(&defaults).unwrap();
+        let decoded: AppearanceSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, defaults);
+
+        let partial: AppearanceSettings = serde_json::from_str(r#"{"fontSize":99}"#).unwrap();
+        let normalized = partial.normalized();
+        assert_eq!(normalized.font_size, 20);
+        assert_eq!(normalized.theme, ThemePreference::Dark);
     }
 }

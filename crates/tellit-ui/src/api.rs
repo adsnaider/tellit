@@ -9,17 +9,17 @@ use core::str::FromStr;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tellit_types::{
-    ApiErrorResponse, ApproveCommitRequest, ApproveCommitResponse, CreateCommentRequest,
-    CreateCommentResponse, HeartbeatEvent, JjChangesResponse, JjCommentsResponse,
-    JjCommitsResponse, JjDiffResponse, JjStatusResponse, LineCountResponse, OpenInEditorRequest,
-    OpenInEditorResponse, ReplyCommentRequest, ReplyCommentResponse, ResolveCommentRequest,
-    ResolveCommentResponse, WatchEvent,
+    ApiErrorResponse, AppearanceSettings, ApproveCommitRequest, ApproveCommitResponse,
+    CreateCommentRequest, CreateCommentResponse, EditorSpecRequest, HeartbeatEvent,
+    JjChangesResponse, JjCommentsResponse, JjCommitsResponse, JjDiffResponse, JjStatusResponse,
+    LineCountResponse, OpenInEditorRequest, OpenInEditorResponse, ReplyCommentRequest,
+    ReplyCommentResponse, ResolveCommentRequest, ResolveCommentResponse, WatchEvent,
 };
 use thiserror::Error;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Event, EventSource, Headers, MessageEvent, RequestInit, Response};
+use web_sys::{Blob, Event, EventSource, Headers, MessageEvent, RequestInit, Response};
 
 /// Errors produced when communicating with the local `tellit` HTTP server.
 #[derive(Debug, Error)]
@@ -118,7 +118,8 @@ async fn fetch_json<T: DeserializeOwned>(url: &str) -> Result<T, ApiError> {
     send_request(url, None).await
 }
 
-async fn post_json<Req: Serialize, Resp: DeserializeOwned>(
+async fn send_json_with_method<Req: Serialize, Resp: DeserializeOwned>(
+    method: &str,
     url: &str,
     payload: &Req,
 ) -> Result<Resp, ApiError> {
@@ -129,11 +130,25 @@ async fn post_json<Req: Serialize, Resp: DeserializeOwned>(
         .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
 
     let init = RequestInit::new();
-    init.set_method("POST");
+    init.set_method(method);
     init.set_headers(&headers);
     init.set_body(&wasm_bindgen::JsValue::from_str(&json_body));
 
     send_request(url, Some(&init)).await
+}
+
+async fn post_json<Req: Serialize, Resp: DeserializeOwned>(
+    url: &str,
+    payload: &Req,
+) -> Result<Resp, ApiError> {
+    send_json_with_method("POST", url, payload).await
+}
+
+async fn put_json<Req: Serialize, Resp: DeserializeOwned>(
+    url: &str,
+    payload: &Req,
+) -> Result<Resp, ApiError> {
+    send_json_with_method("PUT", url, payload).await
 }
 
 /// Fetches `GET /api/jj/status` from the local `tellit` server.
@@ -273,18 +288,60 @@ pub async fn post_jj_comment_resolve(
     post_json(&url, &ResolveCommentRequest { unresolve }).await
 }
 
+/// Constructs a `/api/blob/{*path}?ref=...` URL for raw image or blob fetching.
+#[must_use]
+pub fn blob_url(file_path: &str, rev: &str) -> String {
+    alloc::format!(
+        "/api/blob/{}?ref={}",
+        encode_uri_path(file_path),
+        encode_uri_component(rev)
+    )
+}
+
 /// Fetches UTF-8 text content for `file_path` at Jujutsu revision `rev` via `GET /api/blob/{*path}`.
 ///
 /// # Errors
 ///
 /// Returns [`ApiError`] if the HTTP request fails or the server returns 4xx/5xx.
 pub async fn fetch_blob_text(file_path: &str, rev: &str) -> Result<String, ApiError> {
-    let url = alloc::format!(
-        "/api/blob/{}?ref={}",
-        encode_uri_path(file_path),
-        encode_uri_component(rev)
-    );
+    let url = blob_url(file_path, rev);
     send_text_request(&url, None).await
+}
+
+/// Fetches a blob resource and returns its byte length without retaining the payload.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if the browser request fails or returns a non-success HTTP status.
+pub async fn fetch_blob_byte_size(url: &str) -> Result<u64, ApiError> {
+    let window = web_sys::window().ok_or(ApiError::MissingWindow)?;
+    let resp_value = JsFuture::from(window.fetch_with_str(url))
+        .await
+        .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
+    let response: Response = resp_value
+        .dyn_into()
+        .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
+    if !response.ok() {
+        return Err(ApiError::HttpStatus {
+            status: response.status(),
+            message: response.status_text(),
+        });
+    }
+    let blob_promise = response
+        .blob()
+        .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
+    let blob_val = JsFuture::from(blob_promise)
+        .await
+        .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
+    let blob: Blob = blob_val
+        .dyn_into()
+        .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
+    let size = blob.size();
+    Ok(if size.is_finite() && size >= 0.0 {
+        size as u64
+    } else {
+        0
+    })
 }
 
 /// Fetches line counts for `file_path` at `old_ref` (`old_path` if renamed) and/or `new_ref`.
@@ -330,16 +387,50 @@ pub async fn fetch_line_count(
 pub async fn post_open_in_editor(
     file_path: &str,
     line: Option<usize>,
+    editor: Option<EditorSpecRequest>,
 ) -> Result<OpenInEditorResponse, ApiError> {
     post_json(
         "/api/open-in-editor",
         &OpenInEditorRequest {
             file_path: String::from(file_path),
             line,
-            editor: None,
+            editor,
         },
     )
     .await
+}
+
+/// Fetches server-persisted client appearance settings from `GET /api/user-settings`.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if the HTTP request fails or returns malformed JSON.
+pub async fn fetch_user_settings() -> Result<Option<AppearanceSettings>, ApiError> {
+    let payload: serde_json::Value = fetch_json("/api/user-settings").await?;
+    let Some(appearance) = payload
+        .get("client")
+        .and_then(|c| c.get("appearance"))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let parsed: AppearanceSettings = serde_json::from_value(appearance)?;
+    Ok(Some(parsed.normalized()))
+}
+
+/// Persists `settings` under `client.appearance` via `PUT /api/user-settings`.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if serialization fails or the HTTP request fails.
+pub async fn save_user_settings(settings: &AppearanceSettings) -> Result<(), ApiError> {
+    let body = serde_json::json!({
+        "client": {
+            "appearance": settings,
+        }
+    });
+    let _: serde_json::Value = put_json("/api/user-settings", &body).await?;
+    Ok(())
 }
 
 /// Copies `text` to the browser clipboard via `navigator.clipboard.writeText`.

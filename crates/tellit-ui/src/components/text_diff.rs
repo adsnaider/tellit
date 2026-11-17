@@ -20,16 +20,31 @@ use crate::components::comments::{
     CommentComposer, CommentReplyEvent, CommentSubmitEvent, CommentThreadCard,
 };
 use crate::components::file_list::status_badge_class;
-use crate::state::{self, DiffViewMode};
+use crate::components::image_diff::ImageDiffBody;
+use crate::components::keyboard::CursorPosition;
+use crate::components::markdown_diff::{MarkdownPreviewBody, MarkdownTab};
+use crate::state::{self, DiffViewMode, ResolvedTheme};
 
 use expanded::{
-    DEFAULT_EXPAND_COUNT, ExpandDirection, ExpandedLinesMap, FileExpandedState, MergedChunk,
-    merge_chunks_for_file,
+    DEFAULT_EXPAND_COUNT, ExpandDirection, ExpandedLinesMap, MergedChunk, merge_chunks_for_file,
 };
 use split::pair_side_by_side_rows;
 use word_highlight::CodeLineContent;
 
 const COMMIT_MESSAGE_PATH: &str = "Commit Message";
+
+/// Trigger signal emitted when the user presses `c` on a keyboard-focused diff line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyboardCommentTrigger {
+    /// Monotonic counter so repeated triggers on the same line still open the composer.
+    pub seq: u64,
+    /// Target file path of the focused row.
+    pub file_path: String,
+    /// Diff side (`Old` or `New`) of the focused row.
+    pub side: CommentSide,
+    /// 1-based line number of the focused row.
+    pub line_num: u32,
+}
 
 /// Event emitted when the user submits a new inline or file-level review comment.
 #[derive(Clone)]
@@ -90,6 +105,9 @@ enum SplitAlign {
 #[derive(Clone, Copy)]
 struct ChunkRenderCtx {
     is_commit_msg: bool,
+    file_index: usize,
+    resolved_theme: Signal<ResolvedTheme>,
+    active_cursor: Signal<Option<CursorPosition>>,
     highlighted_word: Signal<Option<String>>,
     on_toggle_word: Callback<String>,
     drag_state: RwSignal<Option<LineSelectionDrag>>,
@@ -101,18 +119,25 @@ struct ChunkRenderCtx {
     on_toggle_resolve: Callback<(String, bool)>,
 }
 
-/// Interactive diff card supporting Unified/Split modes, context expansion, drag selection, and threads.
+/// Interactive diff card supporting Text, Markdown, Image views, expansion, drag selection, and threads.
 #[component]
 pub fn TextDiffCard(
     file: DiffFile,
+    file_index: usize,
+    base_commit: String,
+    target_commit: String,
     #[prop(into)] all_threads: Signal<Vec<JjCommentThread>>,
     #[prop(into)] reviewed_files: Signal<HashSet<String>>,
     #[prop(into)] collapsed_files: Signal<HashSet<String>>,
     #[prop(into)] diff_mode: Signal<DiffViewMode>,
+    #[prop(into)] resolved_theme: Signal<ResolvedTheme>,
     #[prop(into)] show_resolved_inline: Signal<bool>,
     #[prop(into)] highlighted_word: Signal<Option<String>>,
     #[prop(into)] expanded_lines: Signal<ExpandedLinesMap>,
     #[prop(into)] expand_loading: Signal<bool>,
+    #[prop(into)] active_cursor: Signal<Option<CursorPosition>>,
+    #[prop(into)] keyboard_comment_trigger: Signal<Option<KeyboardCommentTrigger>>,
+    on_hover_file: Callback<Option<usize>>,
     on_toggle_word: Callback<String>,
     on_toggle_viewed: Callback<String>,
     on_toggle_collapse: Callback<String>,
@@ -125,8 +150,13 @@ pub fn TextDiffCard(
 ) -> impl IntoView {
     let path = file.path.clone();
     let is_commit_msg = path == COMMIT_MESSAGE_PATH;
-    let is_expandable =
-        !is_commit_msg && file.status != FileStatus::Added && file.status != FileStatus::Deleted;
+    let is_md = !is_commit_msg && state::is_markdown_file(&path);
+    let is_img = !is_commit_msg && state::is_image_file(&path);
+    let md_tab = RwSignal::new(MarkdownTab::Preview);
+    let is_expandable = !is_commit_msg
+        && !is_img
+        && file.status != FileStatus::Added
+        && file.status != FileStatus::Deleted;
     let has_chunks = !file.chunks.is_empty();
     let hunks_count = file.chunks.len();
     let is_generated = file.is_generated;
@@ -136,6 +166,7 @@ pub fn TextDiffCard(
     let path_for_viewed = path.clone();
     let path_for_collapsed = path.clone();
     let path_for_threads = path.clone();
+    let path_for_kbd = path.clone();
 
     let is_viewed_sig = Signal::derive(move || reviewed_files.get().contains(&path_for_viewed));
     let is_collapsed_sig =
@@ -152,7 +183,34 @@ pub fn TextDiffCard(
     let active_composer = RwSignal::new(Option::<ActiveComposer>::None);
 
     let file_for_mouseup = StoredValue::new_local(file.clone());
+    let file_for_kbd = StoredValue::new_local(file.clone());
     let file_for_prefetch = StoredValue::new_local(file.clone());
+
+    Effect::new(move |_| {
+        let Some(trig) = keyboard_comment_trigger.get() else {
+            return;
+        };
+        if trig.file_path != path_for_kbd {
+            return;
+        }
+        if is_md {
+            md_tab.set(MarkdownTab::Code);
+        }
+        let range = LineRangeSpec {
+            start: trig.line_num,
+            end: trig.line_num,
+        };
+        let snippet = file_for_kbd.with_value(|f| {
+            let exp_map = expanded_lines.get_untracked();
+            let merged = merge_chunks_for_file(f, exp_map.get(&f.path));
+            extract_snippet_across_merged(&merged, trig.side, range)
+        });
+        active_composer.set(Some(ActiveComposer {
+            side: trig.side,
+            range,
+            code_snippet: snippet,
+        }));
+    });
 
     let mouseup_handle = window_event_listener(ev::mouseup, move |_| {
         let Some(drag) = drag_state.get_untracked() else {
@@ -186,6 +244,9 @@ pub fn TextDiffCard(
 
     let chunk_ctx = ChunkRenderCtx {
         is_commit_msg,
+        file_index,
+        resolved_theme,
+        active_cursor,
         highlighted_word,
         on_toggle_word,
         drag_state,
@@ -217,6 +278,8 @@ pub fn TextDiffCard(
             } else {
                 "diff-card"
             }
+            on:mouseenter=move |_| on_hover_file.run(Some(file_index))
+            on:mouseleave=move |_| on_hover_file.run(None)
         >
             <header class="diff-card__header">
                 <div class="diff-card__left">
@@ -245,6 +308,31 @@ pub fn TextDiffCard(
                 </div>
 
                 <div class="diff-card__right">
+                    {is_md.then(|| view! {
+                        <div class="segmented" role="group" aria-label="Markdown view mode">
+                            <button
+                                type="button"
+                                class=move || if md_tab.get() == MarkdownTab::Preview { "segmented__btn segmented__btn--active" } else { "segmented__btn" }
+                                on:click=move |_| md_tab.set(MarkdownTab::Preview)
+                            >
+                                "Preview"
+                            </button>
+                            <button
+                                type="button"
+                                class=move || if md_tab.get() == MarkdownTab::Full { "segmented__btn segmented__btn--active" } else { "segmented__btn" }
+                                on:click=move |_| md_tab.set(MarkdownTab::Full)
+                            >
+                                "Full"
+                            </button>
+                            <button
+                                type="button"
+                                class=move || if md_tab.get() == MarkdownTab::Code { "segmented__btn segmented__btn--active" } else { "segmented__btn" }
+                                on:click=move |_| md_tab.set(MarkdownTab::Code)
+                            >
+                                "Code"
+                            </button>
+                        </div>
+                    })}
                     <button
                         type="button"
                         class="btn btn--ghost btn--xs"
@@ -301,6 +389,8 @@ pub fn TextDiffCard(
                 }).into_any()
             } else {
                 let file_snapshot = file_for_body.clone();
+                let base_for_body = base_commit.clone();
+                let target_for_body = target_commit.clone();
                 let path_for_whole_submit = file_snapshot.path.clone();
                 let path_for_line_submit = file_snapshot.path.clone();
 
@@ -339,191 +429,257 @@ pub fn TextDiffCard(
                             }
                         })}
 
-                        {move || {
-                            let exp_map = expanded_lines.get();
-                            let file_exp: Option<&FileExpandedState> = exp_map.get(&file_snapshot.path);
-                            let merged_chunks = merge_chunks_for_file(&file_snapshot, file_exp);
-                            let active_threads = visible_threads.get();
-                            let mode = diff_mode.get();
+                        {if is_img {
+                            view! {
+                                <>
+                                    {move || render_file_threads_section(visible_threads.get(), on_reply, on_toggle_resolve)}
+                                    <ImageDiffBody
+                                        file=file_snapshot
+                                        base_commit=base_for_body
+                                        target_commit=target_for_body
+                                    />
+                                </>
+                            }.into_any()
+                        } else {
+                            let path_for_exp = file_snapshot.path.clone();
+                            let file_for_chunks = StoredValue::new(file_snapshot.clone());
+                            let file_exp_memo = Memo::new(move |_| {
+                                expanded_lines.with(|map| map.get(&path_for_exp).cloned())
+                            });
+                            let merged_chunks_memo = Memo::new(move |_| {
+                                file_for_chunks.with_value(|f| {
+                                    file_exp_memo.with(|exp| merge_chunks_for_file(f, exp.as_ref()))
+                                })
+                            });
+                            let show_code = Memo::new(move |_| !is_md || md_tab.get() == MarkdownTab::Code);
 
-                            let mut placed_ids = HashSet::new();
-                            for mc in &merged_chunks {
-                                collect_placed_thread_ids(mc, &active_threads, mode, &mut placed_ids);
-                            }
-
-                            let unplaced: Vec<JjCommentThread> = active_threads
-                                .iter()
-                                .filter(|t| !placed_ids.contains(&t.id))
-                                .cloned()
-                                .collect();
-
-                            let chunk_count = merged_chunks.len();
-                            let path_clone = file_snapshot.path.clone();
+                            let md_preview_panel = is_md.then(|| {
+                                let md_file = file_snapshot.clone();
+                                let md_base = base_for_body.clone();
+                                let md_target = target_for_body.clone();
+                                view! {
+                                    <div style:display=move || show_code.get().then_some("none")>
+                                        {move || (!show_code.get()).then(|| {
+                                            render_file_threads_section(visible_threads.get(), on_reply, on_toggle_resolve)
+                                        })}
+                                        <MarkdownPreviewBody
+                                            file=md_file
+                                            merged_chunks=merged_chunks_memo
+                                            base_commit=md_base
+                                            target_commit=md_target
+                                            active_tab=md_tab
+                                        />
+                                    </div>
+                                }
+                            });
 
                             view! {
                                 <>
-                                    {(!unplaced.is_empty()).then(|| view! {
-                                        <div class="file-threads-section">
-                                            {unplaced.into_iter().map(|thread| {
-                                                view! {
-                                                    <CommentThreadCard
-                                                        thread=thread
-                                                        on_reply=on_reply
-                                                        on_toggle_resolve=on_toggle_resolve
-                                                    />
-                                                }
-                                            }).collect_view()}
-                                        </div>
-                                    })}
+                                    {md_preview_panel}
+                                    {move || {
+                                        if !show_code.get() {
+                                            return ().into_any();
+                                        }
 
-                                    {if merged_chunks.is_empty() {
+                                        let active_threads = visible_threads.get();
+                                        let merged_chunks = merged_chunks_memo.get();
+                                        let mode = diff_mode.get();
+
+                                        let mut placed_ids = HashSet::new();
+                                        for mc in &merged_chunks {
+                                            collect_placed_thread_ids(mc, &active_threads, mode, &mut placed_ids);
+                                        }
+
+                                        let unplaced: Vec<JjCommentThread> = active_threads
+                                            .iter()
+                                            .filter(|t| !placed_ids.contains(&t.id))
+                                            .cloned()
+                                            .collect();
+
+                                        let chunk_count = merged_chunks.len();
+                                        let path_clone = file_snapshot.path.clone();
+
                                         view! {
-                                            <div class="diff-card__summary">
-                                                "No text hunk changes in this entry."
-                                            </div>
+                                            <>
+                                                {render_file_threads_section(unplaced, on_reply, on_toggle_resolve)}
+
+                                                {if merged_chunks.is_empty() {
+                                                    view! {
+                                                        <div class="diff-card__summary">
+                                                            "No text hunk changes in this entry."
+                                                        </div>
+                                                    }.into_any()
+                                                } else {
+                                                    merged_chunks
+                                                        .into_iter()
+                                                        .enumerate()
+                                                        .map(|(merged_idx, mc)| {
+                                                            let first_orig = *mc.original_indices.first().unwrap_or(&0);
+                                                            let last_orig = *mc.original_indices.last().unwrap_or(&0);
+                                                            let is_first = merged_idx == 0;
+                                                            let is_last = merged_idx + 1 == chunk_count;
+                                                            let hidden_before = mc.hidden_lines_before;
+                                                            let hidden_after = mc.hidden_lines_after.unwrap_or(0);
+                                                            let file_top = file_snapshot.clone();
+                                                            let file_mid = file_snapshot.clone();
+                                                            let file_bot = file_snapshot.clone();
+                                                            let fpath = path_clone.clone();
+                                                            let lsubmit = path_for_line_submit.clone();
+                                                            let t_list = active_threads.clone();
+
+                                                            view! {
+                                                                <div class="diff-chunk-wrapper">
+                                                                    {(is_first && hidden_before > 0).then(|| view! {
+                                                                        <ExpandBar
+                                                                            position=ExpandBarPosition::Top
+                                                                            hidden_lines=hidden_before
+                                                                            is_loading=expand_loading
+                                                                            on_expand_up=Callback::new(|()| {})
+                                                                            on_expand_down=Callback::new({
+                                                                                let f = file_top.clone();
+                                                                                move |()| on_expand_lines.run(ExpandLinesEvent {
+                                                                                    file: f.clone(),
+                                                                                    chunk_index: first_orig,
+                                                                                    direction: Some(ExpandDirection::Up),
+                                                                                    count: DEFAULT_EXPAND_COUNT,
+                                                                                })
+                                                                            })
+                                                                            on_expand_all=Callback::new({
+                                                                                let f = file_top.clone();
+                                                                                move |()| on_expand_lines.run(ExpandLinesEvent {
+                                                                                    file: f.clone(),
+                                                                                    chunk_index: first_orig,
+                                                                                    direction: None,
+                                                                                    count: hidden_before,
+                                                                                })
+                                                                            })
+                                                                        />
+                                                                    })}
+
+                                                                    {(!is_first && hidden_before > 0).then(|| view! {
+                                                                        <ExpandBar
+                                                                            position=ExpandBarPosition::Middle
+                                                                            hidden_lines=hidden_before
+                                                                            is_loading=expand_loading
+                                                                            on_expand_up=Callback::new({
+                                                                                let f = file_mid.clone();
+                                                                                move |()| on_expand_lines.run(ExpandLinesEvent {
+                                                                                    file: f.clone(),
+                                                                                    chunk_index: first_orig.saturating_sub(1),
+                                                                                    direction: Some(ExpandDirection::Down),
+                                                                                    count: DEFAULT_EXPAND_COUNT,
+                                                                                })
+                                                                            })
+                                                                            on_expand_down=Callback::new({
+                                                                                let f = file_mid.clone();
+                                                                                move |()| on_expand_lines.run(ExpandLinesEvent {
+                                                                                    file: f.clone(),
+                                                                                    chunk_index: first_orig,
+                                                                                    direction: Some(ExpandDirection::Up),
+                                                                                    count: DEFAULT_EXPAND_COUNT,
+                                                                                })
+                                                                            })
+                                                                            on_expand_all=Callback::new({
+                                                                                let f = file_mid.clone();
+                                                                                move |()| on_expand_lines.run(ExpandLinesEvent {
+                                                                                    file: f.clone(),
+                                                                                    chunk_index: first_orig,
+                                                                                    direction: None,
+                                                                                    count: hidden_before,
+                                                                                })
+                                                                            })
+                                                                        />
+                                                                    })}
+
+                                                                    <div class="diff-chunk-header">{mc.header.clone()}</div>
+
+                                                                    {if mode == DiffViewMode::Split {
+                                                                        render_split_chunk(
+                                                                            &mc,
+                                                                            &fpath,
+                                                                            &t_list,
+                                                                            &lsubmit,
+                                                                            chunk_ctx,
+                                                                        ).into_any()
+                                                                    } else {
+                                                                        render_unified_chunk(
+                                                                            &mc,
+                                                                            &fpath,
+                                                                            &t_list,
+                                                                            &lsubmit,
+                                                                            chunk_ctx,
+                                                                        ).into_any()
+                                                                    }}
+
+                                                                    {(is_last && hidden_after > 0).then(|| view! {
+                                                                        <ExpandBar
+                                                                            position=ExpandBarPosition::Bottom
+                                                                            hidden_lines=hidden_after
+                                                                            is_loading=expand_loading
+                                                                            on_expand_up=Callback::new({
+                                                                                let f = file_bot.clone();
+                                                                                move |()| on_expand_lines.run(ExpandLinesEvent {
+                                                                                    file: f.clone(),
+                                                                                    chunk_index: last_orig,
+                                                                                    direction: Some(ExpandDirection::Down),
+                                                                                    count: DEFAULT_EXPAND_COUNT,
+                                                                                })
+                                                                            })
+                                                                            on_expand_down=Callback::new(|()| {})
+                                                                            on_expand_all=Callback::new({
+                                                                                let f = file_bot.clone();
+                                                                                move |()| on_expand_lines.run(ExpandLinesEvent {
+                                                                                    file: f.clone(),
+                                                                                    chunk_index: last_orig,
+                                                                                    direction: Some(ExpandDirection::Down),
+                                                                                    count: hidden_after,
+                                                                                })
+                                                                            })
+                                                                        />
+                                                                    })}
+                                                                </div>
+                                                            }
+                                                        })
+                                                        .collect_view()
+                                                        .into_any()
+                                                }}
+                                            </>
                                         }.into_any()
-                                    } else {
-                                        merged_chunks
-                                            .into_iter()
-                                            .enumerate()
-                                            .map(|(merged_idx, mc)| {
-                                                let first_orig = *mc.original_indices.first().unwrap_or(&0);
-                                                let last_orig = *mc.original_indices.last().unwrap_or(&0);
-                                                let is_first = merged_idx == 0;
-                                                let is_last = merged_idx + 1 == chunk_count;
-                                                let hidden_before = mc.hidden_lines_before;
-                                                let hidden_after = mc.hidden_lines_after.unwrap_or(0);
-                                                let file_top = file_snapshot.clone();
-                                                let file_mid = file_snapshot.clone();
-                                                let file_bot = file_snapshot.clone();
-                                                let fpath = path_clone.clone();
-                                                let lsubmit = path_for_line_submit.clone();
-                                                let t_list = active_threads.clone();
-
-                                                view! {
-                                                    <div class="diff-chunk-wrapper">
-                                                        {(is_first && hidden_before > 0).then(|| view! {
-                                                            <ExpandBar
-                                                                position=ExpandBarPosition::Top
-                                                                hidden_lines=hidden_before
-                                                                is_loading=expand_loading
-                                                                on_expand_up=Callback::new(|()| {})
-                                                                on_expand_down=Callback::new({
-                                                                    let f = file_top.clone();
-                                                                    move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                        file: f.clone(),
-                                                                        chunk_index: first_orig,
-                                                                        direction: Some(ExpandDirection::Up),
-                                                                        count: DEFAULT_EXPAND_COUNT,
-                                                                    })
-                                                                })
-                                                                on_expand_all=Callback::new({
-                                                                    let f = file_top.clone();
-                                                                    move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                        file: f.clone(),
-                                                                        chunk_index: first_orig,
-                                                                        direction: None,
-                                                                        count: hidden_before,
-                                                                    })
-                                                                })
-                                                            />
-                                                        })}
-
-                                                        {(!is_first && hidden_before > 0).then(|| view! {
-                                                            <ExpandBar
-                                                                position=ExpandBarPosition::Middle
-                                                                hidden_lines=hidden_before
-                                                                is_loading=expand_loading
-                                                                on_expand_up=Callback::new({
-                                                                    let f = file_mid.clone();
-                                                                    move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                        file: f.clone(),
-                                                                        chunk_index: first_orig.saturating_sub(1),
-                                                                        direction: Some(ExpandDirection::Down),
-                                                                        count: DEFAULT_EXPAND_COUNT,
-                                                                    })
-                                                                })
-                                                                on_expand_down=Callback::new({
-                                                                    let f = file_mid.clone();
-                                                                    move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                        file: f.clone(),
-                                                                        chunk_index: first_orig,
-                                                                        direction: Some(ExpandDirection::Up),
-                                                                        count: DEFAULT_EXPAND_COUNT,
-                                                                    })
-                                                                })
-                                                                on_expand_all=Callback::new({
-                                                                    let f = file_mid.clone();
-                                                                    move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                        file: f.clone(),
-                                                                        chunk_index: first_orig,
-                                                                        direction: None,
-                                                                        count: hidden_before,
-                                                                    })
-                                                                })
-                                                            />
-                                                        })}
-
-                                                        <div class="diff-chunk-header">{mc.header.clone()}</div>
-
-                                                        {if mode == DiffViewMode::Split {
-                                                            render_split_chunk(
-                                                                &mc,
-                                                                &fpath,
-                                                                &t_list,
-                                                                &lsubmit,
-                                                                chunk_ctx,
-                                                            ).into_any()
-                                                        } else {
-                                                            render_unified_chunk(
-                                                                &mc,
-                                                                &fpath,
-                                                                &t_list,
-                                                                &lsubmit,
-                                                                chunk_ctx,
-                                                            ).into_any()
-                                                        }}
-
-                                                        {(is_last && hidden_after > 0).then(|| view! {
-                                                            <ExpandBar
-                                                                position=ExpandBarPosition::Bottom
-                                                                hidden_lines=hidden_after
-                                                                is_loading=expand_loading
-                                                                on_expand_up=Callback::new({
-                                                                    let f = file_bot.clone();
-                                                                    move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                        file: f.clone(),
-                                                                        chunk_index: last_orig,
-                                                                        direction: Some(ExpandDirection::Down),
-                                                                        count: DEFAULT_EXPAND_COUNT,
-                                                                    })
-                                                                })
-                                                                on_expand_down=Callback::new(|()| {})
-                                                                on_expand_all=Callback::new({
-                                                                    let f = file_bot.clone();
-                                                                    move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                        file: f.clone(),
-                                                                        chunk_index: last_orig,
-                                                                        direction: Some(ExpandDirection::Down),
-                                                                        count: hidden_after,
-                                                                    })
-                                                                })
-                                                            />
-                                                        })}
-                                                    </div>
-                                                }
-                                            })
-                                            .collect_view()
-                                            .into_any()
                                     }}
                                 </>
-                            }
+                            }.into_any()
                         }}
                     </div>
                 }.into_any()
             }}
         </article>
     }
+}
+
+fn render_file_threads_section(
+    threads: Vec<JjCommentThread>,
+    on_reply: Callback<CommentReplyEvent>,
+    on_toggle_resolve: Callback<(String, bool)>,
+) -> Option<AnyView> {
+    if threads.is_empty() {
+        return None;
+    }
+    Some(
+        view! {
+            <div class="file-threads-section">
+                {threads.into_iter().map(|thread| {
+                    view! {
+                        <CommentThreadCard
+                            thread=thread
+                            on_reply=on_reply
+                            on_toggle_resolve=on_toggle_resolve
+                        />
+                    }
+                }).collect_view()}
+            </div>
+        }
+        .into_any(),
+    )
 }
 
 #[component]
@@ -722,6 +878,10 @@ fn render_unified_chunk(
                     let kind = line.kind;
                     let sigil = line_sigil(kind);
                     let sigil_class = line_sigil_class(kind);
+                    let line_src = mc.line_sources.get(idx).copied().flatten();
+                    let row_id = line_src.map(|(oc, ol)| {
+                        state::diff_line_element_id(file_path, oc, ol, default_side)
+                    });
 
                     let row_class = move || {
                         let drag = ctx.drag_state.get();
@@ -736,11 +896,15 @@ fn render_unified_chunk(
                         } else {
                             sel_new
                         };
-                        if sel.is_empty() {
-                            String::from(row_class_base)
-                        } else {
-                            alloc::format!("{row_class_base} {sel}")
-                        }
+                        let is_kbd = line_src.is_some_and(|(oc, ol)| {
+                            ctx.active_cursor.get().is_some_and(|cur| {
+                                cur.file_index == ctx.file_index
+                                    && cur.chunk_index == oc
+                                    && cur.line_index == ol
+                            })
+                        });
+                        let kbd_cls = if is_kbd { "diff-row--kbd-active" } else { "" };
+                        combine_classes(row_class_base, sel, kbd_cls)
                     };
 
                     let composer_here = move || {
@@ -758,6 +922,7 @@ fn render_unified_chunk(
                     view! {
                         <>
                             <tr
+                                id=row_id
                                 class=row_class
                                 on:mouseenter=move |_| {
                                     if let Some(drag) = ctx.drag_state.get_untracked()
@@ -830,6 +995,7 @@ fn render_unified_chunk(
                                             syntax_spans=line.syntax_spans.clone()
                                             word_segments=line.word_diff.clone()
                                             highlighted_word=ctx.highlighted_word
+                                            resolved_theme=ctx.resolved_theme
                                             on_toggle_word=ctx.on_toggle_word
                                         />
                                     </div>
@@ -904,7 +1070,7 @@ fn render_split_chunk(
     submit_file_path: &str,
     ctx: ChunkRenderCtx,
 ) -> impl IntoView {
-    let rows = pair_side_by_side_rows(&mc.lines, &mc.expanded_line_flags);
+    let rows = pair_side_by_side_rows(&mc.lines, &mc.expanded_line_flags, &mc.line_sources);
     let all_lines = mc.lines.clone();
 
     view! {
@@ -946,21 +1112,63 @@ fn render_split_chunk(
                     let submit_old = String::from(submit_file_path);
                     let submit_new = String::from(submit_file_path);
 
+                    let old_src = row.old_source;
+                    let new_src = row.new_source;
+                    let old_id = old_src.map(|(oc, ol)| {
+                        state::diff_line_element_id(file_path, oc, ol, CommentSide::Old)
+                    });
+                    let new_id = new_src.map(|(oc, ol)| {
+                        state::diff_line_element_id(file_path, oc, ol, CommentSide::New)
+                    });
                     let old_sel_class = move || {
-                        selection_class(
+                        let sel = selection_class(
                             ctx.drag_state.get(),
                             ctx.active_composer.get().as_ref(),
                             CommentSide::Old,
                             old_num,
-                        )
+                        );
+                        let kbd = if old_src.is_some_and(|(oc, ol)| {
+                            ctx.active_cursor.get().is_some_and(|cur| {
+                                cur.file_index == ctx.file_index
+                                    && cur.chunk_index == oc
+                                    && cur.line_index == ol
+                                    && cur.side == CommentSide::Old
+                            })
+                        }) {
+                            " diff-row--kbd-active"
+                        } else {
+                            ""
+                        };
+                        if kbd.is_empty() {
+                            String::from(sel)
+                        } else {
+                            alloc::format!("{sel}{kbd}")
+                        }
                     };
                     let new_sel_class = move || {
-                        selection_class(
+                        let sel = selection_class(
                             ctx.drag_state.get(),
                             ctx.active_composer.get().as_ref(),
                             CommentSide::New,
                             new_num,
-                        )
+                        );
+                        let kbd = if new_src.is_some_and(|(oc, ol)| {
+                            ctx.active_cursor.get().is_some_and(|cur| {
+                                cur.file_index == ctx.file_index
+                                    && cur.chunk_index == oc
+                                    && cur.line_index == ol
+                                    && cur.side == CommentSide::New
+                            })
+                        }) {
+                            " diff-row--kbd-active"
+                        } else {
+                            ""
+                        };
+                        if kbd.is_empty() {
+                            String::from(sel)
+                        } else {
+                            alloc::format!("{sel}{kbd}")
+                        }
                     };
 
                     let old_composer = move || {
@@ -993,7 +1201,8 @@ fn render_split_chunk(
                                 }
                             >
                                 <td
-                                    class=move || combine_classes(old_class_base, "diff-gutter diff-gutter--num diff-gutter--actions", old_sel_class())
+                                    id=old_id
+                                    class=move || combine_classes(old_class_base, "diff-gutter diff-gutter--num diff-gutter--actions", &old_sel_class())
                                     title={old_num.map(|_| "Click or drag to comment on old side")}
                                     on:mousedown=move |ev: ev::MouseEvent| {
                                         if let Some(ln) = old_num {
@@ -1021,7 +1230,7 @@ fn render_split_chunk(
                                         )
                                     })}
                                 </td>
-                                <td class=move || combine_classes(old_class_base, "diff-code-cell diff-code-cell--split", old_sel_class())>
+                                <td class=move || combine_classes(old_class_base, "diff-code-cell diff-code-cell--split", &old_sel_class())>
                                     {row.old_line.map(|l| view! {
                                         <div class="diff-code-inner">
                                             <span class=line_sigil_class(l.kind)>{line_sigil(l.kind)}</span>
@@ -1031,6 +1240,7 @@ fn render_split_chunk(
                                                 syntax_spans=l.syntax_spans
                                                 word_segments=l.word_diff
                                                 highlighted_word=ctx.highlighted_word
+                                                resolved_theme=ctx.resolved_theme
                                                 on_toggle_word=ctx.on_toggle_word
                                             />
                                         </div>
@@ -1038,7 +1248,8 @@ fn render_split_chunk(
                                 </td>
 
                                 <td
-                                    class=move || combine_classes(new_class_base, "diff-gutter diff-gutter--num diff-gutter--actions", new_sel_class())
+                                    id=new_id
+                                    class=move || combine_classes(new_class_base, "diff-gutter diff-gutter--num diff-gutter--actions", &new_sel_class())
                                     title={new_num.map(|_| "Click or drag to comment on new side")}
                                     on:mousedown=move |ev: ev::MouseEvent| {
                                         if let Some(ln) = new_num {
@@ -1066,7 +1277,7 @@ fn render_split_chunk(
                                         )
                                     })}
                                 </td>
-                                <td class=move || combine_classes(new_class_base, "diff-code-cell diff-code-cell--split", new_sel_class())>
+                                <td class=move || combine_classes(new_class_base, "diff-code-cell diff-code-cell--split", &new_sel_class())>
                                     {row.new_line.map(|l| view! {
                                         <div class="diff-code-inner">
                                             <span class=line_sigil_class(l.kind)>{line_sigil(l.kind)}</span>
@@ -1076,6 +1287,7 @@ fn render_split_chunk(
                                                 syntax_spans=l.syntax_spans
                                                 word_segments=l.word_diff
                                                 highlighted_word=ctx.highlighted_word
+                                                resolved_theme=ctx.resolved_theme
                                                 on_toggle_word=ctx.on_toggle_word
                                             />
                                         </div>

@@ -31,13 +31,15 @@ use leptos::ev;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use tellit_types::{
-    CommentSide, CreateCommentRequest, DiffFile, FileStatus, JjChange, JjCommentThread, JjCommit,
-    JjDiffResponse, JjGraphRow, WatchEvent,
+    AppearanceSettings, CommentSide, CreateCommentRequest, DiffFile, FileStatus, JjChange,
+    JjCommentThread, JjCommit, JjDiffResponse, JjGraphRow, ThemePreference, WatchEvent,
 };
-use web_sys::MouseEvent;
+use web_sys::{KeyboardEvent, MouseEvent, ScrollLogicalPosition};
 
 use components::comments::{CommentReplyEvent, CommentsDrawer, UnresolvedJumpMenu};
 use components::file_list::FileList;
+use components::help_modal::HelpModal;
+use components::keyboard::{self, CursorPosition, NavigationDirection, NavigationTarget};
 use components::review_dot::ReviewDot;
 use components::revision_selector::{
     JjChangeSelector, JjCommitComparisonSelector, commit_ids_match, pick_initial_change,
@@ -46,11 +48,14 @@ use components::revision_tree::JjRevisionTreePanel;
 pub use components::revision_tree::{
     GraphCellLayout, GraphNodeKind, GraphRowLayout, compute_graph_layout,
 };
+use components::settings_modal::SettingsModal;
 use components::text_diff::expanded::{
     ExpandedLinesMap, record_expand_all_before, record_line_expansion, split_blob_lines,
 };
-use components::text_diff::{CreateThreadEvent, ExpandLinesEvent, TextDiffCard};
-pub use state::{ConnectionState, DiffViewMode, RepoStatusState};
+use components::text_diff::{
+    CreateThreadEvent, ExpandLinesEvent, KeyboardCommentTrigger, TextDiffCard,
+};
+pub use state::{ConnectionState, DiffViewMode, RepoStatusState, ResolvedTheme};
 
 #[derive(Clone, Copy)]
 struct AppCtx {
@@ -81,6 +86,15 @@ struct AppCtx {
     highlighted_word: RwSignal<Option<String>>,
     expanded_lines: RwSignal<ExpandedLinesMap>,
     expand_loading: RwSignal<bool>,
+    appearance: RwSignal<AppearanceSettings>,
+    resolved_theme: RwSignal<ResolvedTheme>,
+    settings_open: RwSignal<bool>,
+    help_open: RwSignal<bool>,
+    active_cursor: RwSignal<Option<CursorPosition>>,
+    hovered_file_index: RwSignal<Option<usize>>,
+    keyboard_comment_trigger: RwSignal<Option<KeyboardCommentTrigger>>,
+    keyboard_comment_seq: StoredValue<u64, LocalStorage>,
+    unresolved_jump_cursor: StoredValue<usize, LocalStorage>,
     changes_req_id: StoredValue<u64, LocalStorage>,
     commits_req_id: StoredValue<u64, LocalStorage>,
     diff_req_id: StoredValue<u64, LocalStorage>,
@@ -93,6 +107,8 @@ struct AppCtx {
 
 impl AppCtx {
     fn new() -> Self {
+        let appearance_init = state::load_appearance_settings();
+        let resolved_init = state::apply_appearance_to_document(&appearance_init);
         Self {
             repo_status: RwSignal::new(RepoStatusState::Loading),
             connection: RwSignal::new(ConnectionState::Connecting),
@@ -124,6 +140,15 @@ impl AppCtx {
             highlighted_word: RwSignal::new(None),
             expanded_lines: RwSignal::new(HashMap::new()),
             expand_loading: RwSignal::new(false),
+            appearance: RwSignal::new(appearance_init),
+            resolved_theme: RwSignal::new(resolved_init),
+            settings_open: RwSignal::new(false),
+            help_open: RwSignal::new(false),
+            active_cursor: RwSignal::new(None),
+            hovered_file_index: RwSignal::new(None),
+            keyboard_comment_trigger: RwSignal::new(None),
+            keyboard_comment_seq: StoredValue::new_local(0),
+            unresolved_jump_cursor: StoredValue::new_local(0),
             changes_req_id: StoredValue::new_local(0),
             commits_req_id: StoredValue::new_local(0),
             diff_req_id: StoredValue::new_local(0),
@@ -170,9 +195,20 @@ fn load_diff_and_comments(ctx: AppCtx, target: String, base: Option<String>, ign
                 ctx.prefetched_line_counts.update_value(HashSet::clear);
                 ctx.highlighted_word.set(None);
                 ctx.expand_loading.set(false);
+                ctx.active_cursor.set(None);
 
                 let repo_root = ctx.repo_root_string();
-                let viewed = state::load_viewed_files(&repo_root, &diff.commit);
+                let mut viewed = state::load_viewed_files(&repo_root, &diff.commit);
+                let auto_patterns = ctx.appearance.get_untracked().auto_viewed_patterns;
+                if !auto_patterns.is_empty() {
+                    for file in &diff.files {
+                        if file.path != "Commit Message"
+                            && state::matches_auto_viewed_patterns(&file.path, &auto_patterns)
+                        {
+                            viewed.insert(file.path.clone());
+                        }
+                    }
+                }
                 let mut collapsed: HashSet<String> = viewed.clone();
                 for file in &diff.files {
                     if file.is_generated {
@@ -570,19 +606,9 @@ fn connect_watch(
     }
 }
 
-fn scroll_to_element_id(dom_id: &str) -> bool {
-    if let Some(window) = web_sys::window()
-        && let Some(doc) = window.document()
-        && let Some(el) = doc.get_element_by_id(dom_id)
-    {
-        el.scroll_into_view();
-        return true;
-    }
-    false
-}
-
 fn scroll_to_file_element(path: &str) {
-    let _ = scroll_to_element_id(&state::file_element_id(path));
+    let _ =
+        keyboard::scroll_to_element_id(&state::file_element_id(path), ScrollLogicalPosition::Start);
 }
 
 fn jump_to_thread(ctx: AppCtx, thread: JjCommentThread) {
@@ -593,18 +619,21 @@ fn jump_to_thread(ctx: AppCtx, thread: JjCommentThread) {
 
     let thread_dom = state::thread_element_id(&thread.id);
     let file_dom = state::file_element_id(&thread.file_path);
+    let do_scroll = move || {
+        if !keyboard::scroll_to_element_id(&thread_dom, ScrollLogicalPosition::Center) {
+            let _ = keyboard::scroll_to_element_id(&file_dom, ScrollLogicalPosition::Start);
+        }
+    };
     if let Some(window) = web_sys::window() {
         let promise = js_sys::Promise::new(&mut |resolve, _| {
             let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0);
         });
         spawn_local(async move {
             let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-            if !scroll_to_element_id(&thread_dom) {
-                let _ = scroll_to_element_id(&file_dom);
-            }
+            do_scroll();
         });
-    } else if !scroll_to_element_id(&thread_dom) {
-        let _ = scroll_to_element_id(&file_dom);
+    } else {
+        do_scroll();
     }
 }
 
@@ -735,6 +764,26 @@ pub fn App() -> impl IntoView {
         load_jj_status(ctx);
         connect_heartbeat(ctx.connection, heartbeat_handle);
         connect_watch(ctx, watch_handle);
+        spawn_local(async move {
+            if let Ok(Some(remote)) = api::fetch_user_settings().await {
+                let normalized = remote.normalized();
+                ctx.appearance.set(normalized.clone());
+                ctx.resolved_theme
+                    .set(state::apply_appearance_to_document(&normalized));
+                state::save_appearance_settings(&normalized);
+            }
+        });
+    });
+
+    let apply_settings_update = Callback::new(move |next: AppearanceSettings| {
+        let normalized = next.normalized();
+        ctx.appearance.set(normalized.clone());
+        ctx.resolved_theme
+            .set(state::apply_appearance_to_document(&normalized));
+        state::save_appearance_settings(&normalized);
+        spawn_local(async move {
+            let _ = api::save_user_settings(&normalized).await;
+        });
     });
 
     let mousemove_handle = window_event_listener(ev::mousemove, move |ev: MouseEvent| {
@@ -758,11 +807,16 @@ pub fn App() -> impl IntoView {
         }
     });
 
+    let keydown_handle = window_event_listener(ev::keydown, move |ev: KeyboardEvent| {
+        handle_global_keydown(ctx, &ev);
+    });
+
     on_cleanup(move || {
         heartbeat_handle.set_value(None);
         watch_handle.set_value(None);
         mousemove_handle.remove();
         mouseup_handle.remove();
+        keydown_handle.remove();
     });
 
     let on_toggle_sidebar = move |_| {
@@ -814,21 +868,7 @@ pub fn App() -> impl IntoView {
         let Some(diff) = ctx.diff_data.get_untracked() else {
             return;
         };
-        let mut now_viewed = false;
-        ctx.reviewed_files.update(|set| {
-            if !set.remove(&path) {
-                set.insert(path.clone());
-                now_viewed = true;
-            }
-            state::save_viewed_files(&ctx.repo_root_string(), &diff.commit, set);
-        });
-        ctx.collapsed_files.update(|set| {
-            if now_viewed {
-                set.insert(path);
-            } else {
-                set.remove(&path);
-            }
-        });
+        toggle_file_viewed_and_collapse(ctx, &diff.commit, &path);
     });
 
     let on_toggle_folder_reviewed =
@@ -891,8 +931,9 @@ pub fn App() -> impl IntoView {
     });
 
     let on_open_in_editor = Callback::new(move |(file_path, line): (String, usize)| {
+        let editor = ctx.appearance.get_untracked().editor;
         spawn_local(async move {
-            if let Err(err) = api::post_open_in_editor(&file_path, Some(line)).await {
+            if let Err(err) = api::post_open_in_editor(&file_path, Some(line), Some(editor)).await {
                 ctx.error_banner.set(Some(err.to_string()));
             }
         });
@@ -1156,6 +1197,46 @@ pub fn App() -> impl IntoView {
                             {move || if ctx.reloading.get() { "Refreshing..." } else { "↻ Refresh" }}
                         </button>
                     })}
+                    <button
+                        type="button"
+                        class="icon-btn icon-btn--lg"
+                        title=move || match ctx.resolved_theme.get() {
+                            ResolvedTheme::Dark => "Switch to light theme",
+                            ResolvedTheme::Light => "Switch to dark theme",
+                        }
+                        aria-label="Toggle dark or light theme"
+                        on:click=move |_| {
+                            let mut next = ctx.appearance.get_untracked();
+                            next.theme = match ctx.resolved_theme.get_untracked() {
+                                ResolvedTheme::Dark => ThemePreference::Light,
+                                ResolvedTheme::Light => ThemePreference::Dark,
+                            };
+                            apply_settings_update.run(next);
+                        }
+                    >
+                        {move || match ctx.resolved_theme.get() {
+                            ResolvedTheme::Dark => "☀",
+                            ResolvedTheme::Light => "🌙",
+                        }}
+                    </button>
+                    <button
+                        type="button"
+                        class="icon-btn icon-btn--lg"
+                        title="Settings"
+                        aria-label="Open settings modal"
+                        on:click=move |_| ctx.settings_open.set(true)
+                    >
+                        "⚙"
+                    </button>
+                    <button
+                        type="button"
+                        class="icon-btn icon-btn--lg"
+                        title="Keyboard shortcuts (?)"
+                        aria-label="Open keyboard shortcuts help"
+                        on:click=move |_| ctx.help_open.update(|v| *v = !*v)
+                    >
+                        "?"
+                    </button>
                     <span class="badge">
                         {move || ctx.repo_status.get().badge_label()}
                     </span>
@@ -1365,30 +1446,39 @@ pub fn App() -> impl IntoView {
                                                 </p>
                                             </div>
                                         }.into_any(),
-                                        Some(_) => {
+                                        Some(diff) => {
                                             let generation = ctx.diff_generation.get_value();
+                                            let diff_base = diff.base_commit.clone();
+                                            let diff_target = diff.commit.clone();
                                             view! {
                                                 <div class="diff-file-list">
                                                     <For
                                                         each=move || {
                                                             ctx.diff_data
                                                                 .get()
-                                                                .map(|d| d.files)
+                                                                .map(|d| d.files.into_iter().enumerate().collect::<Vec<_>>())
                                                                 .unwrap_or_default()
                                                         }
-                                                        key=move |file| alloc::format!("{generation}:{}", file.path)
-                                                        children=move |file| {
+                                                        key=move |(idx, file)| alloc::format!("{generation}:{idx}:{}", file.path)
+                                                        children=move |(idx, file)| {
                                                             view! {
                                                                 <TextDiffCard
                                                                     file=file
+                                                                    file_index=idx
+                                                                    base_commit=diff_base.clone()
+                                                                    target_commit=diff_target.clone()
                                                                     all_threads=ctx.comments
                                                                     reviewed_files=ctx.reviewed_files
                                                                     collapsed_files=ctx.collapsed_files
                                                                     diff_mode=ctx.diff_mode
+                                                                    resolved_theme=ctx.resolved_theme
                                                                     show_resolved_inline=ctx.show_resolved_inline
                                                                     highlighted_word=ctx.highlighted_word
                                                                     expanded_lines=ctx.expanded_lines
                                                                     expand_loading=ctx.expand_loading
+                                                                    active_cursor=ctx.active_cursor
+                                                                    keyboard_comment_trigger=ctx.keyboard_comment_trigger
+                                                                    on_hover_file=Callback::new(move |hovered| ctx.hovered_file_index.set(hovered))
                                                                     on_toggle_word=on_toggle_word
                                                                     on_toggle_viewed=on_toggle_reviewed
                                                                     on_toggle_collapse=on_toggle_collapse
@@ -1427,8 +1517,369 @@ pub fn App() -> impl IntoView {
                     />
                 })}
             </div>
+
+            <SettingsModal
+                is_open=ctx.settings_open
+                settings=ctx.appearance
+                on_change=apply_settings_update
+                on_close=Callback::new(move |()| ctx.settings_open.set(false))
+            />
+            <HelpModal
+                is_open=ctx.help_open
+                on_close=Callback::new(move |()| ctx.help_open.set(false))
+            />
         </div>
     }
+}
+
+fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
+    let key = ev.key();
+    if key == "Escape" {
+        if ctx.help_open.get_untracked() {
+            ev.prevent_default();
+            ctx.help_open.set(false);
+            return;
+        }
+        if ctx.settings_open.get_untracked() {
+            ev.prevent_default();
+            ctx.settings_open.set(false);
+            return;
+        }
+        if ctx.drawer_open.get_untracked() {
+            ev.prevent_default();
+            ctx.drawer_open.set(false);
+            return;
+        }
+        if ctx.active_cursor.get_untracked().is_some() {
+            ctx.active_cursor.set(None);
+        }
+        return;
+    }
+
+    if keyboard::should_ignore_shortcut(ev) {
+        return;
+    }
+
+    if key == "?" {
+        ev.prevent_default();
+        ctx.settings_open.set(false);
+        ctx.help_open.update(|v| *v = !*v);
+        return;
+    }
+
+    if ctx.help_open.get_untracked() || ctx.settings_open.get_untracked() {
+        return;
+    }
+
+    let Some(diff) = ctx.diff_data.get_untracked() else {
+        return;
+    };
+    let files = &diff.files;
+    let mode = ctx.diff_mode.get_untracked();
+    let reviewed = ctx.reviewed_files.get_untracked();
+
+    match key.as_str() {
+        "j" | "ArrowDown" => {
+            ev.prevent_default();
+            step_keyboard_cursor(
+                ctx,
+                NavigationDirection::Next,
+                NavigationTarget::Line,
+                files,
+                mode,
+                &reviewed,
+            );
+        }
+        "k" | "ArrowUp" => {
+            ev.prevent_default();
+            step_keyboard_cursor(
+                ctx,
+                NavigationDirection::Prev,
+                NavigationTarget::Line,
+                files,
+                mode,
+                &reviewed,
+            );
+        }
+        "n" => {
+            ev.prevent_default();
+            step_keyboard_cursor(
+                ctx,
+                NavigationDirection::Next,
+                NavigationTarget::Chunk,
+                files,
+                mode,
+                &reviewed,
+            );
+        }
+        "p" => {
+            ev.prevent_default();
+            step_keyboard_cursor(
+                ctx,
+                NavigationDirection::Prev,
+                NavigationTarget::Chunk,
+                files,
+                mode,
+                &reviewed,
+            );
+        }
+        "]" => {
+            ev.prevent_default();
+            step_keyboard_cursor(
+                ctx,
+                NavigationDirection::Next,
+                NavigationTarget::File,
+                files,
+                mode,
+                &reviewed,
+            );
+        }
+        "[" => {
+            ev.prevent_default();
+            step_keyboard_cursor(
+                ctx,
+                NavigationDirection::Prev,
+                NavigationTarget::File,
+                files,
+                mode,
+                &reviewed,
+            );
+        }
+        "{" if !files.is_empty() => {
+            ev.prevent_default();
+            let pos = keyboard::normalize_cursor_side(
+                CursorPosition {
+                    file_index: 0,
+                    chunk_index: 0,
+                    line_index: 0,
+                    side: CommentSide::New,
+                },
+                files,
+            );
+            ctx.active_cursor.set(Some(pos));
+            scroll_cursor(ctx, pos, files, ScrollLogicalPosition::Start);
+        }
+        "}" if !files.is_empty() => {
+            ev.prevent_default();
+            let pos = keyboard::normalize_cursor_side(
+                CursorPosition {
+                    file_index: files.len() - 1,
+                    chunk_index: 0,
+                    line_index: 0,
+                    side: CommentSide::New,
+                },
+                files,
+            );
+            ctx.active_cursor.set(Some(pos));
+            scroll_cursor(ctx, pos, files, ScrollLogicalPosition::Start);
+        }
+        "h" | "ArrowLeft" if mode == DiffViewMode::Split => {
+            if let Some(cur) = ctx.active_cursor.get_untracked() {
+                ev.prevent_default();
+                let next = keyboard::switch_split_side(cur, CommentSide::Old, files);
+                ctx.active_cursor.set(Some(next));
+                scroll_cursor(ctx, next, files, ScrollLogicalPosition::Center);
+            }
+        }
+        "l" | "ArrowRight" if mode == DiffViewMode::Split => {
+            if let Some(cur) = ctx.active_cursor.get_untracked() {
+                ev.prevent_default();
+                let next = keyboard::switch_split_side(cur, CommentSide::New, files);
+                ctx.active_cursor.set(Some(next));
+                scroll_cursor(ctx, next, files, ScrollLogicalPosition::Center);
+            }
+        }
+        "N" | "P" => {
+            ev.prevent_default();
+            let unresolved: Vec<JjCommentThread> = ctx
+                .comments
+                .get_untracked()
+                .into_iter()
+                .filter(|t| !t.resolved)
+                .collect();
+            if unresolved.is_empty() {
+                return;
+            }
+            let len = unresolved.len();
+            let mut target_idx = 0usize;
+            ctx.unresolved_jump_cursor.update_value(|idx| {
+                if key == "N" {
+                    *idx %= len;
+                    target_idx = *idx;
+                    *idx = (*idx + 1) % len;
+                } else {
+                    *idx = (*idx + len - 1) % len;
+                    target_idx = *idx;
+                }
+            });
+            jump_to_thread(ctx, unresolved[target_idx].clone());
+        }
+        "u" => {
+            ev.prevent_default();
+            ctx.diff_mode.set(DiffViewMode::Unified);
+            state::save_diff_view_mode(DiffViewMode::Unified);
+        }
+        "s" => {
+            ev.prevent_default();
+            ctx.diff_mode.set(DiffViewMode::Split);
+            state::save_diff_view_mode(DiffViewMode::Split);
+        }
+        "v" => {
+            let file_idx = ctx
+                .active_cursor
+                .get_untracked()
+                .map(|c| c.file_index)
+                .or_else(|| ctx.hovered_file_index.get_untracked());
+            if let Some(idx) = file_idx
+                && let Some(file) = files.get(idx)
+            {
+                ev.prevent_default();
+                toggle_file_viewed_and_collapse(ctx, &diff.commit, &file.path);
+            }
+        }
+        "V" => {
+            let file_idx = ctx
+                .active_cursor
+                .get_untracked()
+                .map(|c| c.file_index)
+                .or_else(|| ctx.hovered_file_index.get_untracked());
+            if let Some(idx) = file_idx
+                && let Some(file) = files.get(idx)
+            {
+                ev.prevent_default();
+                if !reviewed.contains(&file.path) {
+                    toggle_file_viewed_and_collapse(ctx, &diff.commit, &file.path);
+                }
+                let updated_reviewed = ctx.reviewed_files.get_untracked();
+                if let Some(next_idx) =
+                    keyboard::next_unviewed_file_index(idx, files, &updated_reviewed)
+                {
+                    let pos = keyboard::normalize_cursor_side(
+                        CursorPosition {
+                            file_index: next_idx,
+                            chunk_index: 0,
+                            line_index: 0,
+                            side: CommentSide::New,
+                        },
+                        files,
+                    );
+                    ctx.active_cursor.set(Some(pos));
+                    scroll_cursor(ctx, pos, files, ScrollLogicalPosition::Start);
+                }
+            }
+        }
+        "c" => {
+            if let Some(cur) = ctx.active_cursor.get_untracked()
+                && let Some(file) = files.get(cur.file_index)
+                && let Some(line) = file
+                    .chunks
+                    .get(cur.chunk_index)
+                    .and_then(|c| c.lines.get(cur.line_index))
+            {
+                let line_num = match cur.side {
+                    CommentSide::Old => line.old_line_number.or(line.new_line_number),
+                    CommentSide::New => line.new_line_number.or(line.old_line_number),
+                };
+                if let Some(ln) = line_num {
+                    ev.prevent_default();
+                    let seq = next_req_id(ctx.keyboard_comment_seq);
+                    ctx.collapsed_files.update(|set| {
+                        set.remove(&file.path);
+                    });
+                    ctx.keyboard_comment_trigger
+                        .set(Some(KeyboardCommentTrigger {
+                            seq,
+                            file_path: file.path.clone(),
+                            side: cur.side,
+                            line_num: ln,
+                        }));
+                }
+            }
+        }
+        "L" => {
+            ev.prevent_default();
+            ctx.drawer_open.update(|v| *v = !*v);
+        }
+        "C" => {
+            ev.prevent_default();
+            let prompt = state::format_all_comments_prompt(
+                &ctx.comments.get_untracked(),
+                &ctx.target_commit_id.get_untracked(),
+                &ctx.base_commit_id.get_untracked(),
+            );
+            if !prompt.is_empty() {
+                spawn_local(async move {
+                    let _ = api::copy_to_clipboard(&prompt).await;
+                });
+            }
+        }
+        "R" => {
+            ev.prevent_default();
+            reload_changes_and_commits(ctx, true);
+        }
+        _ => {}
+    }
+}
+
+fn step_keyboard_cursor(
+    ctx: AppCtx,
+    dir: NavigationDirection,
+    target: NavigationTarget,
+    files: &[DiffFile],
+    mode: DiffViewMode,
+    reviewed: &HashSet<String>,
+) {
+    if let Some(next) = keyboard::find_next_position(
+        ctx.active_cursor.get_untracked(),
+        dir,
+        target,
+        files,
+        mode,
+        reviewed,
+    ) {
+        ctx.active_cursor.set(Some(next));
+        let block = if target == NavigationTarget::File {
+            ScrollLogicalPosition::Start
+        } else {
+            ScrollLogicalPosition::Center
+        };
+        scroll_cursor(ctx, next, files, block);
+    }
+}
+
+fn scroll_cursor(
+    ctx: AppCtx,
+    pos: CursorPosition,
+    files: &[DiffFile],
+    block: ScrollLogicalPosition,
+) {
+    let mode = ctx.diff_mode.get_untracked();
+    if let Some(id) = keyboard::cursor_scroll_id(pos, files, mode)
+        && keyboard::scroll_to_element_id(&id, block)
+    {
+        return;
+    }
+    if let Some(file) = files.get(pos.file_index) {
+        let _ = keyboard::scroll_to_element_id(&state::file_element_id(&file.path), block);
+    }
+}
+
+fn toggle_file_viewed_and_collapse(ctx: AppCtx, commit: &str, path: &str) {
+    let mut now_viewed = false;
+    ctx.reviewed_files.update(|set| {
+        if !set.remove(path) {
+            set.insert(String::from(path));
+            now_viewed = true;
+        }
+        state::save_viewed_files(&ctx.repo_root_string(), commit, set);
+    });
+    ctx.collapsed_files.update(|set| {
+        if now_viewed {
+            set.insert(String::from(path));
+        } else {
+            set.remove(path);
+        }
+    });
 }
 
 #[cfg(test)]

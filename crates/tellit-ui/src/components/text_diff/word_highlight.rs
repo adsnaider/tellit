@@ -10,6 +10,8 @@ use leptos::ev;
 use leptos::prelude::*;
 use tellit_types::{DiffLineKind, SyntaxSpan, WordDiffSegment};
 
+use crate::state::{self, ResolvedTheme};
+
 const MIN_WORD_LEN: usize = 2;
 const MAX_WORD_LEN: usize = 100;
 
@@ -212,6 +214,7 @@ pub fn CodeLineContent(
     syntax_spans: Vec<SyntaxSpan>,
     word_segments: Vec<WordDiffSegment>,
     #[prop(into)] highlighted_word: Signal<Option<String>>,
+    #[prop(into)] resolved_theme: Signal<ResolvedTheme>,
     on_toggle_word: Callback<String>,
 ) -> impl IntoView {
     if content.is_empty() {
@@ -223,7 +226,9 @@ pub fn CodeLineContent(
         .into_iter()
         .map(|run| {
             let text = run.text.to_owned();
-            let fg_style = run.fg_hex.map(|fg| alloc::format!("color: {fg}"));
+            let fg_hex = run.fg_hex.map(String::from);
+            let fg_style_tok = fg_hex.clone();
+            let fg_style_plain = fg_hex;
             let token_norm = run.word_token.map(normalize_word);
             let token_click = token_norm.clone();
 
@@ -252,7 +257,12 @@ pub fn CodeLineContent(
                                 base_for_class.clone()
                             }
                         }
-                        style=fg_style
+                        style=move || {
+                            fg_style_tok.as_deref().map(|fg| {
+                                let adjusted = state::theme_adjusted_fg(fg, resolved_theme.get());
+                                alloc::format!("color: {adjusted}")
+                            })
+                        }
                         on:click=move |ev: ev::MouseEvent| {
                             if has_active_text_selection() {
                                 return;
@@ -269,7 +279,17 @@ pub fn CodeLineContent(
                 .into_any()
             } else {
                 view! {
-                    <span class=base_class style=fg_style>{text}</span>
+                    <span
+                        class=base_class
+                        style=move || {
+                            fg_style_plain.as_deref().map(|fg| {
+                                let adjusted = state::theme_adjusted_fg(fg, resolved_theme.get());
+                                alloc::format!("color: {adjusted}")
+                            })
+                        }
+                    >
+                        {text}
+                    </span>
                 }
                 .into_any()
             }

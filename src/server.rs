@@ -26,6 +26,7 @@ mod background;
 mod diff_parser;
 mod editor;
 mod jujutsu;
+mod user_config;
 mod watch;
 
 pub use background::{BACKGROUND_CHILD_ENV, BackgroundServerInfo, spawn_background_child};
@@ -65,6 +66,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch as tokio_watch;
 use tokio::task::JoinHandle;
 use tokio_stream::Stream;
+use user_config::{UserConfig, UserConfigError, UserConfigStore};
 use watch::WatchHub;
 
 /// Default preferred TCP port when `--port` is not specified.
@@ -138,6 +140,8 @@ pub struct ServerConfig {
     pub keep_alive: bool,
     /// Optional filesystem directory overriding embedded WebAssembly UI assets.
     pub web_dir: Option<PathBuf>,
+    /// Optional path overriding `~/.tellit/config.json` for user settings persistence.
+    pub user_config_path: Option<PathBuf>,
     /// Interval between SSE ping frames on `/api/heartbeat`.
     pub heartbeat_interval: Duration,
     /// Grace window before shutting down after the last `/api/heartbeat` client disconnects.
@@ -175,6 +179,7 @@ impl ServerConfig {
             preferred_port: None,
             keep_alive: false,
             web_dir,
+            user_config_path: None,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             disconnect_grace: DEFAULT_DISCONNECT_GRACE,
             quiet: false,
@@ -267,6 +272,13 @@ impl ServerConfig {
     #[must_use]
     pub fn with_web_dir(mut self, web_dir: Option<PathBuf>) -> Self {
         self.web_dir = web_dir;
+        self
+    }
+
+    /// Overrides the JSON configuration file path for `/api/user-settings`.
+    #[must_use]
+    pub fn with_user_config_path(mut self, user_config_path: Option<PathBuf>) -> Self {
+        self.user_config_path = user_config_path;
         self
     }
 
@@ -410,6 +422,7 @@ impl RunningServer {
 struct AppState {
     jj: JujutsuService,
     watch: Arc<WatchHub>,
+    user_config: UserConfigStore,
     commit_ish: Option<String>,
     compare_with: Option<String>,
     web_dir: Option<PathBuf>,
@@ -517,6 +530,7 @@ async fn bind_with_fallback(
 enum ApiError {
     Jujutsu(JujutsuError),
     Editor(EditorError),
+    UserConfig(UserConfigError),
 }
 
 impl From<JujutsuError> for ApiError {
@@ -528,6 +542,12 @@ impl From<JujutsuError> for ApiError {
 impl From<EditorError> for ApiError {
     fn from(err: EditorError) -> Self {
         Self::Editor(err)
+    }
+}
+
+impl From<UserConfigError> for ApiError {
+    fn from(err: UserConfigError) -> Self {
+        Self::UserConfig(err)
     }
 }
 
@@ -552,6 +572,16 @@ impl IntoResponse for ApiError {
                     | EditorError::InvalidInput(_)
                     | EditorError::PathEscapesRepo => StatusCode::BAD_REQUEST,
                     EditorError::SpawnFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                (status, err.to_string())
+            }
+            Self::UserConfig(err) => {
+                let status = match &err {
+                    UserConfigError::InvalidPatch(_) => StatusCode::BAD_REQUEST,
+                    UserConfigError::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+                    UserConfigError::Io(_) | UserConfigError::Serialize(_) => {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
                 };
                 (status, err.to_string())
             }
@@ -747,6 +777,18 @@ async fn post_open_in_editor(
     Ok(Json(open_in_editor(state.jj.repo_path(), &req)?))
 }
 
+async fn get_user_settings(State(state): State<Arc<AppState>>) -> Json<UserConfig> {
+    Json(state.user_config.read().await)
+}
+
+async fn put_user_settings(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<UserConfig>, ApiError> {
+    let updated = state.user_config.update_client(body).await?;
+    Ok(Json(updated))
+}
+
 /// Stream emitting an initial `connected` event followed by periodic `heartbeat` events,
 /// triggering server auto-shutdown on drop when `keep_alive` is disabled and no tabs remain.
 struct HeartbeatStream {
@@ -897,6 +939,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/blob/{*path}", get(get_blob))
         .route("/api/line-count/{*path}", get(get_line_count))
         .route("/api/open-in-editor", post(post_open_in_editor))
+        .route(
+            "/api/user-settings",
+            get(get_user_settings).put(put_user_settings),
+        )
         .route("/api/heartbeat", get(get_heartbeat))
         .route("/api/watch", get(get_watch))
         .route("/{*path}", get(get_static_asset))
@@ -925,6 +971,7 @@ pub async fn start_server(config: ServerConfig) -> Result<RunningServer, ServerE
     let state = Arc::new(AppState {
         jj,
         watch,
+        user_config: UserConfigStore::new(config.user_config_path),
         commit_ish: config.commit_ish,
         compare_with: config.compare_with,
         web_dir: config.web_dir,

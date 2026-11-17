@@ -1423,4 +1423,393 @@ describe('App.svelte integration', () => {
       expect(screen.getByText('Comments (0)')).toBeInTheDocument();
     });
   });
+
+  it('routes markdown and image viewers, executes keyboard shortcuts, and persists settings via /api/user-settings', async () => {
+    const savedSettingsPayloads: Array<Record<string, unknown>> = [];
+    const multiViewerDiff: DiffResponse = {
+      commit: '335eb579f263bb',
+      baseCommitish: '335eb579f263bb^',
+      targetCommitish: '335eb579f263bb',
+      repositoryId: 'repo-1',
+      files: [
+        {
+          path: 'README.md',
+          oldPath: 'README.md',
+          status: 'modified',
+          additions: 1,
+          deletions: 0,
+          chunks: [
+            {
+              header: '@@ -1,3 +1,4 @@',
+              oldStart: 1,
+              oldLines: 3,
+              newStart: 1,
+              newLines: 4,
+              lines: [
+                { type: 'normal', content: '---', oldLineNumber: 1, newLineNumber: 1 },
+                { type: 'normal', content: 'title: Tellit', oldLineNumber: 2, newLineNumber: 2 },
+                { type: 'normal', content: '---', oldLineNumber: 3, newLineNumber: 3 },
+                { type: 'add', content: '# Updated Documentation', newLineNumber: 4 },
+              ],
+            },
+          ],
+        },
+        {
+          path: 'assets/logo.png',
+          oldPath: 'assets/logo.png',
+          status: 'modified',
+          additions: 1,
+          deletions: 1,
+          chunks: [],
+        },
+        {
+          path: 'src/util.ts',
+          status: 'modified',
+          additions: 1,
+          deletions: 0,
+          chunks: [
+            {
+              header: '@@ -1,1 +1,2 @@',
+              oldStart: 1,
+              oldLines: 1,
+              newStart: 1,
+              newLines: 2,
+              lines: [
+                { type: 'normal', content: 'const base = 1;', oldLineNumber: 1, newLineNumber: 1 },
+                { type: 'add', content: 'export const next = 2;', newLineNumber: 2 },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    const sampleThreads: DiffCommentThread[] = [
+      {
+        id: 't-unresolved',
+        filePath: 'src/util.ts',
+        createdAt: '2026-11-16T10:00:00.000Z',
+        updatedAt: '2026-11-16T10:00:00.000Z',
+        resolved: false,
+        position: { side: 'new', line: 2 },
+        messages: [
+          {
+            id: 't-unresolved:0',
+            body: 'Check return value',
+            createdAt: '2026-11-16T10:00:00.000Z',
+            updatedAt: '2026-11-16T10:00:00.000Z',
+          },
+        ],
+      },
+    ];
+
+    vi.mocked(global.fetch).mockImplementation(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url === '/api/user-settings') {
+          if (init?.method === 'PUT') {
+            savedSettingsPayloads.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+            return new Response(JSON.stringify({ ok: true }), { status: 200 });
+          }
+          return new Response(JSON.stringify({ client: {} }), { status: 200 });
+        }
+        if (url === '/api/jj/status') {
+          return new Response(JSON.stringify({ isJj: true, repoRoot: '/workspace' }), {
+            status: 200,
+          });
+        }
+        if (url === '/api/jj/changes') {
+          return new Response(JSON.stringify({ changes: sampleChanges, graphRows: [] }), {
+            status: 200,
+          });
+        }
+        if (url === '/api/jj/changes/ltppwqry22222222/commits') {
+          return new Response(JSON.stringify({ commits: sampleCommits }), { status: 200 });
+        }
+        if (url.startsWith('/api/diff?') || url.startsWith('/api/jj/diff?')) {
+          return new Response(JSON.stringify(multiViewerDiff), { status: 200 });
+        }
+        if (url.startsWith('/api/generated-status/')) {
+          return new Response(
+            JSON.stringify({
+              path: 'src/util.ts',
+              ref: '335eb579f263bb',
+              isGenerated: false,
+              source: 'path',
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.startsWith('/api/line-count/')) {
+          return new Response(JSON.stringify({ oldLineCount: 3, newLineCount: 4 }), {
+            status: 200,
+          });
+        }
+        if (url.startsWith('/api/blob/README.md')) {
+          return new Response('---\ntitle: Tellit\n---\n# Updated Documentation\n', {
+            status: 200,
+          });
+        }
+        if (url.startsWith('/api/blob/')) {
+          return new Response(new Blob([new Uint8Array(64)]), { status: 200 });
+        }
+        if (url.startsWith('/api/jj/comments')) {
+          return new Response(JSON.stringify({ threads: sampleThreads }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ error: `Unexpected URL: ${url}` }), { status: 404 });
+      },
+    );
+
+    const { container } = render(App);
+
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name: 'Diff Preview' })).toBeInTheDocument();
+      expect(screen.getByText('Modified Image')).toBeInTheDocument();
+    });
+
+    // Switch Markdown viewer to Diff Preview and verify rendered heading
+    await fireEvent.click(screen.getByRole('tab', { name: 'Diff Preview' }));
+    expect(screen.getByRole('heading', { name: 'Updated Documentation' })).toBeInTheDocument();
+
+    // Switch back to Code tab so line cursor navigation targets README.md lines
+    await fireEvent.click(screen.getByRole('tab', { name: 'Code' }));
+
+    // Keyboard u/s switches between Unified and Split modes
+    await fireEvent.keyDown(window, { key: 'u' });
+    expect(container.querySelector('[data-diff-mode="unified"]')).toBeInTheDocument();
+    await fireEvent.keyDown(window, { key: 's' });
+    expect(container.querySelector('[data-diff-mode="split"]')).toBeInTheDocument();
+
+    // Keyboard j moves cursor onto first line, n moves to next chunk, ] jumps to next file, N jumps to unresolved comment
+    await fireEvent.keyDown(window, { key: 'j' });
+    expect(container.querySelector('.keyboard-cursor')).not.toBeNull();
+    await fireEvent.keyDown(window, { key: ']' });
+    expect(
+      container.querySelector('[data-file-path="assets/logo.png"] .keyboard-focused-file-header'),
+    ).not.toBeNull();
+    await fireEvent.keyDown(window, { key: 'N' });
+    expect(
+      container.querySelector('[data-file-path="src/util.ts"] .keyboard-focused-file-header'),
+    ).not.toBeNull();
+
+    // Keyboard c opens inline comment form on the focused cursor line, and typing does not fire shortcuts
+    await fireEvent.keyDown(window, { key: 'c' });
+    const commentBox = screen.getByLabelText('Comment on Line 2');
+    expect(commentBox).toBeInTheDocument();
+    await fireEvent.keyDown(commentBox, { key: 'u' });
+    expect(container.querySelector('[data-diff-mode="split"]')).toBeInTheDocument();
+
+    // Keyboard v toggles viewed on the focused file
+    await fireEvent.keyDown(window, { key: 'v' });
+    await waitFor(() => {
+      expect(screen.getByText('1/3 viewed')).toBeInTheDocument();
+    });
+
+    // Keyboard ? opens HelpModal and Escape closes it
+    await fireEvent.keyDown(window, { key: '?' });
+    expect(screen.getByRole('dialog', { name: 'Keyboard Shortcuts' })).toBeInTheDocument();
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.queryByRole('dialog', { name: 'Keyboard Shortcuts' })).not.toBeInTheDocument();
+
+    // Settings modal updates font size and autoViewedPatterns and persists via PUT /api/user-settings
+    await fireEvent.click(screen.getByRole('button', { name: 'Open settings' }));
+    expect(screen.getByRole('dialog', { name: 'Settings' })).toBeInTheDocument();
+    const fontSizeSlider = screen.getByLabelText('Font Size');
+    await fireEvent.input(fontSizeSlider, { target: { value: '16' } });
+    expect(document.documentElement.style.getPropertyValue('--app-font-size')).toBe('16px');
+    await fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+
+    await waitFor(
+      () => {
+        expect(savedSettingsPayloads.length).toBeGreaterThan(0);
+      },
+      { timeout: 1500 },
+    );
+  });
+
+  it('handles added-file split cursors, persistent Shift+N progression, non-replaying c comments, ? toggle, and partial settings migration', async () => {
+    localStorage.setItem(APPEARANCE_STORAGE_KEY, JSON.stringify({ theme: 'light' }));
+    localStorage.setItem(
+      'difit.editor',
+      JSON.stringify({ id: 'textmate', command: 'mate', argsTemplate: '-l %line %file' }),
+    );
+
+    const addedDiff: DiffResponse = {
+      commit: '335eb579f263bb',
+      baseCommitish: '335eb579f263bb^',
+      targetCommitish: '335eb579f263bb',
+      repositoryId: 'repo-1',
+      openInEditorAvailable: true,
+      files: [
+        {
+          path: 'src/added.ts',
+          status: 'added',
+          additions: 2,
+          deletions: 0,
+          chunks: [
+            {
+              header: '@@ -0,0 +1,2 @@',
+              oldStart: 0,
+              oldLines: 0,
+              newStart: 1,
+              newLines: 2,
+              lines: [
+                { type: 'add', content: 'export const a = 1;', newLineNumber: 1 },
+                { type: 'add', content: 'export const b = 2;', newLineNumber: 2 },
+              ],
+            },
+          ],
+        },
+        {
+          path: 'src/other.ts',
+          status: 'modified',
+          additions: 1,
+          deletions: 0,
+          chunks: [
+            {
+              header: '@@ -1,1 +1,2 @@',
+              oldStart: 1,
+              oldLines: 1,
+              newStart: 1,
+              newLines: 2,
+              lines: [
+                { type: 'normal', content: 'const k = 1;', oldLineNumber: 1, newLineNumber: 1 },
+                { type: 'add', content: 'const m = 2;', newLineNumber: 2 },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    const twoThreads: DiffCommentThread[] = [
+      {
+        id: 't-open-1',
+        filePath: 'src/added.ts',
+        createdAt: '2026-11-16T09:00:00.000Z',
+        updatedAt: '2026-11-16T09:00:00.000Z',
+        resolved: false,
+        position: { side: 'new', line: 2 },
+        messages: [
+          {
+            id: 't-open-1:0',
+            body: 'First unresolved thread',
+            createdAt: '2026-11-16T09:00:00.000Z',
+            updatedAt: '2026-11-16T09:00:00.000Z',
+          },
+        ],
+      },
+      {
+        id: 't-open-2',
+        filePath: 'src/other.ts',
+        createdAt: '2026-11-16T09:01:00.000Z',
+        updatedAt: '2026-11-16T09:01:00.000Z',
+        resolved: false,
+        position: { side: 'new', line: 2 },
+        messages: [
+          {
+            id: 't-open-2:0',
+            body: 'Second unresolved thread',
+            createdAt: '2026-11-16T09:01:00.000Z',
+            updatedAt: '2026-11-16T09:01:00.000Z',
+          },
+        ],
+      },
+    ];
+
+    vi.mocked(global.fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url === '/api/user-settings') {
+        return new Response(JSON.stringify({ client: {} }), { status: 200 });
+      }
+      if (url === '/api/jj/status') {
+        return new Response(JSON.stringify({ isJj: true, repoRoot: '/workspace' }), {
+          status: 200,
+        });
+      }
+      if (url === '/api/jj/changes') {
+        return new Response(JSON.stringify({ changes: sampleChanges, graphRows: [] }), {
+          status: 200,
+        });
+      }
+      if (url === '/api/jj/changes/ltppwqry22222222/commits') {
+        return new Response(JSON.stringify({ commits: sampleCommits }), { status: 200 });
+      }
+      if (url.startsWith('/api/diff?') || url.startsWith('/api/jj/diff?')) {
+        return new Response(JSON.stringify(addedDiff), { status: 200 });
+      }
+      if (url.startsWith('/api/generated-status/')) {
+        return new Response(
+          JSON.stringify({
+            path: 'src/added.ts',
+            ref: '335eb579f263bb',
+            isGenerated: false,
+            source: 'path',
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.startsWith('/api/line-count/')) {
+        return new Response(JSON.stringify({ oldLineCount: 1, newLineCount: 2 }), { status: 200 });
+      }
+      if (url.startsWith('/api/jj/comments')) {
+        return new Response(JSON.stringify({ threads: twoThreads }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ error: `Unexpected URL: ${url}` }), { status: 404 });
+    });
+
+    const { container } = render(App);
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole('button', { name: 'Open src/added.ts line 1 in editor' }),
+      ).toBeInTheDocument();
+    });
+
+    // Partial reviewit-appearance-settings preserved light theme AND migrated difit.editor preset
+    expect(document.documentElement.getAttribute('data-theme')).toBe('light');
+    await fireEvent.click(screen.getByRole('button', { name: 'Open settings' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'System' }));
+    expect((screen.getByLabelText('Command') as HTMLInputElement).value).toBe('mate');
+    await fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+
+    // Split mode ] onto added file highlights right cell via fixSide
+    await fireEvent.keyDown(window, { key: ']' });
+    expect(container.querySelector('#file-0-chunk-0-line-0-right.keyboard-cursor')).not.toBeNull();
+
+    // Press c to open CommentForm, cancel it, collapse & re-expand file -> form must NOT replay
+    await fireEvent.keyDown(window, { key: 'c' });
+    expect(screen.getByLabelText('Comment on Line 1')).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByLabelText('Comment on Line 1')).not.toBeInTheDocument();
+
+    const addedToggle = container.querySelector(
+      '[data-file-path="src/added.ts"] button[aria-expanded]',
+    );
+    expect(addedToggle).not.toBeNull();
+    if (addedToggle) {
+      await fireEvent.click(addedToggle);
+      await fireEvent.click(addedToggle);
+    }
+    expect(screen.queryByLabelText('Comment on Line 1')).not.toBeInTheDocument();
+
+    // Shift+N steps from thread 1 to thread 2 cleanly even after highlight timer expires
+    vi.useFakeTimers();
+    try {
+      await fireEvent.keyDown(window, { key: 'N' });
+      expect(container.querySelector('#comment-thread-t-open-1')).toHaveClass('ring-2');
+      await vi.advanceTimersByTimeAsync(2100);
+      expect(container.querySelector('#comment-thread-t-open-1')).not.toHaveClass('ring-2');
+      await fireEvent.keyDown(window, { key: 'N' });
+      expect(container.querySelector('#comment-thread-t-open-2')).toHaveClass('ring-2');
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // Help modal toggles both open and closed via ?
+    await fireEvent.keyDown(window, { key: '?' });
+    expect(screen.getByRole('dialog', { name: 'Keyboard Shortcuts' })).toBeInTheDocument();
+    await fireEvent.keyDown(window, { key: '?' });
+    expect(screen.queryByRole('dialog', { name: 'Keyboard Shortcuts' })).not.toBeInTheDocument();
+  });
 });

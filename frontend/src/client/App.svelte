@@ -4,9 +4,12 @@
 
   import CommentsDrawer from './components/CommentsDrawer.svelte';
   import FileList from './components/FileList.svelte';
+  import HelpModal from './components/HelpModal.svelte';
   import JjRevisionSelector from './components/JjRevisionSelector.svelte';
   import JjRevisionTree from './components/JjRevisionTree.svelte';
-  import TextDiffViewer from './components/TextDiffViewer.svelte';
+  import SettingsModal from './components/SettingsModal.svelte';
+  import { getViewerForFile } from './viewers/registry';
+  import type { PendingCursorCommentRequest } from './viewers/types';
   import {
     type CommentThread,
     type DiffCommentThread,
@@ -26,7 +29,7 @@
   import { createId } from '../utils/createId';
   import { DEFAULT_DIFF_VIEW_MODE, normalizeDiffViewMode } from '../utils/diffMode';
   import { normalizeBaseMode } from '../utils/diffSelection';
-  import { DEFAULT_EDITOR_OPTION, resolveEditorOption } from '../utils/editorOptions';
+  import { resolveEditorOption } from '../utils/editorOptions';
   import {
     addJjComment,
     approveJjRevision,
@@ -47,10 +50,13 @@
   import { storageService } from './services/StorageService';
   import { fetchClientSettings, saveClientSettings } from './services/userSettings';
   import {
+    type AppearanceSettings,
+    DEFAULT_APPEARANCE_SETTINGS,
+    normalizeAppearanceSettings,
+  } from './utils/appearanceSettings';
+  import {
     APPEARANCE_STORAGE_KEY,
     applyResolvedTheme,
-    type ColorVisionMode,
-    getStoredAppearanceSettings,
     resolveThemePreference,
     type ThemePreference,
   } from './utils/appearanceTheme';
@@ -69,7 +75,21 @@
   } from './utils/expandedLines';
   import { makeStandaloneCommitRow } from './utils/jjGraph';
   import { commitIdsMatch, pickInitialChange } from './utils/jjSelection';
+  import {
+    buildCommentIndex,
+    createDiffNavigationFilters,
+    type CursorPosition,
+    findCursorForCommentThread,
+    findNextMatchingPosition,
+    findNextUnviewedFileIndex,
+    fixSide,
+    getStartPosition,
+    isEditableEventTarget,
+    scrollCursorIntoView,
+    switchSplitCursorSide,
+  } from './utils/keyboardNavigation';
   import { connectLiveWatch } from './utils/liveWatch';
+  import { getElementId } from './utils/navigation/domHelpers';
   import { buildFileLineIndex, type FileLineIndex, isThreadOutdated } from './utils/outdatedComments';
   import { getFallbackSyntaxTheme, isSyntaxThemeForResolvedTheme } from './utils/themeLoader';
   import {
@@ -84,12 +104,6 @@
   const DIFF_VIEW_MODE_STORAGE_KEY = 'difit.diffViewMode';
   const SHOW_RESOLVED_INLINE_STORAGE_KEY = 'tellit.showResolvedInline';
   const EDITOR_SETTINGS_STORAGE_KEY = 'difit.editor';
-
-  interface EditorPreference {
-    id: string;
-    command: string;
-    argsTemplate: string;
-  }
 
   function getInitialDiffViewMode(): DiffViewMode {
     if (typeof window === 'undefined') return DEFAULT_DIFF_VIEW_MODE;
@@ -112,43 +126,6 @@
     }
   }
 
-  function getInitialEditorPreference(): EditorPreference {
-    if (typeof window !== 'undefined') {
-      try {
-        const raw = window.localStorage.getItem(EDITOR_SETTINGS_STORAGE_KEY);
-        if (raw) {
-          const parsed: unknown = JSON.parse(raw);
-          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            const candidate = parsed as Partial<EditorPreference>;
-            if (typeof candidate.id === 'string') {
-              const preset = resolveEditorOption(candidate.id);
-              return {
-                id: candidate.id,
-                command: typeof candidate.command === 'string' ? candidate.command : preset.command,
-                argsTemplate:
-                  typeof candidate.argsTemplate === 'string'
-                    ? candidate.argsTemplate
-                    : preset.argsTemplate,
-              };
-            }
-          }
-        }
-      } catch {
-        // Fall back to default editor preset.
-      }
-    }
-    return {
-      id: DEFAULT_EDITOR_OPTION.id,
-      command: DEFAULT_EDITOR_OPTION.command,
-      argsTemplate: DEFAULT_EDITOR_OPTION.argsTemplate,
-    };
-  }
-
-  function getInitialSyntaxTheme(theme: ThemePreference): string {
-    const resolved = resolveThemePreference(theme);
-    return getFallbackSyntaxTheme(resolved)?.id ?? (resolved === 'light' ? 'github' : 'vsDark');
-  }
-
   function getInitialSidebarOpen(): boolean {
     if (typeof window === 'undefined') return true;
     try {
@@ -161,30 +138,57 @@
     return true;
   }
 
-  function getInitialThemePreference(): ThemePreference {
-    return getStoredAppearanceSettings()?.theme ?? 'auto';
-  }
-
-  function getInitialColorVision(): ColorVisionMode {
-    return getStoredAppearanceSettings()?.colorVision ?? 'normal';
-  }
-
-  function persistThemePreference(nextTheme: ThemePreference) {
-    if (typeof window === 'undefined') return;
-    try {
-      const raw = window.localStorage.getItem(APPEARANCE_STORAGE_KEY);
-      const parsed: unknown = raw ? JSON.parse(raw) : null;
-      const base =
-        parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-          ? (parsed as Record<string, unknown>)
-          : {};
-      window.localStorage.setItem(
-        APPEARANCE_STORAGE_KEY,
-        JSON.stringify({ ...base, theme: nextTheme }),
-      );
-    } catch {
-      // Ignore storage access errors.
+  function parseLegacyEditorPreference(raw: unknown): AppearanceSettings['editor'] | null {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return null;
     }
+    const candidate = raw as Partial<AppearanceSettings['editor']>;
+    if (typeof candidate.id !== 'string') {
+      return null;
+    }
+    const preset = resolveEditorOption(candidate.id);
+    return {
+      id: preset.id,
+      command: typeof candidate.command === 'string' ? candidate.command : preset.command,
+      argsTemplate:
+        typeof candidate.argsTemplate === 'string'
+          ? candidate.argsTemplate
+          : preset.argsTemplate,
+    };
+  }
+
+  function getInitialAppearanceSettings(): AppearanceSettings {
+    let base: AppearanceSettings = {
+      ...DEFAULT_APPEARANCE_SETTINGS,
+      editor: { ...DEFAULT_APPEARANCE_SETTINGS.editor },
+    };
+
+    if (typeof window !== 'undefined') {
+      try {
+        const legacyEditorRaw = window.localStorage.getItem(EDITOR_SETTINGS_STORAGE_KEY);
+        if (legacyEditorRaw) {
+          const legacyEditor = parseLegacyEditorPreference(JSON.parse(legacyEditorRaw));
+          if (legacyEditor) {
+            base = { ...base, editor: legacyEditor };
+          }
+        }
+        const storedAppearance = window.localStorage.getItem(APPEARANCE_STORAGE_KEY);
+        if (storedAppearance) {
+          const parsed = normalizeAppearanceSettings(JSON.parse(storedAppearance), base);
+          if (parsed) {
+            base = parsed;
+          }
+        }
+      } catch {
+        // Ignore storage errors and fall back to defaults.
+      }
+    }
+
+    const resolved = resolveThemePreference(base.theme);
+    if (!isSyntaxThemeForResolvedTheme(base.syntaxTheme, resolved)) {
+      base.syntaxTheme = getFallbackSyntaxTheme(resolved)?.id ?? base.syntaxTheme;
+    }
+    return base;
   }
 
   function isAbortError(err: unknown): boolean {
@@ -242,16 +246,12 @@
   let ignoreWhitespace = $state(true);
   let diffMode = $state<DiffViewMode>(getInitialDiffViewMode());
   let sidebarOpen = $state(getInitialSidebarOpen());
-  let themePreference = $state<ThemePreference>(getInitialThemePreference());
-  let colorVision = $state<ColorVisionMode>(getInitialColorVision());
-  let syntaxTheme = $state<string>(getInitialSyntaxTheme(getInitialThemePreference()));
-  let editorSetting = $state<EditorPreference>(getInitialEditorPreference());
+  let appearanceSettings = $state<AppearanceSettings>(getInitialAppearanceSettings());
 
   let revQueryError = $state<string | null>(null);
   let watchReloadPending = $state(false);
   let isReloading = $state(false);
 
-  let autoViewedPatterns = $state<string[]>([]);
   let viewedRecords = $state<ViewedFileRecord[]>([]);
   let viewedFiles = new SvelteSet<string>();
   let changedSinceViewedFiles = new SvelteSet<string>();
@@ -267,10 +267,19 @@
   let rawThreads = $state<DiffCommentThread[]>([]);
   let showResolvedInline = $state(getInitialShowResolvedInline());
   let commentsDrawerOpen = $state(false);
+  let settingsModalOpen = $state(false);
+  let helpModalOpen = $state(false);
   let activeWholeFileCommentPath = $state<string | null>(null);
   let highlightedThreadId = $state<string | null>(null);
   let copiedFilePath = $state<string | null>(null);
   let commentError = $state<string | null>(null);
+
+  let keyboardCursor = $state<CursorPosition | null>(null);
+  let lastRememberedCursor = $state<CursorPosition | null>(null);
+  let lastNavigatedThreadId = $state<string | null>(null);
+  let hoveredFileIndex = $state<number | null>(null);
+  let pendingLineComment = $state<PendingCursorCommentRequest | null>(null);
+  let nextPendingCommentSeq = 0;
 
   let hoveredWord = $state<string | null>(null);
   let pinnedWord = $state<string | null>(null);
@@ -390,6 +399,25 @@
     return map;
   });
 
+  const themePreference = $derived(appearanceSettings.theme);
+  const colorVision = $derived(appearanceSettings.colorVision);
+  const resolvedTheme = $derived(resolveThemePreference(themePreference));
+  const syntaxTheme = $derived(
+    isSyntaxThemeForResolvedTheme(appearanceSettings.syntaxTheme, resolvedTheme)
+      ? appearanceSettings.syntaxTheme
+      : (getFallbackSyntaxTheme(resolvedTheme)?.id ?? appearanceSettings.syntaxTheme),
+  );
+  const editorSetting = $derived(appearanceSettings.editor);
+  const autoViewedPatterns = $derived(appearanceSettings.autoViewedPatterns);
+
+  const navigableFiles = $derived.by<DiffFile[]>(() => {
+    if (!diffData) return [];
+    return diffData.files.map((file) => ({
+      ...file,
+      chunks: mergedChunksByFile.get(file.path) ?? file.chunks,
+    }));
+  });
+
   const openInEditorAvailable = $derived(
     diffData?.openInEditorAvailable !== false &&
       editorSetting.id !== 'none' &&
@@ -398,11 +426,16 @@
   );
 
   $effect(() => {
+    if (typeof document !== 'undefined') {
+      document.documentElement.style.setProperty(
+        '--app-font-size',
+        `${appearanceSettings.fontSize}px`,
+      );
+      document.documentElement.style.setProperty('--app-font-family', appearanceSettings.fontFamily);
+    }
+
     const resolved = resolveThemePreference(themePreference);
     applyResolvedTheme(resolved, colorVision);
-    if (!isSyntaxThemeForResolvedTheme(syntaxTheme, resolved)) {
-      syntaxTheme = getFallbackSyntaxTheme(resolved)?.id ?? syntaxTheme;
-    }
 
     if (themePreference !== 'auto' || typeof window === 'undefined') {
       return;
@@ -412,9 +445,6 @@
     const handleMediaChange = (event: MediaQueryListEvent) => {
       const nextResolved = event.matches ? 'dark' : 'light';
       applyResolvedTheme(nextResolved, colorVision);
-      if (!isSyntaxThemeForResolvedTheme(syntaxTheme, nextResolved)) {
-        syntaxTheme = getFallbackSyntaxTheme(nextResolved)?.id ?? syntaxTheme;
-      }
     };
     mediaQuery.addEventListener('change', handleMediaChange);
     return () => {
@@ -492,6 +522,11 @@
     highlightedThreadId = null;
     commentError = null;
     pinnedWord = null;
+    keyboardCursor = null;
+    lastRememberedCursor = null;
+    lastNavigatedThreadId = null;
+    hoveredFileIndex = null;
+    pendingLineComment = null;
 
     for (const file of nextDiff.files) {
       if (file.isGenerated) {
@@ -611,7 +646,49 @@
       if (signal.aborted || requestId !== activeRequestId) return;
 
       if (clientSettings) {
-        autoViewedPatterns = normalizeAutoViewedPatterns(clientSettings.autoViewedPatterns);
+        let fallbackSettings = {
+          ...appearanceSettings,
+          editor: { ...appearanceSettings.editor },
+          autoViewedPatterns: [...appearanceSettings.autoViewedPatterns],
+        };
+        let updatedFromLegacy = false;
+        if (clientSettings.autoViewedPatterns !== undefined) {
+          fallbackSettings.autoViewedPatterns = normalizeAutoViewedPatterns(
+            clientSettings.autoViewedPatterns,
+          );
+          updatedFromLegacy = true;
+        }
+        const legacyRemoteEditor = parseLegacyEditorPreference(clientSettings.editor);
+        if (legacyRemoteEditor) {
+          fallbackSettings.editor = legacyRemoteEditor;
+          updatedFromLegacy = true;
+        }
+
+        const remoteAppearance = normalizeAppearanceSettings(
+          clientSettings[APPEARANCE_STORAGE_KEY],
+          fallbackSettings,
+        );
+        if (remoteAppearance) {
+          appearanceSettings = remoteAppearance;
+          try {
+            window.localStorage.setItem(APPEARANCE_STORAGE_KEY, JSON.stringify(remoteAppearance));
+          } catch {
+            // Ignore local cache write errors.
+          }
+        } else if (updatedFromLegacy) {
+          appearanceSettings = fallbackSettings;
+        } else {
+          let hasLocalAppearance = false;
+          try {
+            hasLocalAppearance = window.localStorage.getItem(APPEARANCE_STORAGE_KEY) !== null;
+          } catch {
+            // Ignore local storage errors.
+          }
+          if (hasLocalAppearance) {
+            saveClientSettings({ [APPEARANCE_STORAGE_KEY]: appearanceSettings });
+          }
+        }
+
         if (typeof clientSettings.diffViewMode === 'string') {
           let hasLocalDiffMode = false;
           try {
@@ -621,24 +698,6 @@
           }
           if (!hasLocalDiffMode) {
             diffMode = normalizeDiffViewMode(clientSettings.diffViewMode);
-          }
-        }
-        if (
-          clientSettings.editor &&
-          typeof clientSettings.editor === 'object' &&
-          !Array.isArray(clientSettings.editor)
-        ) {
-          const candidate = clientSettings.editor as Partial<EditorPreference>;
-          if (typeof candidate.id === 'string') {
-            const preset = resolveEditorOption(candidate.id);
-            editorSetting = {
-              id: candidate.id,
-              command: typeof candidate.command === 'string' ? candidate.command : preset.command,
-              argsTemplate:
-                typeof candidate.argsTemplate === 'string'
-                  ? candidate.argsTemplate
-                  : preset.argsTemplate,
-            };
           }
         }
       }
@@ -1137,9 +1196,70 @@
     saveClientSettings({ diffViewMode: nextMode });
   }
 
+  function handleAppearanceSettingsChange(next: AppearanceSettings) {
+    const prevPatterns = appearanceSettings.autoViewedPatterns;
+    appearanceSettings = next;
+    if (typeof window !== 'undefined') {
+      try {
+        window.localStorage.setItem(APPEARANCE_STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        // Ignore storage errors.
+      }
+    }
+    saveClientSettings({
+      [APPEARANCE_STORAGE_KEY]: next,
+      autoViewedPatterns: next.autoViewedPatterns,
+      editor: next.editor,
+    });
+
+    if (
+      diffData &&
+      JSON.stringify(prevPatterns) !== JSON.stringify(next.autoViewedPatterns)
+    ) {
+      const snapshotDiff = diffData;
+      const revisionSnapshot = diffRevisionId;
+      const context = buildViewedContext(snapshotDiff);
+      void enqueueViewedMutation(async () => {
+        if (revisionSnapshot !== diffRevisionId) return;
+        try {
+          const hydrated = await hydrateViewedState(
+            context,
+            snapshotDiff.files,
+            next.autoViewedPatterns,
+          );
+          if (revisionSnapshot !== diffRevisionId) return;
+          viewedRecords = hydrated.records;
+          fileHashesByPath = hydrated.hashesByPath;
+          viewedFiles.clear();
+          changedSinceViewedFiles.clear();
+          for (const f of snapshotDiff.files) {
+            if (hydrated.viewedPaths.has(f.path)) {
+              viewedFiles.add(f.path);
+              if (!manuallyToggledPaths.has(f.path)) {
+                collapsedFiles.add(f.path);
+              }
+            }
+          }
+        } catch {
+          // Keep existing viewed state on transient error.
+        }
+      });
+    }
+  }
+
   function handleThemeChange(nextTheme: ThemePreference) {
-    themePreference = nextTheme;
-    persistThemePreference(nextTheme);
+    const nextResolved = resolveThemePreference(nextTheme);
+    const nextSyntaxTheme = isSyntaxThemeForResolvedTheme(
+      appearanceSettings.syntaxTheme,
+      nextResolved,
+    )
+      ? appearanceSettings.syntaxTheme
+      : (getFallbackSyntaxTheme(nextResolved)?.id ?? appearanceSettings.syntaxTheme);
+    handleAppearanceSettingsChange({
+      ...appearanceSettings,
+      theme: nextTheme,
+      syntaxTheme: nextSyntaxTheme,
+    });
   }
 
   async function ensureExpandedFileContent(
@@ -1507,7 +1627,280 @@
     const { signal, requestId } = startNewRequest();
     void bootstrapApp(signal, requestId);
   }
+
+  function setKeyboardCursor(pos: CursorPosition | null) {
+    keyboardCursor = pos;
+    if (pos) {
+      lastRememberedCursor = pos;
+    }
+  }
+
+  function navigateWithFilter(direction: 'next' | 'prev', filterKind: 'line' | 'chunk' | 'comment') {
+    if (navigableFiles.length === 0) return;
+    const commentIndex = buildCommentIndex(normalizedThreads);
+    const filters = createDiffNavigationFilters(
+      navigableFiles,
+      commentIndex,
+      diffMode,
+      collapsedFiles,
+    );
+    const startPos = getStartPosition(keyboardCursor ?? lastRememberedCursor);
+    const result = findNextMatchingPosition(
+      startPos,
+      direction,
+      filters[filterKind],
+      navigableFiles,
+      diffMode,
+    );
+    if (result.position) {
+      setKeyboardCursor(result.position);
+      if (result.scrollTarget) {
+        scrollCursorIntoView(result.scrollTarget);
+      }
+    }
+  }
+
+  function jumpToFileIndex(targetIndex: number) {
+    const file = navigableFiles[targetIndex];
+    if (!file) return;
+    if (file.chunks[0]?.lines[0]) {
+      const nextPos = fixSide(
+        {
+          fileIndex: targetIndex,
+          chunkIndex: 0,
+          lineIndex: 0,
+          side: diffMode === 'split' ? 'left' : 'right',
+        },
+        navigableFiles,
+      );
+      setKeyboardCursor(nextPos);
+      if (collapsedFiles.has(file.path)) {
+        scrollToFile(file.path);
+      } else {
+        scrollCursorIntoView(getElementId(nextPos, diffMode));
+      }
+    } else {
+      setKeyboardCursor({
+        fileIndex: targetIndex,
+        chunkIndex: 0,
+        lineIndex: 0,
+        side: diffMode === 'split' ? 'left' : 'right',
+      });
+      scrollToFile(file.path);
+    }
+  }
+
+  function stepFile(direction: 'next' | 'prev') {
+    const total = navigableFiles.length;
+    if (total === 0) return;
+    const currentIdx = keyboardCursor?.fileIndex ?? lastRememberedCursor?.fileIndex ?? -1;
+    const targetIdx =
+      direction === 'next'
+        ? currentIdx < 0
+          ? 0
+          : (currentIdx + 1) % total
+        : currentIdx < 0
+          ? total - 1
+          : (currentIdx - 1 + total) % total;
+    jumpToFileIndex(targetIdx);
+  }
+
+  function stepUnresolvedComment(direction: 'next' | 'prev') {
+    const unresolved = normalizedThreads.filter((t) => !t.resolved);
+    if (unresolved.length === 0) return;
+
+    // Advance linearly in file/line order independently of transient highlight timeout.
+    const ordered = [...unresolved].sort((a, b) => {
+      const aFileIdx = navigableFiles.findIndex((f) => f.path === a.file);
+      const bFileIdx = navigableFiles.findIndex((f) => f.path === b.file);
+      if (aFileIdx !== bFileIdx) return aFileIdx - bFileIdx;
+      const aLine = Array.isArray(a.line) ? a.line[0] : a.line;
+      const bLine = Array.isArray(b.line) ? b.line[0] : b.line;
+      if (aLine !== bLine) return aLine - bLine;
+      return a.createdAt.localeCompare(b.createdAt);
+    });
+
+    const activeIdx = lastNavigatedThreadId
+      ? ordered.findIndex((t) => t.id === lastNavigatedThreadId)
+      : -1;
+    const nextIdx =
+      activeIdx < 0
+        ? direction === 'next'
+          ? 0
+          : ordered.length - 1
+        : (activeIdx + (direction === 'next' ? 1 : -1) + ordered.length) % ordered.length;
+    const targetThread = ordered[nextIdx];
+    if (!targetThread) return;
+
+    lastNavigatedThreadId = targetThread.id;
+    const pos = findCursorForCommentThread(targetThread, navigableFiles);
+    if (pos) {
+      setKeyboardCursor(pos);
+    }
+    void handleNavigateToThread(targetThread);
+  }
+
+  function triggerCommentOnCursor() {
+    if (!keyboardCursor) return;
+    const file = navigableFiles[keyboardCursor.fileIndex];
+    if (!file) return;
+    if (collapsedFiles.has(file.path)) {
+      manuallyToggledPaths.add(file.path);
+      collapsedFiles.delete(file.path);
+    }
+    if (getViewerForFile(file).id === 'image') {
+      openWholeFileComment(file.path);
+      return;
+    }
+    const line = file.chunks[keyboardCursor.chunkIndex]?.lines[keyboardCursor.lineIndex];
+    if (!line) {
+      openWholeFileComment(file.path);
+      return;
+    }
+    const isDelete = line.type === 'delete' || line.type === 'remove';
+    const side: DiffSide =
+      isDelete || (keyboardCursor.side === 'left' && line.oldLineNumber !== undefined)
+        ? 'old'
+        : 'new';
+    const lineNum =
+      side === 'old' ? line.oldLineNumber : (line.newLineNumber ?? line.oldLineNumber);
+    if (lineNum === undefined) return;
+    pendingLineComment = {
+      filePath: file.path,
+      side,
+      line: lineNum,
+      seq: ++nextPendingCommentSeq,
+    };
+  }
+
+  async function toggleCurrentFileViewed(advanceToNext: boolean) {
+    if (!diffData || diffData.files.length === 0) return;
+    const targetIdx =
+      keyboardCursor?.fileIndex ??
+      hoveredFileIndex ??
+      lastRememberedCursor?.fileIndex ??
+      0;
+    const file = diffData.files[targetIdx];
+    if (!file) return;
+
+    if (!advanceToNext || !viewedFiles.has(file.path)) {
+      await handleToggleFileViewed(file);
+    }
+    if (advanceToNext) {
+      const nextUnviewedIdx = findNextUnviewedFileIndex(targetIdx, navigableFiles, viewedFiles);
+      if (nextUnviewedIdx !== null) {
+        jumpToFileIndex(nextUnviewedIdx);
+      }
+    }
+  }
+
+  function handleGlobalKeydown(event: KeyboardEvent) {
+    if (settingsModalOpen) return;
+    if (isEditableEventTarget(event.target)) return;
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    if (!diffData) return;
+
+    if (event.key === '?') {
+      event.preventDefault();
+      helpModalOpen = !helpModalOpen;
+      return;
+    }
+    if (helpModalOpen) return;
+
+    switch (event.key) {
+      case 'j':
+      case 'ArrowDown':
+        event.preventDefault();
+        navigateWithFilter('next', 'line');
+        break;
+      case 'k':
+      case 'ArrowUp':
+        event.preventDefault();
+        navigateWithFilter('prev', 'line');
+        break;
+      case 'n':
+        event.preventDefault();
+        navigateWithFilter('next', 'chunk');
+        break;
+      case 'p':
+        event.preventDefault();
+        navigateWithFilter('prev', 'chunk');
+        break;
+      case 'N':
+        event.preventDefault();
+        stepUnresolvedComment('next');
+        break;
+      case 'P':
+        event.preventDefault();
+        stepUnresolvedComment('prev');
+        break;
+      case ']':
+        event.preventDefault();
+        stepFile('next');
+        break;
+      case '[':
+        event.preventDefault();
+        stepFile('prev');
+        break;
+      case '{':
+        event.preventDefault();
+        if (navigableFiles.length > 0) jumpToFileIndex(0);
+        break;
+      case '}':
+        event.preventDefault();
+        if (navigableFiles.length > 0) jumpToFileIndex(navigableFiles.length - 1);
+        break;
+      case 'h':
+      case 'ArrowLeft':
+        if (diffMode === 'split' && keyboardCursor) {
+          event.preventDefault();
+          const switched = switchSplitCursorSide(keyboardCursor, 'left', navigableFiles);
+          setKeyboardCursor(switched);
+          scrollCursorIntoView(getElementId(switched, diffMode));
+        }
+        break;
+      case 'l':
+      case 'ArrowRight':
+        if (diffMode === 'split' && keyboardCursor) {
+          event.preventDefault();
+          const switched = switchSplitCursorSide(keyboardCursor, 'right', navigableFiles);
+          setKeyboardCursor(switched);
+          scrollCursorIntoView(getElementId(switched, diffMode));
+        }
+        break;
+      case 'u':
+        event.preventDefault();
+        handleDiffModeChange('unified');
+        break;
+      case 's':
+        event.preventDefault();
+        handleDiffModeChange('split');
+        break;
+      case 'v':
+        event.preventDefault();
+        void toggleCurrentFileViewed(false);
+        break;
+      case 'V':
+        event.preventDefault();
+        void toggleCurrentFileViewed(true);
+        break;
+      case 'c':
+        event.preventDefault();
+        triggerCommentOnCursor();
+        break;
+      case 'L':
+        event.preventDefault();
+        commentsDrawerOpen = !commentsDrawerOpen;
+        break;
+      case 'R':
+        event.preventDefault();
+        void handleReload();
+        break;
+    }
+  }
 </script>
+
+<svelte:window onkeydown={handleGlobalKeydown} />
 
 {#if loading}
   <div class="flex items-center justify-center h-screen bg-github-bg-primary">
@@ -1692,6 +2085,30 @@
             <option value="light">Light</option>
           </select>
         </label>
+
+        <button
+          type="button"
+          onclick={() => {
+            settingsModalOpen = true;
+          }}
+          aria-label="Open settings"
+          title="Settings"
+          class="px-2.5 py-1 text-xs rounded border border-github-border bg-github-bg-tertiary text-github-text-secondary hover:text-github-text-primary cursor-pointer"
+        >
+          Settings
+        </button>
+
+        <button
+          type="button"
+          onclick={() => {
+            helpModalOpen = !helpModalOpen;
+          }}
+          aria-label="Keyboard shortcuts"
+          title="Keyboard shortcuts (?)"
+          class="px-2 py-1 text-xs font-mono rounded border border-github-border bg-github-bg-tertiary text-github-text-secondary hover:text-github-text-primary cursor-pointer"
+        >
+          ?
+        </button>
       </div>
     </header>
 
@@ -1794,16 +2211,25 @@
             </p>
           </div>
         {:else}
-          {#each diffData.files as file (file.path)}
+          {#each diffData.files as file, fileIdx (file.path)}
             {@const badge = formatStatusBadge(file.status)}
             {@const isCollapsed = collapsedFiles.has(file.path)}
             {@const isViewed = viewedFiles.has(file.path)}
+            {@const isKeyboardFocused = keyboardCursor?.fileIndex === fileIdx}
+            {@const viewer = getViewerForFile(file)}
+            {@const ViewerComponent = viewer.Component}
             <article
               id={getFileElementId(file.path)}
               data-file-path={file.path}
+              onmouseenter={() => {
+                hoveredFileIndex = fileIdx;
+              }}
+              onmouseleave={() => {
+                if (hoveredFileIndex === fileIdx) hoveredFileIndex = null;
+              }}
               class="border border-github-border rounded-md overflow-hidden bg-github-bg-secondary"
             >
-              <div class="px-3 py-2 bg-github-bg-secondary border-b border-github-border flex items-center justify-between gap-3">
+              <div class="px-3 py-2 bg-github-bg-secondary border-b border-github-border flex items-center justify-between gap-3 {isKeyboardFocused ? 'keyboard-focused-file-header' : ''}">
                 <button
                   type="button"
                   onclick={() => toggleFileCollapsed(file.path)}
@@ -1865,7 +2291,7 @@
               </div>
 
               {#if !isCollapsed}
-                <TextDiffViewer
+                <ViewerComponent
                   {file}
                   mergedChunks={mergedChunksByFile.get(file.path) ?? []}
                   {diffMode}
@@ -1879,11 +2305,18 @@
                   {isCollapsed}
                   activeWholeFileComment={activeWholeFileCommentPath === file.path}
                   {highlightedThreadId}
+                  fileIndex={fileIdx}
+                  cursor={isKeyboardFocused ? keyboardCursor : null}
+                  {pendingLineComment}
                   onExpandLines={(targetFile, chunkIndex, direction, count) =>
                     void handleExpandLines(targetFile, chunkIndex, direction, count)}
                   onExpandAllBetween={(targetFile, chunkIndex, hiddenLines) =>
                     void handleExpandAllBetween(targetFile, chunkIndex, hiddenLines)}
-                  onPrefetchLineCount={handlePrefetchLineCount}
+                  onPrefetchLineCount={(targetFile) => {
+                    if (viewer.canExpandHiddenLines(targetFile)) {
+                      handlePrefetchLineCount(targetFile);
+                    }
+                  }}
                   onAddComment={handleAddComment}
                   onReplyToThread={handleReplyToThread}
                   onToggleResolve={handleToggleResolve}
@@ -1892,6 +2325,11 @@
                     void handleOpenInEditor(targetPath, lineNum)}
                   onCancelWholeFileComment={() => {
                     activeWholeFileCommentPath = null;
+                  }}
+                  onConsumePendingComment={(seq) => {
+                    if (pendingLineComment?.seq === seq) {
+                      pendingLineComment = null;
+                    }
                   }}
                 />
               {/if}
@@ -1926,4 +2364,20 @@
       />
     </div>
   </div>
+
+  <SettingsModal
+    isOpen={settingsModalOpen}
+    settings={appearanceSettings}
+    onClose={() => {
+      settingsModalOpen = false;
+    }}
+    onSettingsChange={handleAppearanceSettingsChange}
+  />
+
+  <HelpModal
+    isOpen={helpModalOpen}
+    onClose={() => {
+      helpModalOpen = false;
+    }}
+  />
 {/if}

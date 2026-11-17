@@ -20,7 +20,7 @@
           version = "0.1.0";
           src = ./frontend;
           packageJSON = ./frontend/package.json;
-          npmDepsHash = "sha256-eL/UxLcu2cqfFuTaGQkzBG1nEALCEBopIwXn7bl1Nyw=";
+          npmDepsHash = "sha256-QEy6Li69zzAm0Wxosk5Xe3v5mbP60UyN9/QY5DvZNnY=";
           npmFlags = ["--legacy-peer-deps"];
         };
 

@@ -1,16 +1,15 @@
 <script lang="ts">
   import type {
     CommentThread,
-    DiffFile,
     DiffSide,
-    DiffViewMode,
     ExpandedLine,
     LineNumber,
-    MergedChunk,
   } from '../../types/diff';
+  import type { DiffViewerBodyProps } from '../viewers/types';
   import { isExpandableFile } from '../utils/expandedLines';
   import { getPrismLanguageFromFilename, isWholeFileHighlightExtension } from '../utils/languageDetection';
   import { loadPrismLanguage } from '../utils/languageLoader';
+  import { getElementId } from '../utils/navigation/domHelpers';
   import { type HighlightToken, isPrismLanguageLoaded, tokenizeCode } from '../utils/prism';
   import {
     computeUnifiedWordDiffMap,
@@ -32,42 +31,6 @@
 
   const MAX_WHOLE_FILE_LINES = 2000;
 
-  interface Props {
-    file: DiffFile;
-    mergedChunks: MergedChunk[];
-    diffMode: DiffViewMode;
-    threads: CommentThread[];
-    showAuthorBadges?: boolean;
-    syntaxTheme?: string;
-    baseCommitish?: string;
-    targetCommitish?: string;
-    openInEditorAvailable?: boolean;
-    isExpandLoading?: boolean;
-    isCollapsed?: boolean;
-    activeWholeFileComment?: boolean;
-    highlightedThreadId?: string | null;
-    onExpandLines: (
-      file: DiffFile,
-      chunkIndex: number,
-      direction: 'up' | 'down',
-      count?: number,
-    ) => void;
-    onExpandAllBetween: (file: DiffFile, chunkIndex: number, hiddenLines: number) => void;
-    onPrefetchLineCount?: (file: DiffFile) => void;
-    onAddComment: (
-      filePath: string,
-      line: LineNumber | undefined,
-      body: string,
-      codeContent?: string,
-      side?: DiffSide,
-    ) => Promise<void>;
-    onReplyToThread: (threadId: string, body: string) => Promise<void>;
-    onToggleResolve?: (threadId: string, currentResolved: boolean) => Promise<void> | void;
-    onRemoveThread?: (threadId: string) => void;
-    onOpenInEditor?: (filePath: string, lineNumber: number) => void;
-    onCancelWholeFileComment?: () => void;
-  }
-
   let {
     file,
     mergedChunks,
@@ -82,6 +45,9 @@
     isCollapsed = false,
     activeWholeFileComment = false,
     highlightedThreadId = null,
+    fileIndex,
+    cursor = null,
+    pendingLineComment = null,
     onExpandLines,
     onExpandAllBetween,
     onPrefetchLineCount,
@@ -91,7 +57,8 @@
     onRemoveThread,
     onOpenInEditor,
     onCancelWholeFileComment,
-  }: Props = $props();
+    onConsumePendingComment,
+  }: DiffViewerBodyProps = $props();
 
   interface DragSelection {
     chunkIndex: number;
@@ -141,6 +108,7 @@
   );
 
   let lastSelectionResetKey: string | null = null;
+  let lastPendingCommentSeq = -1;
 
   // Reset transient selection state only when the file or compared commits actually change.
   $effect(() => {
@@ -152,6 +120,37 @@
     }
     lastSelectionResetKey = nextKey;
   });
+
+  // Open an inline comment form when triggered from the keyboard shortcut ("c").
+  $effect(() => {
+    if (
+      pendingLineComment &&
+      pendingLineComment.filePath === file.path &&
+      pendingLineComment.seq !== lastPendingCommentSeq
+    ) {
+      lastPendingCommentSeq = pendingLineComment.seq;
+      commentingLine = { side: pendingLineComment.side, line: pendingLineComment.line };
+      onConsumePendingComment?.(pendingLineComment.seq);
+    }
+  });
+
+  function isLineCursor(
+    chunkIndex: number,
+    lineIndex: number | undefined,
+    side: 'left' | 'right',
+  ): boolean {
+    if (
+      fileIndex === undefined ||
+      lineIndex === undefined ||
+      !cursor ||
+      cursor.fileIndex !== fileIndex ||
+      cursor.chunkIndex !== chunkIndex ||
+      cursor.lineIndex !== lineIndex
+    ) {
+      return false;
+    }
+    return diffMode === 'unified' ? true : cursor.side === side;
+  }
 
   // Prefetch line counts once a collapsible file scrolls into view (or immediately when IntersectionObserver is unavailable).
   $effect(() => {
@@ -656,8 +655,17 @@
                     isCommentingAnchorRow('old', line.oldLineNumber)}
 
                   <tr
+                    id={fileIndex !== undefined
+                      ? getElementId({ fileIndex, chunkIndex: chunkIdx, lineIndex: lineIdx, side: 'right' }, 'unified')
+                      : undefined}
                     data-diff-line-row="true"
-                    class="group {getUnifiedLineClass(line)} {rowSelClass}"
+                    class="group {getUnifiedLineClass(line)} {rowSelClass} {isLineCursor(
+                      chunkIdx,
+                      lineIdx,
+                      'right',
+                    )
+                      ? 'keyboard-cursor'
+                      : ''}"
                     onmouseenter={() => {
                       if (dragState?.side === 'old') {
                         updateDragEnd(chunkIdx, 'old', line.oldLineNumber);
@@ -850,9 +858,22 @@
                     </td>
 
                     <td
+                      id={fileIndex !== undefined && sideLine.oldOriginalIndex !== undefined
+                        ? getElementId(
+                            {
+                              fileIndex,
+                              chunkIndex: chunkIdx,
+                              lineIndex: sideLine.oldOriginalIndex,
+                              side: 'left',
+                            },
+                            'split',
+                          )
+                        : undefined}
                       class="p-0 align-top border-r border-github-border {getSplitCellClass(
                         sideLine.oldLine,
-                      )} {oldSelClass}"
+                      )} {oldSelClass} {isLineCursor(chunkIdx, sideLine.oldOriginalIndex, 'left')
+                        ? 'keyboard-cursor'
+                        : ''}"
                       onmouseenter={() => updateDragEnd(chunkIdx, 'old', sideLine.oldLineNumber)}
                     >
                       {#if sideLine.oldLine}
@@ -926,7 +947,22 @@
                     </td>
 
                     <td
-                      class="p-0 align-top {getSplitCellClass(sideLine.newLine)} {newSelClass}"
+                      id={fileIndex !== undefined && sideLine.newOriginalIndex !== undefined
+                        ? getElementId(
+                            {
+                              fileIndex,
+                              chunkIndex: chunkIdx,
+                              lineIndex: sideLine.newOriginalIndex,
+                              side: 'right',
+                            },
+                            'split',
+                          )
+                        : undefined}
+                      class="p-0 align-top {getSplitCellClass(
+                        sideLine.newLine,
+                      )} {newSelClass} {isLineCursor(chunkIdx, sideLine.newOriginalIndex, 'right')
+                        ? 'keyboard-cursor'
+                        : ''}"
                       onmouseenter={() => updateDragEnd(chunkIdx, 'new', sideLine.newLineNumber)}
                     >
                       {#if sideLine.newLine}

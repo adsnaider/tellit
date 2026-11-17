@@ -6,6 +6,7 @@ pub mod syntax;
 extern crate alloc;
 
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use leptos::prelude::*;
@@ -1101,8 +1102,8 @@ fn render_frontmatter_for_diff(
 /// Interactive Markdown preview panel rendering diff blocks or full document with YAML frontmatter.
 #[component]
 pub fn MarkdownPreviewBody(
-    file: DiffFile,
-    #[prop(into)] merged_chunks: Signal<Vec<MergedChunk>>,
+    file: Arc<DiffFile>,
+    #[prop(into)] merged_chunks: Signal<Arc<Vec<MergedChunk>>>,
     base_commit: String,
     target_commit: String,
     #[prop(into)] active_tab: Signal<MarkdownTab>,

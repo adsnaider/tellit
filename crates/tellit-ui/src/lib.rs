@@ -24,6 +24,7 @@ mod components;
 mod state;
 
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use std::collections::{HashMap, HashSet};
 
@@ -637,7 +638,7 @@ fn jump_to_thread(ctx: AppCtx, thread: JjCommentThread) {
     }
 }
 
-fn prefetch_line_count_for_file(ctx: AppCtx, file: DiffFile) {
+fn prefetch_line_count_for_file(ctx: AppCtx, file: Arc<DiffFile>) {
     if ctx
         .prefetched_line_counts
         .with_value(|s| s.contains(&file.path))
@@ -939,7 +940,7 @@ pub fn App() -> impl IntoView {
         });
     });
 
-    let on_prefetch_line_count = Callback::new(move |file: DiffFile| {
+    let on_prefetch_line_count = Callback::new(move |file: Arc<DiffFile>| {
         prefetch_line_count_for_file(ctx, file);
     });
 
@@ -1020,15 +1021,23 @@ pub fn App() -> impl IntoView {
         counts
     });
 
-    let diff_files =
-        Signal::derive(move || ctx.diff_data.get().map(|d| d.files).unwrap_or_default());
+    let diff_files = Signal::derive(move || {
+        ctx.diff_data
+            .with(|d| d.as_ref().map(|d| d.files.clone()).unwrap_or_default())
+    });
 
-    let is_rebase_diff =
-        Signal::derive(move || ctx.diff_data.get().is_some_and(|d| d.is_rebase_diff));
-    let rebase_ignored =
-        Signal::derive(move || ctx.diff_data.get().is_some_and(|d| d.rebase_ignored));
-    let rebase_conflict =
-        Signal::derive(move || ctx.diff_data.get().is_some_and(|d| d.rebase_conflict));
+    let is_rebase_diff = Signal::derive(move || {
+        ctx.diff_data
+            .with(|d| d.as_ref().is_some_and(|d| d.is_rebase_diff))
+    });
+    let rebase_ignored = Signal::derive(move || {
+        ctx.diff_data
+            .with(|d| d.as_ref().is_some_and(|d| d.rebase_ignored))
+    });
+    let rebase_conflict = Signal::derive(move || {
+        ctx.diff_data
+            .with(|d| d.as_ref().is_some_and(|d| d.rebase_conflict))
+    });
 
     let active_change = Signal::derive(move || {
         let sel = ctx.selected_change_id.get();
@@ -1164,7 +1173,7 @@ pub fn App() -> impl IntoView {
                         </>
                     })}
                     {move || {
-                        let total = diff_files.get().len();
+                        let total = ctx.diff_data.with(|d| d.as_ref().map_or(0, |d| d.files.len()));
                         let viewed = ctx.reviewed_files.get().len().min(total);
                         (total > 0).then(|| {
                             let pct = (viewed * 100) / total;
@@ -1366,134 +1375,149 @@ pub fn App() -> impl IntoView {
                             </section>
                         }.into_any(),
                         RepoStatusState::Loaded(_) => {
-                            if ctx.loading_changes.get() && ctx.diff_data.get().is_none() {
+                            if ctx.loading_changes.get()
+                                && ctx.diff_data.with(|d| d.is_none())
+                            {
                                 return view! {
                                     <div class="center-message">"Loading Jujutsu revisions..."</div>
                                 }.into_any();
                             }
 
-                            let diff_opt = ctx.diff_data.get();
-                            let change_opt = active_change.get();
-                            let total_threads = ctx.comments.get().len();
-                            let unresolved_threads = ctx.comments.get().iter().filter(|t| !t.resolved).count();
-
                             view! {
                                 <div class="diff-workspace">
-                                    {change_opt.map(|change| {
-                                        let review = change.review_status();
-                                        let status = Signal::derive(move || review);
-                                        view! {
-                                            <section class="revision-summary">
-                                                <div class="revision-summary__title-row">
-                                                    <span class="jj-change-id jj-change-id--lg">
-                                                        {change.short_change_id}
-                                                    </span>
-                                                    <span class="muted-mono">{change.short_commit_id}</span>
-                                                    <ReviewDot
-                                                        status=status
-                                                        comment_count=change.comment_count
-                                                        unresolved_count=change.unresolved_comment_count
-                                                    />
-                                                    <h1 class="revision-summary__desc">{change.description}</h1>
-                                                </div>
-                                                <div class="revision-summary__meta">
-                                                    <span>{change.author}</span>
-                                                    <span>{change.timestamp}</span>
-                                                    {(total_threads > 0).then(|| view! {
-                                                        <span class={if unresolved_threads > 0 {
-                                                            "pill-tag pill-tag--warn"
-                                                        } else {
-                                                            "pill-tag pill-tag--ok"
-                                                        }}>
-                                                            {if unresolved_threads > 0 {
-                                                                alloc::format!("{unresolved_threads} unresolved / {total_threads} threads")
-                                                            } else {
-                                                                alloc::format!("{total_threads} resolved")
-                                                            }}
-                                                        </span>
-                                                    })}
-                                                    {move || ctx.highlighted_word.get().map(|w| view! {
-                                                        <button
-                                                            type="button"
-                                                            class="pill-tag pill-tag--info"
-                                                            title="Click to clear highlighted identifier"
-                                                            on:click=move |_| ctx.highlighted_word.set(None)
-                                                        >
-                                                            {alloc::format!("token: {w} ×")}
-                                                        </button>
-                                                    })}
-                                                </div>
-                                            </section>
-                                        }
-                                    })}
-
-                                    {match diff_opt {
-                                        None if ctx.loading_diff.get() => view! {
-                                            <div class="center-message">"Loading diff..."</div>
-                                        }.into_any(),
-                                        None => view! {
-                                            <div class="center-message">"Select a revision to inspect its diff."</div>
-                                        }.into_any(),
-                                        Some(diff) if diff.is_empty && diff.files.len() <= 1 => view! {
-                                            <div class="empty-diff-card">
-                                                <h2>"No changes in this revision"</h2>
-                                                <p>
-                                                    {alloc::format!(
-                                                        "Commit {} has no modified files against {}.",
-                                                        diff.commit.chars().take(8).collect::<String>(),
-                                                        diff.base_commit.chars().take(8).collect::<String>(),
-                                                    )}
-                                                </p>
-                                            </div>
-                                        }.into_any(),
-                                        Some(diff) => {
-                                            let generation = ctx.diff_generation.get_value();
-                                            let diff_base = diff.base_commit.clone();
-                                            let diff_target = diff.commit.clone();
+                                    {move || {
+                                        let change_opt = active_change.get();
+                                        let total_threads = ctx.comments.with(Vec::len);
+                                        let unresolved_threads = ctx
+                                            .comments
+                                            .with(|list| list.iter().filter(|t| !t.resolved).count());
+                                        change_opt.map(|change| {
+                                            let review = change.review_status();
+                                            let status = Signal::derive(move || review);
                                             view! {
-                                                <div class="diff-file-list">
-                                                    <For
-                                                        each=move || {
-                                                            ctx.diff_data
-                                                                .get()
-                                                                .map(|d| d.files.into_iter().enumerate().collect::<Vec<_>>())
-                                                                .unwrap_or_default()
-                                                        }
-                                                        key=move |(idx, file)| alloc::format!("{generation}:{idx}:{}", file.path)
-                                                        children=move |(idx, file)| {
-                                                            view! {
-                                                                <TextDiffCard
-                                                                    file=file
-                                                                    file_index=idx
-                                                                    base_commit=diff_base.clone()
-                                                                    target_commit=diff_target.clone()
-                                                                    all_threads=ctx.comments
-                                                                    reviewed_files=ctx.reviewed_files
-                                                                    collapsed_files=ctx.collapsed_files
-                                                                    diff_mode=ctx.diff_mode
-                                                                    resolved_theme=ctx.resolved_theme
-                                                                    show_resolved_inline=ctx.show_resolved_inline
-                                                                    highlighted_word=ctx.highlighted_word
-                                                                    expanded_lines=ctx.expanded_lines
-                                                                    expand_loading=ctx.expand_loading
-                                                                    active_cursor=ctx.active_cursor
-                                                                    keyboard_comment_trigger=ctx.keyboard_comment_trigger
-                                                                    on_hover_file=Callback::new(move |hovered| ctx.hovered_file_index.set(hovered))
-                                                                    on_toggle_word=on_toggle_word
-                                                                    on_toggle_viewed=on_toggle_reviewed
-                                                                    on_toggle_collapse=on_toggle_collapse
-                                                                    on_open_in_editor=on_open_in_editor
-                                                                    on_prefetch_line_count=on_prefetch_line_count
-                                                                    on_expand_lines=on_expand_lines
-                                                                    on_create_thread=on_create_thread
-                                                                    on_reply=on_reply
-                                                                    on_toggle_resolve=on_toggle_resolve
-                                                                />
-                                                            }
-                                                        }
-                                                    />
+                                                <section class="revision-summary">
+                                                    <div class="revision-summary__title-row">
+                                                        <span class="jj-change-id jj-change-id--lg">
+                                                            {change.short_change_id}
+                                                        </span>
+                                                        <span class="muted-mono">{change.short_commit_id}</span>
+                                                        <ReviewDot
+                                                            status=status
+                                                            comment_count=change.comment_count
+                                                            unresolved_count=change.unresolved_comment_count
+                                                        />
+                                                        <h1 class="revision-summary__desc">{change.description}</h1>
+                                                    </div>
+                                                    <div class="revision-summary__meta">
+                                                        <span>{change.author}</span>
+                                                        <span>{change.timestamp}</span>
+                                                        {(total_threads > 0).then(|| view! {
+                                                            <span class={if unresolved_threads > 0 {
+                                                                "pill-tag pill-tag--warn"
+                                                            } else {
+                                                                "pill-tag pill-tag--ok"
+                                                            }}>
+                                                                {if unresolved_threads > 0 {
+                                                                    alloc::format!("{unresolved_threads} unresolved / {total_threads} threads")
+                                                                } else {
+                                                                    alloc::format!("{total_threads} resolved")
+                                                                }}
+                                                            </span>
+                                                        })}
+                                                        {move || ctx.highlighted_word.get().map(|w| view! {
+                                                            <button
+                                                                type="button"
+                                                                class="pill-tag pill-tag--info"
+                                                                title="Click to clear highlighted identifier"
+                                                                on:click=move |_| ctx.highlighted_word.set(None)
+                                                            >
+                                                                {alloc::format!("token: {w} ×")}
+                                                            </button>
+                                                        })}
+                                                    </div>
+                                                </section>
+                                            }
+                                        })
+                                    }}
+
+                                    {move || {
+                                        let diff_meta = ctx.diff_data.with(|opt| {
+                                            opt.as_ref().map(|d| {
+                                                (
+                                                    d.is_empty && d.files.len() <= 1,
+                                                    d.base_commit.clone(),
+                                                    d.commit.clone(),
+                                                )
+                                            })
+                                        });
+                                        match diff_meta {
+                                            None if ctx.loading_diff.get() => view! {
+                                                <div class="center-message">"Loading diff..."</div>
+                                            }.into_any(),
+                                            None => view! {
+                                                <div class="center-message">"Select a revision to inspect its diff."</div>
+                                            }.into_any(),
+                                            Some((true, base_c, target_c)) => view! {
+                                                <div class="empty-diff-card">
+                                                    <h2>"No changes in this revision"</h2>
+                                                    <p>
+                                                        {alloc::format!(
+                                                            "Commit {} has no modified files against {}.",
+                                                            target_c.chars().take(8).collect::<String>(),
+                                                            base_c.chars().take(8).collect::<String>(),
+                                                        )}
+                                                    </p>
                                                 </div>
-                                            }.into_any()
+                                            }.into_any(),
+                                            Some((false, diff_base, diff_target)) => {
+                                                let generation = ctx.diff_generation.get_value();
+                                                view! {
+                                                    <div class="diff-file-list">
+                                                        <For
+                                                            each=move || {
+                                                                ctx.diff_data
+                                                                    .with(|opt| {
+                                                                        opt.as_ref()
+                                                                            .map(|d| d.files.iter().cloned().enumerate().collect::<Vec<_>>())
+                                                                            .unwrap_or_default()
+                                                                    })
+                                                            }
+                                                            key=move |(idx, file)| alloc::format!("{generation}:{idx}:{}", file.path)
+                                                            children=move |(idx, file)| {
+                                                                view! {
+                                                                    <TextDiffCard
+                                                                        file=file
+                                                                        file_index=idx
+                                                                        base_commit=diff_base.clone()
+                                                                        target_commit=diff_target.clone()
+                                                                        all_threads=ctx.comments
+                                                                        reviewed_files=ctx.reviewed_files
+                                                                        collapsed_files=ctx.collapsed_files
+                                                                        diff_mode=ctx.diff_mode
+                                                                        resolved_theme=ctx.resolved_theme
+                                                                        show_resolved_inline=ctx.show_resolved_inline
+                                                                        highlighted_word=ctx.highlighted_word
+                                                                        expanded_lines=ctx.expanded_lines
+                                                                        expand_loading=ctx.expand_loading
+                                                                        active_cursor=ctx.active_cursor
+                                                                        keyboard_comment_trigger=ctx.keyboard_comment_trigger
+                                                                        on_hover_file=Callback::new(move |hovered| ctx.hovered_file_index.set(hovered))
+                                                                        on_toggle_word=on_toggle_word
+                                                                        on_toggle_viewed=on_toggle_reviewed
+                                                                        on_toggle_collapse=on_toggle_collapse
+                                                                        on_open_in_editor=on_open_in_editor
+                                                                        on_prefetch_line_count=on_prefetch_line_count
+                                                                        on_expand_lines=on_expand_lines
+                                                                        on_create_thread=on_create_thread
+                                                                        on_reply=on_reply
+                                                                        on_toggle_resolve=on_toggle_resolve
+                                                                    />
+                                                                }
+                                                            }
+                                                        />
+                                                    </div>
+                                                }.into_any()
+                                            }
                                         }
                                     }}
                                 </div>

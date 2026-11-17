@@ -7,6 +7,7 @@ pub(crate) mod split;
 pub(crate) mod word_highlight;
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use std::collections::HashSet;
 
@@ -65,7 +66,7 @@ pub struct CreateThreadEvent {
 #[derive(Clone)]
 pub struct ExpandLinesEvent {
     /// Diff file descriptor needing context lines.
-    pub file: DiffFile,
+    pub file: Arc<DiffFile>,
     /// Original index inside `file.chunks`.
     pub chunk_index: usize,
     /// Direction (`Up` or `Down`), or `None` when expanding an entire gap before `chunk_index`.
@@ -142,12 +143,13 @@ pub fn TextDiffCard(
     on_toggle_viewed: Callback<String>,
     on_toggle_collapse: Callback<String>,
     on_open_in_editor: Callback<(String, usize)>,
-    on_prefetch_line_count: Callback<DiffFile>,
+    on_prefetch_line_count: Callback<Arc<DiffFile>>,
     on_expand_lines: Callback<ExpandLinesEvent>,
     on_create_thread: Callback<CreateThreadEvent>,
     on_reply: Callback<CommentReplyEvent>,
     on_toggle_resolve: Callback<(String, bool)>,
 ) -> impl IntoView {
+    let file = Arc::new(file);
     let path = file.path.clone();
     let is_commit_msg = path == COMMIT_MESSAGE_PATH;
     let is_md = !is_commit_msg && state::is_markdown_file(&path);
@@ -182,9 +184,9 @@ pub fn TextDiffCard(
     let selection_anchor = RwSignal::new(Option::<(CommentSide, u32)>::None);
     let active_composer = RwSignal::new(Option::<ActiveComposer>::None);
 
-    let file_for_mouseup = StoredValue::new_local(file.clone());
-    let file_for_kbd = StoredValue::new_local(file.clone());
-    let file_for_prefetch = StoredValue::new_local(file.clone());
+    let file_for_mouseup = StoredValue::new_local(Arc::clone(&file));
+    let file_for_kbd = StoredValue::new_local(Arc::clone(&file));
+    let file_for_prefetch = StoredValue::new_local(Arc::clone(&file));
 
     Effect::new(move |_| {
         let Some(trig) = keyboard_comment_trigger.get() else {
@@ -238,7 +240,7 @@ pub fn TextDiffCard(
 
     Effect::new(move |_| {
         if is_expandable && has_chunks && !is_collapsed_sig.get() {
-            file_for_prefetch.with_value(|f| on_prefetch_line_count.run(f.clone()));
+            file_for_prefetch.with_value(|f| on_prefetch_line_count.run(Arc::clone(f)));
         }
     });
 
@@ -268,7 +270,7 @@ pub fn TextDiffCard(
     });
 
     let total_thread_count = Signal::derive(move || visible_threads.get().len());
-    let file_for_body = file.clone();
+    let file_for_body = Arc::clone(&file);
 
     view! {
         <article
@@ -388,7 +390,7 @@ pub fn TextDiffCard(
                     </div>
                 }).into_any()
             } else {
-                let file_snapshot = file_for_body.clone();
+                let file_snapshot = Arc::clone(&file_for_body);
                 let base_for_body = base_commit.clone();
                 let target_for_body = target_commit.clone();
                 let path_for_whole_submit = file_snapshot.path.clone();
@@ -434,7 +436,7 @@ pub fn TextDiffCard(
                                 <>
                                     {move || render_file_threads_section(visible_threads.get(), on_reply, on_toggle_resolve)}
                                     <ImageDiffBody
-                                        file=file_snapshot
+                                        file=(*file_snapshot).clone()
                                         base_commit=base_for_body
                                         target_commit=target_for_body
                                     />
@@ -442,19 +444,19 @@ pub fn TextDiffCard(
                             }.into_any()
                         } else {
                             let path_for_exp = file_snapshot.path.clone();
-                            let file_for_chunks = StoredValue::new(file_snapshot.clone());
+                            let file_for_chunks = StoredValue::new_local(Arc::clone(&file_snapshot));
                             let file_exp_memo = Memo::new(move |_| {
                                 expanded_lines.with(|map| map.get(&path_for_exp).cloned())
                             });
                             let merged_chunks_memo = Memo::new(move |_| {
-                                file_for_chunks.with_value(|f| {
+                                Arc::new(file_for_chunks.with_value(|f| {
                                     file_exp_memo.with(|exp| merge_chunks_for_file(f, exp.as_ref()))
-                                })
+                                }))
                             });
                             let show_code = Memo::new(move |_| !is_md || md_tab.get() == MarkdownTab::Code);
 
                             let md_preview_panel = is_md.then(|| {
-                                let md_file = file_snapshot.clone();
+                                let md_file = Arc::clone(&file_snapshot);
                                 let md_base = base_for_body.clone();
                                 let md_target = target_for_body.clone();
                                 view! {
@@ -486,7 +488,7 @@ pub fn TextDiffCard(
                                         let mode = diff_mode.get();
 
                                         let mut placed_ids = HashSet::new();
-                                        for mc in &merged_chunks {
+                                        for mc in merged_chunks.iter() {
                                             collect_placed_thread_ids(mc, &active_threads, mode, &mut placed_ids);
                                         }
 
@@ -511,7 +513,7 @@ pub fn TextDiffCard(
                                                     }.into_any()
                                                 } else {
                                                     merged_chunks
-                                                        .into_iter()
+                                                        .iter()
                                                         .enumerate()
                                                         .map(|(merged_idx, mc)| {
                                                             let first_orig = *mc.original_indices.first().unwrap_or(&0);
@@ -520,9 +522,9 @@ pub fn TextDiffCard(
                                                             let is_last = merged_idx + 1 == chunk_count;
                                                             let hidden_before = mc.hidden_lines_before;
                                                             let hidden_after = mc.hidden_lines_after.unwrap_or(0);
-                                                            let file_top = file_snapshot.clone();
-                                                            let file_mid = file_snapshot.clone();
-                                                            let file_bot = file_snapshot.clone();
+                                                            let file_top = Arc::clone(&file_snapshot);
+                                                            let file_mid = Arc::clone(&file_snapshot);
+                                                            let file_bot = Arc::clone(&file_snapshot);
                                                             let fpath = path_clone.clone();
                                                             let lsubmit = path_for_line_submit.clone();
                                                             let t_list = active_threads.clone();
@@ -536,18 +538,18 @@ pub fn TextDiffCard(
                                                                             is_loading=expand_loading
                                                                             on_expand_up=Callback::new(|()| {})
                                                                             on_expand_down=Callback::new({
-                                                                                let f = file_top.clone();
+                                                                                let f = Arc::clone(&file_top);
                                                                                 move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                                    file: f.clone(),
+                                                                                    file: Arc::clone(&f),
                                                                                     chunk_index: first_orig,
                                                                                     direction: Some(ExpandDirection::Up),
                                                                                     count: DEFAULT_EXPAND_COUNT,
                                                                                 })
                                                                             })
                                                                             on_expand_all=Callback::new({
-                                                                                let f = file_top.clone();
+                                                                                let f = Arc::clone(&file_top);
                                                                                 move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                                    file: f.clone(),
+                                                                                    file: Arc::clone(&f),
                                                                                     chunk_index: first_orig,
                                                                                     direction: None,
                                                                                     count: hidden_before,
@@ -562,27 +564,27 @@ pub fn TextDiffCard(
                                                                             hidden_lines=hidden_before
                                                                             is_loading=expand_loading
                                                                             on_expand_up=Callback::new({
-                                                                                let f = file_mid.clone();
+                                                                                let f = Arc::clone(&file_mid);
                                                                                 move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                                    file: f.clone(),
+                                                                                    file: Arc::clone(&f),
                                                                                     chunk_index: first_orig.saturating_sub(1),
                                                                                     direction: Some(ExpandDirection::Down),
                                                                                     count: DEFAULT_EXPAND_COUNT,
                                                                                 })
                                                                             })
                                                                             on_expand_down=Callback::new({
-                                                                                let f = file_mid.clone();
+                                                                                let f = Arc::clone(&file_mid);
                                                                                 move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                                    file: f.clone(),
+                                                                                    file: Arc::clone(&f),
                                                                                     chunk_index: first_orig,
                                                                                     direction: Some(ExpandDirection::Up),
                                                                                     count: DEFAULT_EXPAND_COUNT,
                                                                                 })
                                                                             })
                                                                             on_expand_all=Callback::new({
-                                                                                let f = file_mid.clone();
+                                                                                let f = Arc::clone(&file_mid);
                                                                                 move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                                    file: f.clone(),
+                                                                                    file: Arc::clone(&f),
                                                                                     chunk_index: first_orig,
                                                                                     direction: None,
                                                                                     count: hidden_before,
@@ -595,7 +597,7 @@ pub fn TextDiffCard(
 
                                                                     {if mode == DiffViewMode::Split {
                                                                         render_split_chunk(
-                                                                            &mc,
+                                                                            mc,
                                                                             &fpath,
                                                                             &t_list,
                                                                             &lsubmit,
@@ -603,7 +605,7 @@ pub fn TextDiffCard(
                                                                         ).into_any()
                                                                     } else {
                                                                         render_unified_chunk(
-                                                                            &mc,
+                                                                            mc,
                                                                             &fpath,
                                                                             &t_list,
                                                                             &lsubmit,
@@ -617,9 +619,9 @@ pub fn TextDiffCard(
                                                                             hidden_lines=hidden_after
                                                                             is_loading=expand_loading
                                                                             on_expand_up=Callback::new({
-                                                                                let f = file_bot.clone();
+                                                                                let f = Arc::clone(&file_bot);
                                                                                 move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                                    file: f.clone(),
+                                                                                    file: Arc::clone(&f),
                                                                                     chunk_index: last_orig,
                                                                                     direction: Some(ExpandDirection::Down),
                                                                                     count: DEFAULT_EXPAND_COUNT,
@@ -627,9 +629,9 @@ pub fn TextDiffCard(
                                                                             })
                                                                             on_expand_down=Callback::new(|()| {})
                                                                             on_expand_all=Callback::new({
-                                                                                let f = file_bot.clone();
+                                                                                let f = Arc::clone(&file_bot);
                                                                                 move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                                    file: f.clone(),
+                                                                                    file: Arc::clone(&f),
                                                                                     chunk_index: last_orig,
                                                                                     direction: Some(ExpandDirection::Down),
                                                                                     count: hidden_after,
@@ -794,7 +796,7 @@ fn render_line_actions(
     line_num: u32,
     editor_line: Option<u32>,
     edit_path: String,
-    lines_for_drag: Vec<DiffLine>,
+    lines_for_drag: Arc<[DiffLine]>,
     ctx: ChunkRenderCtx,
 ) -> impl IntoView {
     view! {
@@ -846,7 +848,7 @@ fn render_unified_chunk(
     submit_file_path: &str,
     ctx: ChunkRenderCtx,
 ) -> impl IntoView {
-    let all_lines = mc.lines.clone();
+    let all_lines: Arc<[DiffLine]> = Arc::from(mc.lines.as_slice());
 
     view! {
         <table class="diff-table diff-table--unified">
@@ -865,10 +867,10 @@ fn render_unified_chunk(
                     };
 
                     let line_threads = unified_line_threads(line, threads);
-                    let lines_for_old = all_lines.clone();
-                    let lines_for_new = all_lines.clone();
-                    let lines_for_plus = all_lines.clone();
-                    let lines_for_snippet = all_lines.clone();
+                    let lines_for_old = Arc::clone(&all_lines);
+                    let lines_for_new = Arc::clone(&all_lines);
+                    let lines_for_plus = Arc::clone(&all_lines);
+                    let lines_for_snippet = Arc::clone(&all_lines);
                     let edit_path = String::from(file_path);
                     let editor_line = (!ctx.is_commit_msg && line.kind != DiffLineKind::Delete)
                         .then(|| line.new_line_number.or(line.old_line_number))
@@ -1071,7 +1073,7 @@ fn render_split_chunk(
     ctx: ChunkRenderCtx,
 ) -> impl IntoView {
     let rows = pair_side_by_side_rows(&mc.lines, &mc.expanded_line_flags, &mc.line_sources);
-    let all_lines = mc.lines.clone();
+    let all_lines: Arc<[DiffLine]> = Arc::from(mc.lines.as_slice());
 
     view! {
         <table class="diff-table diff-table--split">
@@ -1105,9 +1107,11 @@ fn render_split_chunk(
                     let is_context_pair = row.old_line.as_ref().is_some_and(|l| l.kind == DiffLineKind::Context)
                         && row.new_line.as_ref().is_some_and(|l| l.kind == DiffLineKind::Context);
 
-                    let old_lines_drag = all_lines.clone();
-                    let new_lines_drag = all_lines.clone();
-                    let snippet_lines = all_lines.clone();
+                    let old_lines_drag = Arc::clone(&all_lines);
+                    let new_lines_drag = Arc::clone(&all_lines);
+                    let snippet_lines = Arc::clone(&all_lines);
+                    let old_action_lines = Arc::clone(&all_lines);
+                    let new_action_lines = Arc::clone(&all_lines);
                     let edit_path = String::from(file_path);
                     let submit_old = String::from(submit_file_path);
                     let submit_new = String::from(submit_file_path);
@@ -1225,7 +1229,7 @@ fn render_split_chunk(
                                             ln,
                                             None,
                                             edit_path.clone(),
-                                            all_lines.clone(),
+                                            old_action_lines,
                                             ctx,
                                         )
                                     })}
@@ -1272,7 +1276,7 @@ fn render_split_chunk(
                                             ln,
                                             (!ctx.is_commit_msg).then_some(ln),
                                             edit_path.clone(),
-                                            all_lines.clone(),
+                                            new_action_lines,
                                             ctx,
                                         )
                                     })}

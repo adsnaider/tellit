@@ -12,7 +12,7 @@ use std::process::Output;
 
 use tellit_types::{
     ApproveCommitResponse, CommentSide, JjChange, JjChangesResponse, JjCommentThread, JjCommit,
-    JjDiffResponse, JjGraphRow, JjStatusResponse, LineRangeSpec,
+    JjDiffResponse, JjGraphRow, JjStatusResponse, LineCountResponse, LineRangeSpec,
 };
 use thiserror::Error;
 use tokio::process::Command;
@@ -25,6 +25,7 @@ const JJ_LOG_EDGE_MARKER: &str = "__TELLIT_EDGE__";
 const ROOT_CHANGE_ID: &str = "00000000000000000000000000000000";
 const UPWARD_CONNECTING_GLYPHS: &str = "│|:╯┘'╰└`├┤┴┼+";
 const MAX_ETXTBSY_RETRIES: u32 = 10;
+const MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
 
 const JJ_CHANGE_FIELDS_EXPR: &str = r#"change_id ++ "\t" ++ change_id.shortest() ++ "\t" ++ commit_id ++ "\t" ++ if(current_working_copy, "1", "0") ++ "\t" ++ if(empty, "1", "0") ++ "\t" ++ if(immutable, "1", "0") ++ "\t" ++ if(conflict, "1", "0") ++ "\t" ++ if(root, "1", "0") ++ "\t" ++ bookmarks.map(|b| b.name()).join(",") ++ "\t" ++ parents.map(|p| p.commit_id()).join(",") ++ "\t" ++ if(author.name(), author.name(), author.email()) ++ "\t" ++ committer.timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ description.first_line()"#;
 
@@ -77,6 +78,15 @@ pub struct JjRepoPaths {
     pub jj_repo_dir: PathBuf,
 }
 
+/// Raw repository file bytes and detected MIME type returned by `GET /api/blob/{*path}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobPayload {
+    /// Unmodified file bytes at the requested revision.
+    pub bytes: Vec<u8>,
+    /// MIME content type for HTTP response headers.
+    pub content_type: &'static str,
+}
+
 #[derive(Debug, Clone)]
 struct CommitMeta {
     commit_id: String,
@@ -114,6 +124,12 @@ impl JujutsuService {
             repo_path,
             store_override,
         }
+    }
+
+    /// Returns the workspace root directory configured for this service.
+    #[must_use]
+    pub fn repo_path(&self) -> &Path {
+        &self.repo_path
     }
 
     /// Resolves the `.tellit/` store directory for this workspace.
@@ -471,7 +487,10 @@ impl JujutsuService {
 
         let effective_base = match normalized_base {
             Some(base_ref) => base_meta.map_or_else(|| String::from(base_ref), |m| m.commit_id),
-            None => alloc::format!("{resolved_target}^"),
+            None => target_meta
+                .as_ref()
+                .and_then(|m| m.parents.first().cloned())
+                .unwrap_or_else(|| alloc::format!("{resolved_target}-")),
         };
 
         Ok(JjDiffResponse {
@@ -482,6 +501,132 @@ impl JujutsuService {
             is_rebase_diff,
             rebase_ignored,
             rebase_conflict,
+        })
+    }
+
+    /// Reads raw file bytes for `raw_path` at Jujutsu revision `raw_rev` (or `working`/`.`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JujutsuError::InvalidInput`] for invalid paths/revisions or oversized files,
+    /// [`JujutsuError::NotFound`] if the file does not exist at `raw_rev`, or command/I/O errors.
+    pub async fn get_blob_content(
+        &self,
+        raw_path: &str,
+        raw_rev: Option<&str>,
+    ) -> Result<BlobPayload, JujutsuError> {
+        let clean_path = validate_repo_relative_path(raw_path)?;
+        if clean_path == Path::new(COMMIT_MESSAGE_PATH) {
+            return Err(JujutsuError::NotFound(String::from(
+                "blob content not available for virtual commit message",
+            )));
+        }
+
+        let rev = normalize_blob_rev(raw_rev)?;
+        let content_type = blob_content_type(&clean_path);
+
+        if rev == "working" || rev == "." {
+            let repo_path = self.repo_path.clone();
+            let bytes =
+                tokio::task::spawn_blocking(move || read_working_file(&repo_path, &clean_path))
+                    .await
+                    .map_err(|err| JujutsuError::Io(io::Error::other(err)))??;
+            return Ok(BlobPayload {
+                bytes,
+                content_type,
+            });
+        }
+
+        let rel_posix = clean_path.to_string_lossy().replace('\\', "/");
+        let rev_arg = alloc::format!("--revision={rev}");
+        let args = [
+            "--no-pager",
+            "--ignore-working-copy",
+            "file",
+            "show",
+            &rev_arg,
+            "--",
+            &rel_posix,
+        ];
+        let output = run_command_with_retry("jj", &self.repo_path, &args, None).await?;
+        if !output.status.success() {
+            return Err(JujutsuError::NotFound(alloc::format!(
+                "file '{rel_posix}' not found at revision '{rev}'"
+            )));
+        }
+        if output.stdout.len() > MAX_BLOB_BYTES {
+            return Err(JujutsuError::InvalidInput(String::from(
+                "file exceeds 16 MiB display limit",
+            )));
+        }
+
+        Ok(BlobPayload {
+            bytes: output.stdout,
+            content_type,
+        })
+    }
+
+    /// Counts total lines for `raw_path` at `old_ref` (`old_path` if renamed) and/or `new_ref`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JujutsuError::InvalidInput`] if any path or revision argument fails validation.
+    pub async fn get_line_count(
+        &self,
+        raw_path: &str,
+        old_ref: Option<&str>,
+        new_ref: Option<&str>,
+        old_path: Option<&str>,
+    ) -> Result<LineCountResponse, JujutsuError> {
+        let clean_new = validate_repo_relative_path(raw_path)?;
+        let new_str = clean_new.to_string_lossy().replace('\\', "/");
+        if new_str == COMMIT_MESSAGE_PATH {
+            return Ok(LineCountResponse {
+                old_line_count: Some(0),
+                new_line_count: Some(0),
+            });
+        }
+
+        let clean_old = match old_path.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(p) => validate_repo_relative_path(p)?
+                .to_string_lossy()
+                .replace('\\', "/"),
+            None => new_str.clone(),
+        };
+
+        let old_rev = match old_ref.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(r) => Some(normalize_blob_rev(Some(r))?),
+            None => None,
+        };
+        let new_rev = match new_ref.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(r) => Some(normalize_blob_rev(Some(r))?),
+            None => None,
+        };
+
+        let (old_line_count, new_line_count) = tokio::join!(
+            async {
+                match old_rev.as_deref() {
+                    Some(rev) => Some(match self.get_blob_content(&clean_old, Some(rev)).await {
+                        Ok(blob) => count_blob_lines(&blob.bytes),
+                        Err(_) => 0,
+                    }),
+                    None => None,
+                }
+            },
+            async {
+                match new_rev.as_deref() {
+                    Some(rev) => Some(match self.get_blob_content(&new_str, Some(rev)).await {
+                        Ok(blob) => count_blob_lines(&blob.bytes),
+                        Err(_) => 0,
+                    }),
+                    None => None,
+                }
+            }
+        );
+
+        Ok(LineCountResponse {
+            old_line_count,
+            new_line_count,
         })
     }
 
@@ -1687,7 +1832,18 @@ fn thread_info_to_wire(thread: ThreadInfo, side: CommentSide) -> JjCommentThread
     }
 }
 
-fn validate_repo_relative_path(raw: &str) -> Result<PathBuf, JujutsuError> {
+/// Validates and normalizes a repository-relative path, rejecting traversal, absolute paths, and `.git`/`.jj` metadata.
+///
+/// # Errors
+///
+/// Returns [`JujutsuError::InvalidInput`] if `raw` is empty, contains NUL bytes, is absolute,
+/// traverses upward with `..`, or targets internal `.git` or `.jj` directories.
+pub fn validate_repo_relative_path(raw: &str) -> Result<PathBuf, JujutsuError> {
+    if raw.contains('\0') {
+        return Err(JujutsuError::InvalidInput(String::from(
+            "filePath cannot contain NUL bytes",
+        )));
+    }
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(JujutsuError::InvalidInput(String::from(
@@ -1707,7 +1863,14 @@ fn validate_repo_relative_path(raw: &str) -> Result<PathBuf, JujutsuError> {
     let mut clean = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::Normal(seg) => clean.push(seg),
+            Component::Normal(seg) => {
+                if seg == ".git" || seg == ".jj" {
+                    return Err(JujutsuError::InvalidInput(String::from(
+                        "filePath cannot target repository metadata directories",
+                    )));
+                }
+                clean.push(seg);
+            }
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 return Err(JujutsuError::InvalidInput(String::from(
@@ -1722,6 +1885,99 @@ fn validate_repo_relative_path(raw: &str) -> Result<PathBuf, JujutsuError> {
         )));
     }
     Ok(clean)
+}
+
+fn normalize_blob_rev(raw_rev: Option<&str>) -> Result<String, JujutsuError> {
+    let Some(trimmed) = raw_rev.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(String::from("@"));
+    };
+    if trimmed.starts_with('-') {
+        return Err(JujutsuError::InvalidInput(String::from(
+            "revision parameter cannot start with '-'",
+        )));
+    }
+    if trimmed.chars().any(|c| c.is_control() || c == '\0') {
+        return Err(JujutsuError::InvalidInput(String::from(
+            "revision parameter contains invalid control characters",
+        )));
+    }
+    let trailing_carets = trimmed.chars().rev().take_while(|&c| c == '^').count();
+    if trailing_carets > 0 {
+        let base = &trimmed[..trimmed.len() - trailing_carets];
+        let mut out = String::with_capacity(trimmed.len());
+        out.push_str(base);
+        for _ in 0..trailing_carets {
+            out.push('-');
+        }
+        return Ok(out);
+    }
+    Ok(String::from(trimmed))
+}
+
+fn count_blob_lines(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let newlines = bytes.iter().filter(|&&b| b == b'\n').count();
+    if bytes.ends_with(b"\n") {
+        newlines
+    } else {
+        newlines + 1
+    }
+}
+
+fn read_working_file(repo_path: &Path, clean_path: &Path) -> Result<Vec<u8>, JujutsuError> {
+    let repo_root = repo_path.canonicalize().map_err(JujutsuError::Io)?;
+    let target_path = repo_root.join(clean_path);
+    let canonical_file = target_path.canonicalize().map_err(|err| {
+        if err.kind() == io::ErrorKind::NotFound {
+            JujutsuError::NotFound(alloc::format!(
+                "file '{}' not found in working copy",
+                clean_path.display()
+            ))
+        } else {
+            JujutsuError::Io(err)
+        }
+    })?;
+    if !canonical_file.starts_with(&repo_root) {
+        return Err(JujutsuError::InvalidInput(String::from(
+            "filePath cannot escape the repository root",
+        )));
+    }
+    let meta = std::fs::metadata(&canonical_file)?;
+    if !meta.is_file() {
+        return Err(JujutsuError::NotFound(alloc::format!(
+            "'{}' is not a regular file",
+            clean_path.display()
+        )));
+    }
+    if meta.len() > MAX_BLOB_BYTES as u64 {
+        return Err(JujutsuError::InvalidInput(String::from(
+            "file exceeds 16 MiB display limit",
+        )));
+    }
+    Ok(std::fs::read(&canonical_file)?)
+}
+
+fn blob_content_type(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("tiff" | "tif") => "image/tiff",
+        Some("avif") => "image/avif",
+        Some("heic") => "image/heic",
+        Some("heif") => "image/heif",
+        _ => "application/octet-stream",
+    }
 }
 
 fn map_store_lookup_error(err: anyhow::Error) -> JujutsuError {

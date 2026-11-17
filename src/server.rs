@@ -24,6 +24,7 @@ extern crate alloc;
 mod assets;
 mod background;
 mod diff_parser;
+mod editor;
 mod jujutsu;
 mod watch;
 
@@ -42,19 +43,22 @@ use core::time::Duration;
 use std::io;
 use std::path::PathBuf;
 
+use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use editor::{EditorError, open_in_editor};
 use jujutsu::{JujutsuError, JujutsuService};
 use serde::Deserialize;
 use tellit_types::{
     ApiErrorResponse, ApproveCommitRequest, ApproveCommitResponse, CreateCommentRequest,
     CreateCommentResponse, HeartbeatEvent, JjChangesResponse, JjCommentsResponse,
-    JjCommitsResponse, JjDiffResponse, JjStatusResponse, ReplyCommentRequest, ReplyCommentResponse,
-    ResolveCommentRequest, ResolveCommentResponse,
+    JjCommitsResponse, JjDiffResponse, JjStatusResponse, LineCountResponse, OpenInEditorRequest,
+    OpenInEditorResponse, ReplyCommentRequest, ReplyCommentResponse, ResolveCommentRequest,
+    ResolveCommentResponse,
 };
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -510,31 +514,49 @@ async fn bind_with_fallback(
     Err(ServerError::PortExhausted { start_port })
 }
 
-struct ApiError(JujutsuError);
+enum ApiError {
+    Jujutsu(JujutsuError),
+    Editor(EditorError),
+}
 
 impl From<JujutsuError> for ApiError {
     fn from(err: JujutsuError) -> Self {
-        Self(err)
+        Self::Jujutsu(err)
+    }
+}
+
+impl From<EditorError> for ApiError {
+    fn from(err: EditorError) -> Self {
+        Self::Editor(err)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = match &self.0 {
-            JujutsuError::InvalidInput(_) => StatusCode::BAD_REQUEST,
-            JujutsuError::NotFound(_) => StatusCode::NOT_FOUND,
-            JujutsuError::CommandSpawn { .. }
-            | JujutsuError::CommandFailed { .. }
-            | JujutsuError::Store(_)
-            | JujutsuError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        let (status, message) = match self {
+            Self::Jujutsu(err) => {
+                let status = match &err {
+                    JujutsuError::InvalidInput(_) => StatusCode::BAD_REQUEST,
+                    JujutsuError::NotFound(_) => StatusCode::NOT_FOUND,
+                    JujutsuError::CommandSpawn { .. }
+                    | JujutsuError::CommandFailed { .. }
+                    | JujutsuError::Store(_)
+                    | JujutsuError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                (status, err.to_string())
+            }
+            Self::Editor(err) => {
+                let status = match &err {
+                    EditorError::Disabled
+                    | EditorError::NotConfigured { .. }
+                    | EditorError::InvalidInput(_)
+                    | EditorError::PathEscapesRepo => StatusCode::BAD_REQUEST,
+                    EditorError::SpawnFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                (status, err.to_string())
+            }
         };
-        (
-            status,
-            Json(ApiErrorResponse {
-                error: self.0.to_string(),
-            }),
-        )
-            .into_response()
+        (status, Json(ApiErrorResponse { error: message })).into_response()
     }
 }
 
@@ -557,6 +579,20 @@ struct CommentsQuery {
     target: Option<String>,
     commit: Option<String>,
     base: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BlobQuery {
+    #[serde(rename = "ref")]
+    rev: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LineCountQuery {
+    old_ref: Option<String>,
+    new_ref: Option<String>,
+    old_path: Option<String>,
 }
 
 async fn get_jj_status(State(state): State<Arc<AppState>>) -> Json<JjStatusResponse> {
@@ -652,6 +688,63 @@ async fn post_jj_approve(
         .await?;
     state.watch.broadcast_comments_changed();
     Ok(Json(response))
+}
+
+async fn get_blob(
+    State(state): State<Arc<AppState>>,
+    AxumPath(path): AxumPath<String>,
+    Query(query): Query<BlobQuery>,
+) -> Result<Response, ApiError> {
+    let blob = state
+        .jj
+        .get_blob_content(&path, query.rev.as_deref())
+        .await?;
+    let mut response = Response::new(Body::from(blob.bytes));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(blob.content_type),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if blob.content_type == "image/svg+xml" {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'"),
+        );
+    }
+    Ok(response)
+}
+
+async fn get_line_count(
+    State(state): State<Arc<AppState>>,
+    AxumPath(path): AxumPath<String>,
+    Query(query): Query<LineCountQuery>,
+) -> Result<Json<LineCountResponse>, ApiError> {
+    let counts = state
+        .jj
+        .get_line_count(
+            &path,
+            query.old_ref.as_deref(),
+            query.new_ref.as_deref(),
+            query.old_path.as_deref(),
+        )
+        .await?;
+    Ok(Json(counts))
+}
+
+async fn post_open_in_editor(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OpenInEditorRequest>,
+) -> Result<Json<OpenInEditorResponse>, ApiError> {
+    Ok(Json(open_in_editor(state.jj.repo_path(), &req)?))
 }
 
 /// Stream emitting an initial `connected` event followed by periodic `heartbeat` events,
@@ -801,6 +894,9 @@ fn build_router(state: Arc<AppState>) -> Router {
             post(post_jj_comment_resolve),
         )
         .route("/api/jj/approve", post(post_jj_approve))
+        .route("/api/blob/{*path}", get(get_blob))
+        .route("/api/line-count/{*path}", get(get_line_count))
+        .route("/api/open-in-editor", post(post_open_in_editor))
         .route("/api/heartbeat", get(get_heartbeat))
         .route("/api/watch", get(get_watch))
         .route("/{*path}", get(get_static_asset))

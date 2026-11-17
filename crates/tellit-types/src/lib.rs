@@ -654,7 +654,7 @@ pub struct DiffFile {
 pub struct JjDiffResponse {
     /// Resolved target commit ID.
     pub commit: String,
-    /// Effective base revision label (`"{commit}^"` or the compared commit ID).
+    /// Effective base revision label (resolved parent commit ID, `"{commit}-"`, or compared commit ID).
     pub base_commit: String,
     /// Ordered changed files, beginning with `"Commit Message"`.
     pub files: Vec<DiffFile>,
@@ -833,6 +833,55 @@ pub enum WatchEvent {
     },
     /// `.tellit/` comment threads or approvals changed on disk or via API.
     CommentsChanged,
+}
+
+/// Response payload returned by `GET /api/line-count/{*path}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineCountResponse {
+    /// Total lines at `oldRef` (when requested).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_line_count: Option<usize>,
+    /// Total lines at `newRef` (when requested).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_line_count: Option<usize>,
+}
+
+/// Client editor configuration sent with `POST /api/open-in-editor`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditorSpecRequest {
+    /// Preset or special identifier (`vscode`, `zed`, `custom`, `none`, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Custom executable name when `id` is `"custom"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Custom argument template (`%file`, `%line`) when `id` is `"custom"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args_template: Option<String>,
+}
+
+/// Request body accepted by `POST /api/open-in-editor`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenInEditorRequest {
+    /// Repository-relative path of the file to open.
+    pub file_path: String,
+    /// Optional 1-based line number to jump to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    /// Optional editor override from client settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<EditorSpecRequest>,
+}
+
+/// Response payload returned by `POST /api/open-in-editor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenInEditorResponse {
+    /// `true` once the editor process was spawned.
+    pub success: bool,
 }
 
 /// Structured error payload returned by `/api/*` endpoints on failure.

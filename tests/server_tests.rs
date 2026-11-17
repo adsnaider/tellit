@@ -982,3 +982,160 @@ async fn jj_comments_crud_and_watch_sse_stream_work_end_to_end() {
     server.shutdown();
     server.wait().await.unwrap();
 }
+
+#[tokio::test]
+async fn blob_line_count_and_open_in_editor_enforce_safety_and_serve_content() {
+    let repo = setup_jj_test_repo();
+    let root = repo.path();
+
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn one() {}\npub fn two() {}\n",
+    )
+    .unwrap();
+    run_jj_test(root, &["describe", "-m", "v1"]);
+    let rev1 = run_jj_test(root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+
+    run_jj_test(root, &["new", "-m", "v2"]);
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn one() {}\npub fn two() {}\npub fn three() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("logo.svg"),
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"/>\n",
+    )
+    .unwrap();
+    let rev2 = run_jj_test(root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+
+    let server = start_server(
+        ServerConfig::new(root.to_path_buf())
+            .with_port(Some(0))
+            .with_keep_alive(true),
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+
+    // Blob serves exact revision contents and strict headers for SVG.
+    let blob_v1 = client
+        .get(format!("{}/api/blob/src/lib.rs?ref={rev1}", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blob_v1.status(), StatusCode::OK);
+    assert_eq!(
+        blob_v1.text().await.unwrap(),
+        "pub fn one() {}\npub fn two() {}\n"
+    );
+
+    let svg_resp = client
+        .get(format!("{}/api/blob/logo.svg?ref={rev2}", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(svg_resp.status(), StatusCode::OK);
+    assert_eq!(svg_resp.headers()["content-type"], "image/svg+xml");
+    assert_eq!(svg_resp.headers()["x-content-type-options"], "nosniff");
+    assert!(svg_resp.headers().contains_key("content-security-policy"));
+
+    // Path traversal (backslash-normalized, symlink escape, flag-like ref) and VCS metadata files are rejected.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/etc/hosts", root.join("outside.txt")).unwrap();
+    #[cfg(unix)]
+    {
+        let symlink_blob = client
+            .get(format!("{}/api/blob/outside.txt?ref=working", server.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(symlink_blob.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let bad_blob = client
+        .get(format!(
+            "{}/api/blob/..%5Cetc%5Cpasswd?ref=working",
+            server.url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_blob.status(), StatusCode::BAD_REQUEST);
+
+    let flag_ref_blob = client
+        .get(format!("{}/api/blob/src/lib.rs?ref=--help", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(flag_ref_blob.status(), StatusCode::BAD_REQUEST);
+
+    let bad_git = client
+        .get(format!("{}/api/blob/.git/config?ref=working", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_git.status(), StatusCode::BAD_REQUEST);
+
+    // Line-count returns exact old and new counts and handles added files gracefully.
+    let counts: tellit_types::LineCountResponse = client
+        .get(format!(
+            "{}/api/line-count/src/lib.rs?oldRef={rev1}&newRef={rev2}",
+            server.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(counts.old_line_count, Some(2));
+    assert_eq!(counts.new_line_count, Some(3));
+
+    let added_counts: tellit_types::LineCountResponse = client
+        .get(format!(
+            "{}/api/line-count/logo.svg?oldRef={rev1}&newRef={rev2}",
+            server.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(added_counts.old_line_count, Some(0));
+    assert_eq!(added_counts.new_line_count, Some(1));
+
+    // Editor endpoint blocks traversal and shell interpreters.
+    let traversal_editor = client
+        .post(format!("{}/api/open-in-editor", server.url))
+        .json(&tellit_types::OpenInEditorRequest {
+            file_path: String::from("../secret.rs"),
+            line: Some(1),
+            editor: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(traversal_editor.status(), StatusCode::BAD_REQUEST);
+
+    let shell_editor = client
+        .post(format!("{}/api/open-in-editor", server.url))
+        .json(&tellit_types::OpenInEditorRequest {
+            file_path: String::from("src/lib.rs"),
+            line: Some(2),
+            editor: Some(tellit_types::EditorSpecRequest {
+                id: Some(String::from("custom")),
+                command: Some(String::from("bash")),
+                args_template: Some(String::from("-c echo")),
+            }),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shell_editor.status(), StatusCode::BAD_REQUEST);
+
+    server.shutdown();
+    server.wait().await.unwrap();
+}

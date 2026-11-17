@@ -9,9 +9,11 @@ use core::str::FromStr;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tellit_types::{
-    ApiErrorResponse, ApproveCommitRequest, ApproveCommitResponse, HeartbeatEvent,
-    JjChangesResponse, JjCommentsResponse, JjCommitsResponse, JjDiffResponse, JjStatusResponse,
-    WatchEvent,
+    ApiErrorResponse, ApproveCommitRequest, ApproveCommitResponse, CreateCommentRequest,
+    CreateCommentResponse, HeartbeatEvent, JjChangesResponse, JjCommentsResponse,
+    JjCommitsResponse, JjDiffResponse, JjStatusResponse, LineCountResponse, OpenInEditorRequest,
+    OpenInEditorResponse, ReplyCommentRequest, ReplyCommentResponse, ResolveCommentRequest,
+    ResolveCommentResponse, WatchEvent,
 };
 use thiserror::Error;
 use wasm_bindgen::JsCast;
@@ -55,10 +57,14 @@ fn encode_uri_component(raw: &str) -> String {
         .unwrap_or_else(|| String::from(raw))
 }
 
-async fn send_request<T: DeserializeOwned>(
-    url: &str,
-    init: Option<&RequestInit>,
-) -> Result<T, ApiError> {
+fn encode_uri_path(path: &str) -> String {
+    path.split('/')
+        .map(encode_uri_component)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+async fn send_text_request(url: &str, init: Option<&RequestInit>) -> Result<String, ApiError> {
     let window = web_sys::window().ok_or(ApiError::MissingWindow)?;
     let promise = match init {
         Some(opts) => window.fetch_with_str_and_init(url, opts),
@@ -97,6 +103,14 @@ async fn send_request<T: DeserializeOwned>(
         return Err(ApiError::HttpStatus { status, message });
     }
 
+    Ok(body)
+}
+
+async fn send_request<T: DeserializeOwned>(
+    url: &str,
+    init: Option<&RequestInit>,
+) -> Result<T, ApiError> {
+    let body = send_text_request(url, init).await?;
     Ok(serde_json::from_str(&body)?)
 }
 
@@ -211,6 +225,136 @@ pub async fn post_jj_approve(
         disapprove,
     };
     post_json("/api/jj/approve", &req).await
+}
+
+/// Creates a new `.tellit/` comment thread via `POST /api/jj/comments`.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if the HTTP request fails or the server returns a non-2xx response.
+pub async fn post_jj_comment(
+    req: &CreateCommentRequest,
+) -> Result<CreateCommentResponse, ApiError> {
+    post_json("/api/jj/comments", req).await
+}
+
+/// Appends a reply message to an existing `.tellit/` review thread.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if the HTTP request fails or the thread is missing.
+pub async fn post_jj_comment_reply(
+    thread_id: &str,
+    content: &str,
+) -> Result<ReplyCommentResponse, ApiError> {
+    let url = alloc::format!("/api/jj/comments/{}/reply", encode_uri_component(thread_id));
+    post_json(
+        &url,
+        &ReplyCommentRequest {
+            content: String::from(content),
+        },
+    )
+    .await
+}
+
+/// Resolves or reopens an existing `.tellit/` review thread.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if the HTTP request fails or the thread is missing.
+pub async fn post_jj_comment_resolve(
+    thread_id: &str,
+    unresolve: bool,
+) -> Result<ResolveCommentResponse, ApiError> {
+    let url = alloc::format!(
+        "/api/jj/comments/{}/resolve",
+        encode_uri_component(thread_id)
+    );
+    post_json(&url, &ResolveCommentRequest { unresolve }).await
+}
+
+/// Fetches UTF-8 text content for `file_path` at Jujutsu revision `rev` via `GET /api/blob/{*path}`.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if the HTTP request fails or the server returns 4xx/5xx.
+pub async fn fetch_blob_text(file_path: &str, rev: &str) -> Result<String, ApiError> {
+    let url = alloc::format!(
+        "/api/blob/{}?ref={}",
+        encode_uri_path(file_path),
+        encode_uri_component(rev)
+    );
+    send_text_request(&url, None).await
+}
+
+/// Fetches line counts for `file_path` at `old_ref` (`old_path` if renamed) and/or `new_ref`.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if the HTTP request fails or the JSON payload is invalid.
+pub async fn fetch_line_count(
+    file_path: &str,
+    old_ref: Option<&str>,
+    new_ref: Option<&str>,
+    old_path: Option<&str>,
+) -> Result<LineCountResponse, ApiError> {
+    let mut params = Vec::new();
+    if let Some(old_r) = old_ref.map(str::trim).filter(|s| !s.is_empty()) {
+        params.push(alloc::format!("oldRef={}", encode_uri_component(old_r)));
+    }
+    if let Some(new_r) = new_ref.map(str::trim).filter(|s| !s.is_empty()) {
+        params.push(alloc::format!("newRef={}", encode_uri_component(new_r)));
+    }
+    if let Some(old_p) = old_path
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != file_path)
+    {
+        params.push(alloc::format!("oldPath={}", encode_uri_component(old_p)));
+    }
+
+    let query = params.join("&");
+    let encoded_path = encode_uri_path(file_path);
+    let url = if query.is_empty() {
+        alloc::format!("/api/line-count/{encoded_path}")
+    } else {
+        alloc::format!("/api/line-count/{encoded_path}?{query}")
+    };
+    fetch_json(&url).await
+}
+
+/// Requests the backend to open `file_path` at `line` in the configured external editor.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if the HTTP request fails or the editor could not be launched.
+pub async fn post_open_in_editor(
+    file_path: &str,
+    line: Option<usize>,
+) -> Result<OpenInEditorResponse, ApiError> {
+    post_json(
+        "/api/open-in-editor",
+        &OpenInEditorRequest {
+            file_path: String::from(file_path),
+            line,
+            editor: None,
+        },
+    )
+    .await
+}
+
+/// Copies `text` to the browser clipboard via `navigator.clipboard.writeText`.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if the browser window is missing or clipboard write fails.
+pub async fn copy_to_clipboard(text: &str) -> Result<(), ApiError> {
+    let window = web_sys::window().ok_or(ApiError::MissingWindow)?;
+    let clipboard = window.navigator().clipboard();
+    let promise = clipboard.write_text(text);
+    JsFuture::from(promise)
+        .await
+        .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
+    Ok(())
 }
 
 fn normalize_interdiff_base<'a>(base: Option<&'a str>, target: &str) -> Option<&'a str> {

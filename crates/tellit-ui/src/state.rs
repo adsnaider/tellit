@@ -6,7 +6,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use std::collections::HashSet;
 
-use tellit_types::{HeartbeatEvent, JjStatusResponse};
+use tellit_types::{CommentSide, HeartbeatEvent, JjCommentThread, JjStatusResponse, LineRangeSpec};
 
 /// `localStorage` key controlling whether the left sidebar starts open.
 pub const SIDEBAR_OPEN_STORAGE_KEY: &str = "difit.sidebarOpen";
@@ -14,6 +14,10 @@ pub const SIDEBAR_OPEN_STORAGE_KEY: &str = "difit.sidebarOpen";
 pub const SIDEBAR_WIDTH_STORAGE_KEY: &str = "difit.sidebarWidth";
 /// `localStorage` key controlling whether the revision graph panel is expanded.
 pub const REVISIONS_TREE_STORAGE_KEY: &str = "tellit.revisionsTreeOpen";
+/// `localStorage` key persisting unified vs. split diff presentation mode.
+pub const DIFF_MODE_STORAGE_KEY: &str = "tellit.diffViewMode";
+/// `localStorage` key controlling whether resolved comment threads appear inline in diffs.
+pub const SHOW_RESOLVED_INLINE_STORAGE_KEY: &str = "tellit.showResolvedInline";
 /// Minimum sidebar width in pixels.
 pub const SIDEBAR_MIN_WIDTH: u32 = 200;
 /// Maximum sidebar width in pixels.
@@ -256,5 +260,259 @@ pub fn save_viewed_files(repo_root: &str, target_commit: &str, viewed: &HashSet<
     if let Ok(json) = serde_json::to_string(&paths) {
         let key = viewed_files_storage_key(repo_root, target_commit);
         let _ = storage.set_item(&key, &json);
+    }
+}
+
+/// Diff layout mode rendered by [`crate::components::text_diff::TextDiffViewer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffViewMode {
+    /// Unified single-column interleaved diff table.
+    #[default]
+    Unified,
+    /// Side-by-side split old/new diff table.
+    Split,
+}
+
+impl DiffViewMode {
+    /// Parses a persisted view mode name, falling back to [`DiffViewMode::Unified`].
+    #[must_use]
+    pub fn from_storage(raw: &str) -> Self {
+        if raw.trim().eq_ignore_ascii_case("split") {
+            Self::Split
+        } else {
+            Self::Unified
+        }
+    }
+
+    /// Stable string persisted into `localStorage`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unified => "unified",
+            Self::Split => "split",
+        }
+    }
+}
+
+/// Loads the saved [`DiffViewMode`] from `localStorage`.
+#[must_use]
+pub fn load_diff_view_mode() -> DiffViewMode {
+    local_storage()
+        .and_then(|s| s.get_item(DIFF_MODE_STORAGE_KEY).ok().flatten())
+        .map_or(DiffViewMode::Unified, |raw| {
+            DiffViewMode::from_storage(&raw)
+        })
+}
+
+/// Saves the selected [`DiffViewMode`] to `localStorage`.
+pub fn save_diff_view_mode(mode: DiffViewMode) {
+    if let Some(storage) = local_storage() {
+        let _ = storage.set_item(DIFF_MODE_STORAGE_KEY, mode.as_str());
+    }
+}
+
+/// Builds a stable DOM element ID for scrolling directly to a review comment thread card.
+#[must_use]
+pub fn thread_element_id(thread_id: &str) -> String {
+    let mut out = String::from("comment-thread-");
+    for ch in thread_id.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    out
+}
+
+/// Formats the short line label for a thread (`L12`, `L12-L15`, or `file`).
+#[must_use]
+pub fn format_thread_line_label(range: Option<LineRangeSpec>) -> String {
+    match range {
+        Some(lr) if lr.start == lr.end => alloc::format!("L{}", lr.start),
+        Some(lr) => alloc::format!("L{}-L{}", lr.start, lr.end),
+        None => String::from("file"),
+    }
+}
+
+/// Formats `file:line (old)?` for display in headers and copied agent prompts.
+#[must_use]
+pub fn format_thread_location(thread: &JjCommentThread) -> String {
+    let file = if thread.file_path.is_empty() {
+        "<unknown file>"
+    } else {
+        thread.file_path.as_str()
+    };
+    let line_label = format_thread_line_label(thread.line_range);
+    let side_suffix = if thread.side == CommentSide::Old {
+        " (old)"
+    } else {
+        ""
+    };
+    alloc::format!("{file}:{line_label}{side_suffix}")
+}
+
+/// Parsed segment inside a Markdown comment body separating prose from `suggestion` code fences.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodySegment {
+    /// Plain prose outside a fenced suggestion block.
+    Text(String),
+    /// Replacement code lines extracted from a ```` ```suggestion ```` block.
+    Suggestion(String),
+}
+
+/// Splits a comment body into alternating prose and fenced ```` ```suggestion ```` segments.
+#[must_use]
+pub fn parse_body_segments(body: &str) -> Vec<BodySegment> {
+    if !body.contains("```suggestion") {
+        return alloc::vec![BodySegment::Text(String::from(body))];
+    }
+
+    let mut segments = Vec::new();
+    let mut rest = body;
+
+    while let Some(start) = rest.find("```suggestion") {
+        let before = &rest[..start];
+        if !before.trim().is_empty() {
+            segments.push(BodySegment::Text(String::from(before.trim_end())));
+        }
+
+        let after_tag = &rest[start + "```suggestion".len()..];
+        let content_start = after_tag.find('\n').map_or(0, |idx| idx + 1);
+        let candidate = &after_tag[content_start..];
+        let Some(end) = candidate.find("\n```").or_else(|| candidate.find("```")) else {
+            segments.push(BodySegment::Text(String::from(&rest[start..])));
+            return segments;
+        };
+
+        let suggested = candidate[..end].trim_end_matches('\r');
+        segments.push(BodySegment::Suggestion(String::from(suggested)));
+
+        let close_len = if candidate[end..].starts_with("\n```") {
+            4
+        } else {
+            3
+        };
+        rest = &candidate[end + close_len..];
+    }
+
+    if !rest.trim().is_empty() {
+        segments.push(BodySegment::Text(String::from(rest.trim_start())));
+    }
+    if segments.is_empty() {
+        segments.push(BodySegment::Text(String::from(body)));
+    }
+    segments
+}
+
+fn format_comment_body_for_prompt(body: &str, code_snippet: Option<&str>) -> String {
+    if !body.contains("```suggestion") {
+        return String::from(body);
+    }
+
+    let mut parts = Vec::new();
+    for segment in parse_body_segments(body) {
+        match segment {
+            BodySegment::Text(text) => {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    parts.push(String::from(trimmed));
+                }
+            }
+            BodySegment::Suggestion(suggested) => {
+                if let Some(orig) = code_snippet.filter(|s| !s.is_empty()) {
+                    parts.push(alloc::format!("ORIGINAL:\n```\n{orig}\n```"));
+                }
+                parts.push(alloc::format!("SUGGESTED:\n```\n{suggested}\n```"));
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+/// Formats one review thread (location, root message, suggestion blocks, and replies) for agent copying.
+#[must_use]
+pub fn format_thread_prompt(thread: &JjCommentThread, code_snippet: Option<&str>) -> String {
+    let mut sections = alloc::vec![format_thread_location(thread)];
+    for (idx, body) in thread.comments.iter().enumerate() {
+        if idx == 0 {
+            sections.push(format_comment_body_for_prompt(body, code_snippet));
+        } else {
+            sections.push(alloc::format!("Reply {idx}"));
+            sections.push(format_comment_body_for_prompt(body, code_snippet));
+        }
+    }
+    sections
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Formats all provided comment threads with diff revision header for pasting into an AI agent.
+#[must_use]
+pub fn format_all_comments_prompt(
+    threads: &[JjCommentThread],
+    target_commit: &str,
+    base_commit: &str,
+) -> String {
+    if threads.is_empty() {
+        return String::new();
+    }
+    let body = threads
+        .iter()
+        .map(|t| format_thread_prompt(t, None))
+        .collect::<Vec<_>>()
+        .join("\n=====\n");
+
+    if !target_commit.is_empty() && !base_commit.is_empty() {
+        let short_base: String = base_commit.chars().take(12).collect();
+        let short_target: String = target_commit.chars().take(12).collect();
+        alloc::format!("diff {short_base}..{short_target}\n\n{body}")
+    } else {
+        body
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_view_mode_parses_and_roundtrips() {
+        assert_eq!(DiffViewMode::from_storage("split"), DiffViewMode::Split);
+        assert_eq!(DiffViewMode::from_storage("SPLIT"), DiffViewMode::Split);
+        assert_eq!(DiffViewMode::from_storage("unified"), DiffViewMode::Unified);
+        assert_eq!(DiffViewMode::from_storage("other"), DiffViewMode::Unified);
+        assert_eq!(DiffViewMode::Split.as_str(), "split");
+    }
+
+    #[test]
+    fn formats_thread_and_all_comments_prompts_with_suggestions() {
+        let thread = JjCommentThread {
+            id: String::from("t1"),
+            change_id: String::from("chg1"),
+            commit_id: String::from("111122223333"),
+            file_path: String::from("src/main.rs"),
+            side: CommentSide::New,
+            line_range: Some(LineRangeSpec { start: 10, end: 12 }),
+            comments: alloc::vec![
+                String::from("Please inline this:\n```suggestion\nlet x = 42;\n```"),
+                String::from("Done!"),
+            ],
+            resolved: false,
+        };
+        let single = format_thread_prompt(&thread, Some("let x = 1;"));
+        assert!(single.contains("src/main.rs:L10-L12\n"));
+        assert!(single.contains("ORIGINAL:\n```\nlet x = 1;\n```"));
+        assert!(single.contains("SUGGESTED:\n```\nlet x = 42;\n```"));
+        assert!(single.contains("Reply 1\nDone!"));
+
+        let all = format_all_comments_prompt(
+            core::slice::from_ref(&thread),
+            "aaaa1111bbbb2222",
+            "cccc3333dddd4444",
+        );
+        assert!(all.starts_with("diff cccc3333dddd..aaaa1111bbbb\n\n"));
     }
 }

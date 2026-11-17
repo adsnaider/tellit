@@ -31,11 +31,13 @@ use leptos::ev;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use tellit_types::{
-    DiffFile, JjChange, JjCommentThread, JjCommit, JjDiffResponse, JjGraphRow, WatchEvent,
+    CommentSide, CreateCommentRequest, DiffFile, FileStatus, JjChange, JjCommentThread, JjCommit,
+    JjDiffResponse, JjGraphRow, WatchEvent,
 };
 use web_sys::MouseEvent;
 
-use components::file_list::{FileList, status_badge_class};
+use components::comments::{CommentReplyEvent, CommentsDrawer, UnresolvedJumpMenu};
+use components::file_list::FileList;
 use components::review_dot::ReviewDot;
 use components::revision_selector::{
     JjChangeSelector, JjCommitComparisonSelector, commit_ids_match, pick_initial_change,
@@ -44,7 +46,11 @@ use components::revision_tree::JjRevisionTreePanel;
 pub use components::revision_tree::{
     GraphCellLayout, GraphNodeKind, GraphRowLayout, compute_graph_layout,
 };
-pub use state::{ConnectionState, RepoStatusState};
+use components::text_diff::expanded::{
+    ExpandedLinesMap, record_expand_all_before, record_line_expansion, split_blob_lines,
+};
+use components::text_diff::{CreateThreadEvent, ExpandLinesEvent, TextDiffCard};
+pub use state::{ConnectionState, DiffViewMode, RepoStatusState};
 
 #[derive(Clone, Copy)]
 struct AppCtx {
@@ -69,10 +75,18 @@ struct AppCtx {
     reviewed_files: RwSignal<HashSet<String>>,
     collapsed_files: RwSignal<HashSet<String>>,
     selected_file_path: RwSignal<Option<String>>,
+    diff_mode: RwSignal<DiffViewMode>,
+    show_resolved_inline: RwSignal<bool>,
+    drawer_open: RwSignal<bool>,
+    highlighted_word: RwSignal<Option<String>>,
+    expanded_lines: RwSignal<ExpandedLinesMap>,
+    expand_loading: RwSignal<bool>,
     changes_req_id: StoredValue<u64, LocalStorage>,
     commits_req_id: StoredValue<u64, LocalStorage>,
     diff_req_id: StoredValue<u64, LocalStorage>,
     comments_req_id: StoredValue<u64, LocalStorage>,
+    diff_generation: StoredValue<u64, LocalStorage>,
+    prefetched_line_counts: StoredValue<HashSet<String>, LocalStorage>,
     pending_initial_target: StoredValue<Option<String>, LocalStorage>,
     pending_initial_base: StoredValue<Option<String>, LocalStorage>,
 }
@@ -101,10 +115,21 @@ impl AppCtx {
             reviewed_files: RwSignal::new(HashSet::new()),
             collapsed_files: RwSignal::new(HashSet::new()),
             selected_file_path: RwSignal::new(None),
+            diff_mode: RwSignal::new(state::load_diff_view_mode()),
+            show_resolved_inline: RwSignal::new(state::load_storage_bool(
+                state::SHOW_RESOLVED_INLINE_STORAGE_KEY,
+                true,
+            )),
+            drawer_open: RwSignal::new(false),
+            highlighted_word: RwSignal::new(None),
+            expanded_lines: RwSignal::new(HashMap::new()),
+            expand_loading: RwSignal::new(false),
             changes_req_id: StoredValue::new_local(0),
             commits_req_id: StoredValue::new_local(0),
             diff_req_id: StoredValue::new_local(0),
             comments_req_id: StoredValue::new_local(0),
+            diff_generation: StoredValue::new_local(0),
+            prefetched_line_counts: StoredValue::new_local(HashSet::new()),
             pending_initial_target: StoredValue::new_local(None),
             pending_initial_base: StoredValue::new_local(None),
         }
@@ -140,6 +165,12 @@ fn load_diff_and_comments(ctx: AppCtx, target: String, base: Option<String>, ign
                 if ctx.diff_req_id.get_value() != diff_id {
                     return;
                 }
+                let _ = next_req_id(ctx.diff_generation);
+                ctx.expanded_lines.set(HashMap::new());
+                ctx.prefetched_line_counts.update_value(HashSet::clear);
+                ctx.highlighted_word.set(None);
+                ctx.expand_loading.set(false);
+
                 let repo_root = ctx.repo_root_string();
                 let viewed = state::load_viewed_files(&repo_root, &diff.commit);
                 let mut collapsed: HashSet<String> = viewed.clone();
@@ -539,121 +570,147 @@ fn connect_watch(
     }
 }
 
-fn scroll_to_file_element(path: &str) {
+fn scroll_to_element_id(dom_id: &str) -> bool {
     if let Some(window) = web_sys::window()
         && let Some(doc) = window.document()
-        && let Some(el) = doc.get_element_by_id(&state::file_element_id(path))
+        && let Some(el) = doc.get_element_by_id(dom_id)
     {
         el.scroll_into_view();
+        return true;
+    }
+    false
+}
+
+fn scroll_to_file_element(path: &str) {
+    let _ = scroll_to_element_id(&state::file_element_id(path));
+}
+
+fn jump_to_thread(ctx: AppCtx, thread: JjCommentThread) {
+    ctx.selected_file_path.set(Some(thread.file_path.clone()));
+    ctx.collapsed_files.update(|set| {
+        set.remove(&thread.file_path);
+    });
+
+    let thread_dom = state::thread_element_id(&thread.id);
+    let file_dom = state::file_element_id(&thread.file_path);
+    if let Some(window) = web_sys::window() {
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0);
+        });
+        spawn_local(async move {
+            let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+            if !scroll_to_element_id(&thread_dom) {
+                let _ = scroll_to_element_id(&file_dom);
+            }
+        });
+    } else if !scroll_to_element_id(&thread_dom) {
+        let _ = scroll_to_element_id(&file_dom);
     }
 }
 
-fn render_diff_file_card(
-    file: DiffFile,
-    threads_count: usize,
-    is_viewed: bool,
-    is_collapsed: bool,
-    on_toggle_viewed: Callback<String>,
-    on_toggle_collapse: Callback<String>,
-) -> impl IntoView {
-    let path = file.path.clone();
-    let path_for_id = state::file_element_id(&path);
-    let path_toggle_collapse = path.clone();
-    let path_toggle_viewed = path.clone();
-    let header_title = match file.old_path {
-        Some(ref old) => alloc::format!("{old} -> {path}"),
-        None => path.clone(),
-    };
-    let hunks_count = file.chunks.len();
-
-    view! {
-        <article
-            id=path_for_id
-            class={if is_viewed {
-                "diff-card diff-card--viewed"
-            } else {
-                "diff-card"
-            }}
-        >
-            <header class="diff-card__header">
-                <div class="diff-card__left">
-                    <button
-                        type="button"
-                        class="icon-btn"
-                        title={if is_collapsed { "Expand file" } else { "Collapse file" }}
-                        aria-expanded=!is_collapsed
-                        on:click=move |_| on_toggle_collapse.run(path_toggle_collapse.clone())
-                    >
-                        {if is_collapsed { "▸" } else { "▾" }}
-                    </button>
-                    <span class=status_badge_class(file.status)>{file.status.short_code()}</span>
-                    <span class="diff-card__path">{header_title}</span>
-                    {file.is_generated.then(|| view! {
-                        <span class="pill-tag">"generated"</span>
-                    })}
-                    {(threads_count > 0).then(|| view! {
-                        <span class="pill-tag pill-tag--warn">
-                            {alloc::format!("{threads_count} thread{}", if threads_count == 1 { "" } else { "s" })}
-                        </span>
-                    })}
-                </div>
-                <div class="diff-card__right">
-                    <span class="diff-totals">
-                        <span class="stat-add">{alloc::format!("+{}", file.additions)}</span>
-                        <span class="stat-del">{alloc::format!("-{}", file.deletions)}</span>
-                    </span>
-                    <label class="viewed-toggle">
-                        <input
-                            type="checkbox"
-                            class="file-checkbox"
-                            prop:checked=is_viewed
-                            on:change=move |_| on_toggle_viewed.run(path_toggle_viewed.clone())
-                        />
-                        <span>"Viewed"</span>
-                    </label>
-                </div>
-            </header>
-
-            {(!is_collapsed).then(|| {
-                let hunk_headers: Vec<(String, usize)> = file
-                    .chunks
-                    .iter()
-                    .map(|c| (c.header.clone(), c.lines.len()))
-                    .collect();
-                view! {
-                    <div class="diff-card__body">
-                        {if hunk_headers.is_empty() {
-                            view! {
-                                <div class="diff-card__summary">"Binary or metadata-only change"</div>
-                            }.into_any()
-                        } else {
-                            view! {
-                                <ul class="hunk-summary-list">
-                                    {hunk_headers.into_iter().map(|(hdr, line_count)| view! {
-                                        <li class="hunk-summary-row">
-                                            <code>{hdr}</code>
-                                            <span class="muted-label">
-                                                {alloc::format!("{line_count} diff lines")}
-                                            </span>
-                                        </li>
-                                    }).collect_view()}
-                                </ul>
-                            }.into_any()
-                        }}
-                    </div>
-                }
-            })}
-            {(is_collapsed && hunks_count > 0).then(|| view! {
-                <div class="diff-card__collapsed-note">
-                    {if file.is_generated {
-                        alloc::format!("Generated file collapsed ({hunks_count} hunks)")
-                    } else {
-                        alloc::format!("Collapsed ({hunks_count} hunks)")
-                    }}
-                </div>
-            })}
-        </article>
+fn prefetch_line_count_for_file(ctx: AppCtx, file: DiffFile) {
+    if ctx
+        .prefetched_line_counts
+        .with_value(|s| s.contains(&file.path))
+    {
+        return;
     }
+    let Some(diff) = ctx.diff_data.get_untracked() else {
+        return;
+    };
+    let generation = ctx.diff_generation.get_value();
+    let path = file.path.clone();
+    ctx.prefetched_line_counts.update_value(|s| {
+        s.insert(path.clone());
+    });
+
+    let old_ref = (file.status != FileStatus::Added).then(|| diff.base_commit.clone());
+    let new_ref = (file.status != FileStatus::Deleted).then(|| diff.commit.clone());
+    let old_path = file.old_path.clone();
+
+    spawn_local(async move {
+        let Ok(counts) = api::fetch_line_count(
+            &path,
+            old_ref.as_deref(),
+            new_ref.as_deref(),
+            old_path.as_deref(),
+        )
+        .await
+        else {
+            return;
+        };
+        if ctx.diff_generation.get_value() != generation {
+            return;
+        }
+        ctx.expanded_lines.update(|map| {
+            let entry = map.entry(path).or_default();
+            if entry.old_total_lines.is_none() {
+                entry.old_total_lines = counts.old_line_count.and_then(|n| u32::try_from(n).ok());
+            }
+            if entry.new_total_lines.is_none() {
+                entry.new_total_lines = counts.new_line_count.and_then(|n| u32::try_from(n).ok());
+            }
+        });
+    });
+}
+
+fn expand_lines_for_file(ctx: AppCtx, req: ExpandLinesEvent) {
+    let Some(diff) = ctx.diff_data.get_untracked() else {
+        return;
+    };
+    let generation = ctx.diff_generation.get_value();
+    ctx.expand_loading.set(true);
+
+    spawn_local(async move {
+        let path = req.file.path.clone();
+        let old_path = req.file.old_path.as_deref().unwrap_or(&path).to_owned();
+
+        let existing = ctx.expanded_lines.get_untracked().get(&path).cloned();
+        let need_old = req.file.status != FileStatus::Added
+            && existing.as_ref().is_none_or(|e| e.old_content.is_none());
+        let need_new = req.file.status != FileStatus::Deleted
+            && existing.as_ref().is_none_or(|e| e.new_content.is_none());
+
+        let old_lines = if need_old {
+            match api::fetch_blob_text(&old_path, &diff.base_commit).await {
+                Ok(text) => Some(split_blob_lines(&text)),
+                Err(_) => Some(Vec::new()),
+            }
+        } else {
+            None
+        };
+
+        let new_lines = if need_new {
+            match api::fetch_blob_text(&path, &diff.commit).await {
+                Ok(text) => Some(split_blob_lines(&text)),
+                Err(_) => Some(Vec::new()),
+            }
+        } else {
+            None
+        };
+
+        if ctx.diff_generation.get_value() != generation {
+            ctx.expand_loading.set(false);
+            return;
+        }
+
+        ctx.expanded_lines.update(|map| {
+            let entry = map.entry(path.clone()).or_default();
+            if let Some(lines) = old_lines {
+                entry.old_total_lines = Some(u32::try_from(lines.len()).unwrap_or(u32::MAX));
+                entry.old_content = Some(lines);
+            }
+            if let Some(lines) = new_lines {
+                entry.new_total_lines = Some(u32::try_from(lines.len()).unwrap_or(u32::MAX));
+                entry.new_content = Some(lines);
+            }
+            match req.direction {
+                Some(dir) => record_line_expansion(map, &path, req.chunk_index, dir, req.count),
+                None => record_expand_all_before(map, &path, req.chunk_index, req.count),
+            }
+        });
+        ctx.expand_loading.set(false);
+    });
 }
 
 /// Root Leptos component for the `tellit` Jujutsu review application.
@@ -823,6 +880,97 @@ pub fn App() -> impl IntoView {
         scroll_to_file_element(&path);
     });
 
+    let on_toggle_word = Callback::new(move |word: String| {
+        ctx.highlighted_word.update(|cur| {
+            if cur.as_deref() == Some(word.as_str()) {
+                *cur = None;
+            } else {
+                *cur = Some(word);
+            }
+        });
+    });
+
+    let on_open_in_editor = Callback::new(move |(file_path, line): (String, usize)| {
+        spawn_local(async move {
+            if let Err(err) = api::post_open_in_editor(&file_path, Some(line)).await {
+                ctx.error_banner.set(Some(err.to_string()));
+            }
+        });
+    });
+
+    let on_prefetch_line_count = Callback::new(move |file: DiffFile| {
+        prefetch_line_count_for_file(ctx, file);
+    });
+
+    let on_expand_lines = Callback::new(move |req: ExpandLinesEvent| {
+        expand_lines_for_file(ctx, req);
+    });
+
+    let on_create_thread = Callback::new(move |evt: CreateThreadEvent| {
+        let Some(diff) = ctx.diff_data.get_untracked() else {
+            evt.on_done.run(Err(String::from("No active diff loaded")));
+            return;
+        };
+        let base_state = ctx.base_commit_id.get_untracked();
+        let is_interdiff = base_state != "parent" && !base_state.is_empty();
+        let commit_id = if evt.side == CommentSide::Old && is_interdiff {
+            diff.base_commit
+        } else {
+            diff.commit
+        };
+
+        spawn_local(async move {
+            let req = CreateCommentRequest {
+                commit_id,
+                file_path: evt.file_path,
+                line_range: evt.line_range,
+                content: evt.body,
+            };
+            match api::post_jj_comment(&req).await {
+                Ok(_) => {
+                    evt.on_done.run(Ok(()));
+                    refresh_comments_only(ctx);
+                    reload_changes_and_commits(ctx, false);
+                }
+                Err(err) => evt.on_done.run(Err(err.to_string())),
+            }
+        });
+    });
+
+    let on_reply = Callback::new(move |evt: CommentReplyEvent| {
+        spawn_local(async move {
+            match api::post_jj_comment_reply(&evt.thread_id, &evt.body).await {
+                Ok(_) => {
+                    evt.on_done.run(Ok(()));
+                    refresh_comments_only(ctx);
+                    reload_changes_and_commits(ctx, false);
+                }
+                Err(err) => evt.on_done.run(Err(err.to_string())),
+            }
+        });
+    });
+
+    let on_toggle_resolve = Callback::new(move |(thread_id, current_resolved): (String, bool)| {
+        spawn_local(async move {
+            match api::post_jj_comment_resolve(&thread_id, current_resolved).await {
+                Ok(_) => {
+                    refresh_comments_only(ctx);
+                    reload_changes_and_commits(ctx, false);
+                }
+                Err(err) => ctx.error_banner.set(Some(err.to_string())),
+            }
+        });
+    });
+
+    let on_jump_to_thread = Callback::new(move |thread: JjCommentThread| {
+        jump_to_thread(ctx, thread);
+    });
+
+    let on_toggle_show_resolved_inline = Callback::new(move |show: bool| {
+        ctx.show_resolved_inline.set(show);
+        state::save_storage_bool(state::SHOW_RESOLVED_INLINE_STORAGE_KEY, show);
+    });
+
     let comment_counts_by_file = Signal::derive(move || {
         let mut counts: HashMap<String, usize> = HashMap::new();
         for thread in ctx.comments.get() {
@@ -923,6 +1071,57 @@ pub fn App() -> impl IntoView {
                 })}
 
                 <div class="topbar-meta">
+                    {move || is_jj_workspace.get().then(|| view! {
+                        <>
+                            <div class="segmented" role="group" aria-label="Diff view mode">
+                                <button
+                                    type="button"
+                                    class=move || if ctx.diff_mode.get() == DiffViewMode::Unified {
+                                        "segmented__btn segmented__btn--active"
+                                    } else {
+                                        "segmented__btn"
+                                    }
+                                    on:click=move |_| {
+                                        ctx.diff_mode.set(DiffViewMode::Unified);
+                                        state::save_diff_view_mode(DiffViewMode::Unified);
+                                    }
+                                >
+                                    "Unified"
+                                </button>
+                                <button
+                                    type="button"
+                                    class=move || if ctx.diff_mode.get() == DiffViewMode::Split {
+                                        "segmented__btn segmented__btn--active"
+                                    } else {
+                                        "segmented__btn"
+                                    }
+                                    on:click=move |_| {
+                                        ctx.diff_mode.set(DiffViewMode::Split);
+                                        state::save_diff_view_mode(DiffViewMode::Split);
+                                    }
+                                >
+                                    "Split"
+                                </button>
+                            </div>
+                            <UnresolvedJumpMenu
+                                threads=ctx.comments
+                                on_jump_to_thread=on_jump_to_thread
+                                on_open_drawer=Callback::new(move |()| ctx.drawer_open.set(true))
+                            />
+                            <button
+                                type="button"
+                                class=move || if ctx.drawer_open.get() {
+                                    "btn btn--active"
+                                } else {
+                                    "btn btn--ghost"
+                                }
+                                title="Toggle review comments drawer"
+                                on:click=move |_| ctx.drawer_open.update(|v| *v = !*v)
+                            >
+                                "Drawer"
+                            </button>
+                        </>
+                    })}
                     {move || {
                         let total = diff_files.get().len();
                         let viewed = ctx.reviewed_files.get().len().min(total);
@@ -1094,9 +1293,6 @@ pub fn App() -> impl IntoView {
 
                             let diff_opt = ctx.diff_data.get();
                             let change_opt = active_change.get();
-                            let thread_counts = comment_counts_by_file.get();
-                            let reviewed = ctx.reviewed_files.get();
-                            let collapsed = ctx.collapsed_files.get();
                             let total_threads = ctx.comments.get().len();
                             let unresolved_threads = ctx.comments.get().iter().filter(|t| !t.resolved).count();
 
@@ -1135,6 +1331,16 @@ pub fn App() -> impl IntoView {
                                                             }}
                                                         </span>
                                                     })}
+                                                    {move || ctx.highlighted_word.get().map(|w| view! {
+                                                        <button
+                                                            type="button"
+                                                            class="pill-tag pill-tag--info"
+                                                            title="Click to clear highlighted identifier"
+                                                            on:click=move |_| ctx.highlighted_word.set(None)
+                                                        >
+                                                            {alloc::format!("token: {w} ×")}
+                                                        </button>
+                                                    })}
                                                 </div>
                                             </section>
                                         }
@@ -1159,29 +1365,67 @@ pub fn App() -> impl IntoView {
                                                 </p>
                                             </div>
                                         }.into_any(),
-                                        Some(diff) => view! {
-                                            <div class="diff-file-list">
-                                                {diff.files.into_iter().map(|file| {
-                                                    let t_count = thread_counts.get(&file.path).copied().unwrap_or(0);
-                                                    let is_viewed = reviewed.contains(&file.path);
-                                                    let is_collapsed = collapsed.contains(&file.path);
-                                                    render_diff_file_card(
-                                                        file,
-                                                        t_count,
-                                                        is_viewed,
-                                                        is_collapsed,
-                                                        on_toggle_reviewed,
-                                                        on_toggle_collapse,
-                                                    )
-                                                }).collect_view()}
-                                            </div>
-                                        }.into_any(),
+                                        Some(_) => {
+                                            let generation = ctx.diff_generation.get_value();
+                                            view! {
+                                                <div class="diff-file-list">
+                                                    <For
+                                                        each=move || {
+                                                            ctx.diff_data
+                                                                .get()
+                                                                .map(|d| d.files)
+                                                                .unwrap_or_default()
+                                                        }
+                                                        key=move |file| alloc::format!("{generation}:{}", file.path)
+                                                        children=move |file| {
+                                                            view! {
+                                                                <TextDiffCard
+                                                                    file=file
+                                                                    all_threads=ctx.comments
+                                                                    reviewed_files=ctx.reviewed_files
+                                                                    collapsed_files=ctx.collapsed_files
+                                                                    diff_mode=ctx.diff_mode
+                                                                    show_resolved_inline=ctx.show_resolved_inline
+                                                                    highlighted_word=ctx.highlighted_word
+                                                                    expanded_lines=ctx.expanded_lines
+                                                                    expand_loading=ctx.expand_loading
+                                                                    on_toggle_word=on_toggle_word
+                                                                    on_toggle_viewed=on_toggle_reviewed
+                                                                    on_toggle_collapse=on_toggle_collapse
+                                                                    on_open_in_editor=on_open_in_editor
+                                                                    on_prefetch_line_count=on_prefetch_line_count
+                                                                    on_expand_lines=on_expand_lines
+                                                                    on_create_thread=on_create_thread
+                                                                    on_reply=on_reply
+                                                                    on_toggle_resolve=on_toggle_resolve
+                                                                />
+                                                            }
+                                                        }
+                                                    />
+                                                </div>
+                                            }.into_any()
+                                        }
                                     }}
                                 </div>
                             }.into_any()
                         }
                     }}
                 </main>
+
+                {move || is_jj_workspace.get().then(|| view! {
+                    <CommentsDrawer
+                        is_open=ctx.drawer_open
+                        threads=ctx.comments
+                        show_resolved_inline=ctx.show_resolved_inline
+                        target_commit_id=ctx.target_commit_id
+                        base_commit_id=ctx.base_commit_id
+                        on_close=Callback::new(move |()| ctx.drawer_open.set(false))
+                        on_toggle_show_resolved_inline=on_toggle_show_resolved_inline
+                        on_jump_to_thread=on_jump_to_thread
+                        on_reply=on_reply
+                        on_toggle_resolve=on_toggle_resolve
+                    />
+                })}
             </div>
         </div>
     }

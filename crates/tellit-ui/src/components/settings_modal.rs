@@ -9,6 +9,7 @@ use tellit_types::{
     AppearanceSettings, CUSTOM_EDITOR_ID, ColorVisionMode, EDITOR_PRESETS, EditorSpecRequest,
     NONE_EDITOR_ID, ThemePreference, resolve_editor_preset,
 };
+use web_sys::KeyboardEvent;
 
 use crate::state;
 
@@ -41,18 +42,39 @@ const FONT_FAMILIES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Modal dialog for configuring theme, font, color vision, editor command, and auto-viewed globs.
+/// Modal dialog for configuring theme, font, diff width, color vision, editor command, and auto-viewed globs.
 #[component]
 pub fn SettingsModal(
     #[prop(into)] is_open: Signal<bool>,
     #[prop(into)] settings: Signal<AppearanceSettings>,
+    #[prop(into)] diff_width_chars: Signal<Option<u16>>,
     on_change: Callback<AppearanceSettings>,
+    on_change_diff_width: Callback<Option<u16>>,
     on_close: Callback<()>,
 ) -> impl IntoView {
     let active_section = RwSignal::new(SettingsSection::Appearance);
     let patterns_draft = RwSignal::new(state::format_auto_viewed_patterns(
         &settings.get_untracked().auto_viewed_patterns,
     ));
+    let width_draft = RwSignal::new(
+        diff_width_chars
+            .get_untracked()
+            .map_or_else(String::new, |n| n.to_string()),
+    );
+
+    let commit_width_draft = move || {
+        let raw = width_draft.get_untracked();
+        match state::parse_diff_width_input(&raw) {
+            Ok(next) => {
+                on_change_diff_width.run(next);
+                width_draft.set(next.map_or_else(String::new, |n| n.to_string()));
+            }
+            Err(()) => {
+                let current = diff_width_chars.get_untracked();
+                width_draft.set(current.map_or_else(String::new, |n| n.to_string()));
+            }
+        }
+    };
 
     let is_none_memo = Memo::new(move |_| {
         settings.with(|s| editor_id_or_default(s).eq_ignore_ascii_case(NONE_EDITOR_ID))
@@ -82,6 +104,8 @@ pub fn SettingsModal(
             patterns_draft.set(state::format_auto_viewed_patterns(
                 &current.auto_viewed_patterns,
             ));
+            let current_width = diff_width_chars.get_untracked();
+            width_draft.set(current_width.map_or_else(String::new, |n| n.to_string()));
         }
     });
 
@@ -183,6 +207,77 @@ pub fn SettingsModal(
                                                     }
                                                 }).collect_view()}
                                             </select>
+                                        </div>
+
+                                        <div class="setting-field">
+                                            <label class="setting-label" for="settings-diff-width">
+                                                "Diff Width"
+                                            </label>
+                                            <div class="setting-btn-row setting-btn-row--wrap" role="group" aria-label="Diff width presets">
+                                                {state::DIFF_WIDTH_PRESETS.iter().copied().map(|preset| {
+                                                    let label = preset.to_string();
+                                                    view! {
+                                                        <button
+                                                            type="button"
+                                                            class=move || if diff_width_chars.get() == Some(preset) { "btn btn--active-accent" } else { "btn" }
+                                                            aria-pressed=move || diff_width_chars.get() == Some(preset)
+                                                            on:click=move |_| {
+                                                                width_draft.set(preset.to_string());
+                                                                on_change_diff_width.run(Some(preset));
+                                                            }
+                                                        >
+                                                            {label}
+                                                        </button>
+                                                    }
+                                                }).collect_view()}
+                                                <button
+                                                    type="button"
+                                                    class=move || if diff_width_chars.get().is_none() { "btn btn--active-accent" } else { "btn" }
+                                                    aria-pressed=move || diff_width_chars.get().is_none()
+                                                    on:click=move |_| {
+                                                        width_draft.set(String::new());
+                                                        on_change_diff_width.run(None);
+                                                    }
+                                                >
+                                                    "Full"
+                                                </button>
+                                                <div class="setting-width-custom">
+                                                    <input
+                                                        id="settings-diff-width"
+                                                        type="number"
+                                                        class="text-input text-input--mono setting-width-input"
+                                                        min=state::MIN_DIFF_WIDTH_CHARS
+                                                        max=state::MAX_DIFF_WIDTH_CHARS
+                                                        step="10"
+                                                        placeholder="Full"
+                                                        aria-label="Custom diff width in characters"
+                                                        prop:value=move || width_draft.get()
+                                                        on:input=move |ev| {
+                                                            let val = event_target_value(&ev);
+                                                            let trimmed = val.trim();
+                                                            width_draft.set(val.clone());
+                                                            if trimmed.is_empty() {
+                                                                on_change_diff_width.run(None);
+                                                            } else if let Ok(n) = trimmed.parse::<u16>()
+                                                                && (state::MIN_DIFF_WIDTH_CHARS..=state::MAX_DIFF_WIDTH_CHARS).contains(&n)
+                                                            {
+                                                                on_change_diff_width.run(Some(n));
+                                                            }
+                                                        }
+                                                        on:blur=move |_| commit_width_draft()
+                                                        on:keydown=move |ev: KeyboardEvent| {
+                                                            if ev.key() == "Enter" {
+                                                                ev.prevent_default();
+                                                                commit_width_draft();
+                                                            }
+                                                        }
+                                                    />
+                                                    <span class="setting-sublabel">"ch"</span>
+                                                </div>
+                                            </div>
+                                            <p class="setting-help">
+                                                "Target character width per code column (60–300), capped at the available screen width. Clear for full width."
+                                            </p>
                                         </div>
 
                                         <div class="setting-field">
@@ -383,6 +478,8 @@ pub fn SettingsModal(
                                     next.font_family = defaults.font_family;
                                     next.theme = defaults.theme;
                                     next.color_vision = defaults.color_vision;
+                                    width_draft.set(String::new());
+                                    on_change_diff_width.run(None);
                                 } else {
                                     next.editor = defaults.editor;
                                     next.auto_viewed_patterns = defaults.auto_viewed_patterns.clone();

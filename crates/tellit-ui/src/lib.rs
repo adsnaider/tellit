@@ -231,6 +231,7 @@ struct AppCtx {
     overview_expanded_files: RwSignal<HashSet<String>>,
     selected_file_path: RwSignal<Option<String>>,
     diff_mode: RwSignal<DiffViewMode>,
+    diff_width_chars: RwSignal<Option<u16>>,
     show_resolved_inline: RwSignal<bool>,
     drawer_open: RwSignal<bool>,
     highlighted_word: RwSignal<Option<String>>,
@@ -295,6 +296,7 @@ impl AppCtx {
             overview_expanded_files: RwSignal::new(HashSet::new()),
             selected_file_path: RwSignal::new(initial_selected_file),
             diff_mode: RwSignal::new(state::load_diff_view_mode()),
+            diff_width_chars: RwSignal::new(state::load_diff_width_chars()),
             show_resolved_inline: RwSignal::new(state::load_storage_bool(
                 state::SHOW_RESOLVED_INLINE_STORAGE_KEY,
                 true,
@@ -1879,6 +1881,12 @@ pub fn App() -> impl IntoView {
         });
     });
 
+    let apply_diff_width_update = Callback::new(move |next: Option<u16>| {
+        let clamped = next.map(state::clamp_diff_width_chars);
+        ctx.diff_width_chars.set(clamped);
+        state::save_diff_width_chars(clamped);
+    });
+
     let mousemove_handle = window_event_listener(ev::mousemove, move |ev: MouseEvent| {
         if !is_resizing.get_untracked() {
             return;
@@ -2623,6 +2631,13 @@ pub fn App() -> impl IntoView {
 
                 <main
                     class="diff-main"
+                    data-diff-mode=move || ctx.diff_mode.get().as_str()
+                    data-diff-width=move || if ctx.diff_width_chars.get().is_some() {
+                        "fixed"
+                    } else {
+                        "full"
+                    }
+                    style=move || state::format_diff_width_css_var(ctx.diff_width_chars.get())
                     on:mousedown=move |ev: MouseEvent| handle_diff_main_mousedown(ctx, &ev)
                     on:mouseover=move |ev: MouseEvent| handle_diff_main_mouseover(ctx, &ev)
                     on:mouseleave=move |_| {
@@ -2812,7 +2827,9 @@ pub fn App() -> impl IntoView {
             <SettingsModal
                 is_open=ctx.settings_open
                 settings=ctx.appearance
+                diff_width_chars=ctx.diff_width_chars
                 on_change=apply_settings_update
+                on_change_diff_width=apply_diff_width_update
                 on_close=Callback::new(move |()| ctx.settings_open.set(false))
             />
             <HelpModal

@@ -1118,7 +1118,7 @@ button {
   display: flex;
   flex-direction: column;
   gap: 14px;
-  max-width: 1200px;
+  width: 100%;
   margin: 0 auto;
   padding-top: 16px;
 }
@@ -1173,10 +1173,41 @@ button {
 }
 
 .diff-card {
+  width: 100%;
+  max-width: 100%;
+  margin-inline: auto;
   background-color: var(--color-bg-secondary);
   border: 1px solid var(--color-border);
   border-radius: 8px;
   contain: style;
+  /* Match .diff-table monospace metrics so 1ch in max-width equals one code character. */
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+/* Unified overhead: 2x52px gutters + 20px sigil + 14px code padding + 2px card borders = 140px. */
+.diff-main[data-diff-width="fixed"][data-diff-mode="unified"] .diff-card {
+  max-width: min(calc(var(--diff-code-ch) * 1ch + 140px), 100%);
+}
+
+/* Split overhead: 2x56px gutters + 2x20px sigils + 2x14px code padding + 4px borders = 184px. */
+.diff-main[data-diff-width="fixed"][data-diff-mode="split"] .diff-card {
+  max-width: min(calc(var(--diff-code-ch) * 2ch + 184px), 100%);
+}
+
+/* Keep single-column Markdown previews at one column width even when global mode is Split. */
+.diff-main[data-diff-width="fixed"][data-diff-mode="split"] .diff-card[data-card-columns="1"] {
+  max-width: min(calc(var(--diff-code-ch) * 1ch + 140px), 100%);
+}
+
+.diff-card__header,
+.diff-card__body {
+  font-family: var(--font-sans);
+  font-size: var(--app-font-size);
+}
+
+.diff-card__collapsed-note {
+  font-family: var(--font-sans);
 }
 
 .diff-card--viewed .diff-card__body,
@@ -1226,6 +1257,8 @@ button {
 .diff-card__right {
   flex-wrap: wrap;
   flex-shrink: 0;
+  max-width: 100%;
+  justify-content: flex-end;
   margin-left: auto;
 }
 
@@ -1293,11 +1326,11 @@ button {
 .thread-card,
 .whole-file-composer,
 .comment-form {
-  scroll-margin-top: 64px;
+  scroll-margin-top: 76px;
 }
 
 .comment-form__textarea {
-  scroll-margin-top: 96px;
+  scroll-margin-top: 108px;
 }
 
 .hunk-summary-list {
@@ -2561,6 +2594,21 @@ tr:hover .diff-gutter--actions .diff-line-actions,
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.setting-btn-row--wrap {
+  flex-wrap: wrap;
+}
+
+.setting-width-custom {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.setting-width-input {
+  width: 84px;
+  padding: 4px 8px;
 }
 
 .setting-range-row input[type="range"] {

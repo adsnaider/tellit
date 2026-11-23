@@ -74,6 +74,8 @@ pub const SIDEBAR_WIDTH_STORAGE_KEY: &str = "difit.sidebarWidth";
 pub const REVISIONS_TREE_STORAGE_KEY: &str = "tellit.revisionsTreeOpen";
 /// `localStorage` key persisting unified vs. split diff presentation mode.
 pub const DIFF_MODE_STORAGE_KEY: &str = "tellit.diffViewMode";
+/// `localStorage` key persisting user-configured diff character width (`"full"` or `"60"`..=`"300"`).
+pub const DIFF_WIDTH_CHARS_STORAGE_KEY: &str = "tellit.diffWidthChars";
 /// `localStorage` key controlling whether resolved comment threads appear inline in diffs.
 pub const SHOW_RESOLVED_INLINE_STORAGE_KEY: &str = "tellit.showResolvedInline";
 /// `localStorage` key caching client appearance and editor settings.
@@ -84,6 +86,12 @@ pub const SIDEBAR_MIN_WIDTH: u32 = 200;
 pub const SIDEBAR_MAX_WIDTH: u32 = 600;
 /// Default sidebar width in pixels.
 pub const SIDEBAR_DEFAULT_WIDTH: u32 = 300;
+/// Minimum configurable diff code-column width in characters.
+pub const MIN_DIFF_WIDTH_CHARS: u16 = 60;
+/// Maximum configurable diff code-column width in characters.
+pub const MAX_DIFF_WIDTH_CHARS: u16 = 300;
+/// Quick-pick diff character-width presets shown in Settings.
+pub const DIFF_WIDTH_PRESETS: &[u16] = &[80, 100, 120, 160];
 
 /// Browser-to-server `/api/heartbeat` SSE connection state.
 ///
@@ -391,6 +399,74 @@ pub fn load_diff_view_mode() -> DiffViewMode {
 pub fn save_diff_view_mode(mode: DiffViewMode) {
     if let Some(storage) = local_storage() {
         let _ = storage.set_item(DIFF_MODE_STORAGE_KEY, mode.as_str());
+    }
+}
+
+/// Clamps a diff code-column width into `MIN_DIFF_WIDTH_CHARS..=MAX_DIFF_WIDTH_CHARS`.
+#[must_use]
+pub const fn clamp_diff_width_chars(chars: u16) -> u16 {
+    if chars < MIN_DIFF_WIDTH_CHARS {
+        MIN_DIFF_WIDTH_CHARS
+    } else if chars > MAX_DIFF_WIDTH_CHARS {
+        MAX_DIFF_WIDTH_CHARS
+    } else {
+        chars
+    }
+}
+
+/// Parses a custom diff-width input string into `Ok(None)` for full width or `Ok(Some(clamped))`.
+///
+/// # Errors
+///
+/// Returns `Err(())` when `raw` is non-empty, not `"full"` (case-insensitive), and cannot be
+/// parsed as an unsigned integer.
+pub fn parse_diff_width_input(raw: &str) -> Result<Option<u16>, ()> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("full") {
+        return Ok(None);
+    }
+    // Parse as u32 first so oversized numbers like "99999" clamp to MAX_DIFF_WIDTH_CHARS.
+    let parsed = trimmed.parse::<u32>().map_err(|_| ())?;
+    let saturated = u16::try_from(parsed).unwrap_or(u16::MAX);
+    Ok(Some(clamp_diff_width_chars(saturated)))
+}
+
+/// Parses a persisted `localStorage` diff-width value, falling back to `None` (full width).
+#[must_use]
+pub fn parse_diff_width_storage(raw: &str) -> Option<u16> {
+    parse_diff_width_input(raw).ok().flatten()
+}
+
+/// Serializes `width` for `localStorage` (`"full"` or clamped decimal character count).
+#[must_use]
+pub fn serialize_diff_width_chars(width: Option<u16>) -> String {
+    match width {
+        Some(n) => clamp_diff_width_chars(n).to_string(),
+        None => String::from("full"),
+    }
+}
+
+/// Formats the `--diff-code-ch` inline CSS declaration for `width`, or `None` in full-width mode.
+#[must_use]
+pub fn format_diff_width_css_var(width: Option<u16>) -> Option<String> {
+    width.map(|n| alloc::format!("--diff-code-ch: {};", clamp_diff_width_chars(n)))
+}
+
+/// Loads the saved diff character width from `localStorage` (`None` = full screen width).
+#[must_use]
+pub fn load_diff_width_chars() -> Option<u16> {
+    local_storage()
+        .and_then(|s| s.get_item(DIFF_WIDTH_CHARS_STORAGE_KEY).ok().flatten())
+        .and_then(|raw| parse_diff_width_storage(&raw))
+}
+
+/// Persists `width` to `localStorage`.
+pub fn save_diff_width_chars(width: Option<u16>) {
+    if let Some(storage) = local_storage() {
+        let _ = storage.set_item(
+            DIFF_WIDTH_CHARS_STORAGE_KEY,
+            &serialize_diff_width_chars(width),
+        );
     }
 }
 
@@ -859,6 +935,53 @@ mod tests {
         assert_eq!(
             auto_collapse_reason(&base_file("small.rs", FileStatus::Added, 40, 0, false)),
             None
+        );
+    }
+
+    #[test]
+    fn diff_width_clamping_parsing_serialization_and_css_formatting() {
+        assert_eq!(clamp_diff_width_chars(0), MIN_DIFF_WIDTH_CHARS);
+        assert_eq!(clamp_diff_width_chars(59), MIN_DIFF_WIDTH_CHARS);
+        assert_eq!(clamp_diff_width_chars(60), 60);
+        assert_eq!(clamp_diff_width_chars(120), 120);
+        assert_eq!(clamp_diff_width_chars(300), 300);
+        assert_eq!(clamp_diff_width_chars(500), MAX_DIFF_WIDTH_CHARS);
+
+        assert_eq!(parse_diff_width_input(""), Ok(None));
+        assert_eq!(parse_diff_width_input("   "), Ok(None));
+        assert_eq!(parse_diff_width_input("full"), Ok(None));
+        assert_eq!(parse_diff_width_input(" FULL "), Ok(None));
+        assert_eq!(parse_diff_width_input("80"), Ok(Some(80)));
+        assert_eq!(parse_diff_width_input(" 40 "), Ok(Some(60)));
+        assert_eq!(parse_diff_width_input("999999"), Ok(Some(300)));
+        assert_eq!(parse_diff_width_input("-10"), Err(()));
+        assert_eq!(parse_diff_width_input("12.5"), Err(()));
+        assert_eq!(parse_diff_width_input("abc"), Err(()));
+
+        assert_eq!(parse_diff_width_storage(""), None);
+        assert_eq!(parse_diff_width_storage("full"), None);
+        assert_eq!(parse_diff_width_storage("not-a-number"), None);
+        assert_eq!(parse_diff_width_storage("45"), Some(60));
+        assert_eq!(parse_diff_width_storage("100"), Some(100));
+        assert_eq!(parse_diff_width_storage("999"), Some(300));
+
+        assert_eq!(serialize_diff_width_chars(None), "full");
+        assert_eq!(serialize_diff_width_chars(Some(40)), "60");
+        assert_eq!(serialize_diff_width_chars(Some(120)), "120");
+        assert_eq!(serialize_diff_width_chars(Some(400)), "300");
+
+        assert_eq!(format_diff_width_css_var(None), None);
+        assert_eq!(
+            format_diff_width_css_var(Some(40)).as_deref(),
+            Some("--diff-code-ch: 60;")
+        );
+        assert_eq!(
+            format_diff_width_css_var(Some(100)).as_deref(),
+            Some("--diff-code-ch: 100;")
+        );
+        assert_eq!(
+            format_diff_width_css_var(Some(900)).as_deref(),
+            Some("--diff-code-ch: 300;")
         );
     }
 }

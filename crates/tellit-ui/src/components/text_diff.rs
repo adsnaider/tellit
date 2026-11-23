@@ -512,6 +512,7 @@ pub fn TextDiffCard(
             id=path_for_id
             data-file=path_attr
             data-file-idx=move || file_index.get().to_string()
+            data-card-columns=move || if is_md && !show_code.get() { "1" } else { "auto" }
             class=move || {
                 match (is_single_file, is_viewed_sig.get()) {
                     (true, true) => "diff-card diff-card--single diff-card--viewed",

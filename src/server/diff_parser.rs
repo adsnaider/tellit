@@ -4,14 +4,19 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use std::path::Path;
 use std::sync::OnceLock;
 
 use similar::{ChangeTag, TextDiff};
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{Color, Theme, ThemeSet};
-use syntect::parsing::{SyntaxReference, SyntaxSet};
-use tellit_types::{DiffChunk, DiffLine, DiffLineKind, FileStatus, SyntaxSpan, WordDiffSegment};
+use syntect::highlighting::{
+    Color, HighlightIterator, HighlightState, Highlighter, Theme, ThemeSet,
+};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
+use tellit_types::{
+    DiffChunk, DiffLine, DiffLineKind, FileStatus, MAX_HIGHLIGHT_LINE_BYTES, SyntaxSpan,
+    WordDiffSegment,
+};
 
 /// Virtual file path representing the commit description in a Jujutsu diff.
 pub const COMMIT_MESSAGE_PATH: &str = "Commit Message";
@@ -387,16 +392,161 @@ fn parse_chunks(lines: &[&str]) -> Vec<DiffChunk> {
     chunks
 }
 
-fn format_fg_hex(color: Color, default_fg: Option<Color>) -> Option<String> {
+/// Base16 Ocean Dark non-default foreground RGB values matching CSS classes `.syn-1`..`.syn-19`.
+const SYNTAX_PALETTE_RGB: [(u8, u8, u8); 19] = [
+    (0x2b, 0x30, 0x3b), // 1:  base00
+    (0x34, 0x3d, 0x46), // 2:  base01
+    (0x4f, 0x5b, 0x66), // 3:  base02
+    (0x65, 0x73, 0x7e), // 4:  base03 (comments)
+    (0xa7, 0xad, 0xba), // 5:  base04
+    (0xdf, 0xe1, 0xe8), // 6:  base06
+    (0xef, 0xf1, 0xf5), // 7:  base07
+    (0xbf, 0x61, 0x6a), // 8:  base08 (variables / tags)
+    (0xd0, 0x87, 0x70), // 9:  base09 (numbers / constants)
+    (0xeb, 0xcb, 0x8b), // 10: base0A (classes / types)
+    (0xa3, 0xbe, 0x8c), // 11: base0B (strings)
+    (0x96, 0xb5, 0xb4), // 12: base0C (escapes / support)
+    (0x8f, 0xa1, 0xb3), // 13: base0D (functions)
+    (0xb4, 0x8e, 0xad), // 14: base0E (keywords)
+    (0xab, 0x79, 0x67), // 15: base0F (embedded / deprecated)
+    (0x56, 0x56, 0x56), // 16: subtle delimiter/meta accent
+    (0x96, 0x7e, 0xfb), // 17: purple accent
+    (0xa6, 0xe2, 0x2e), // 18: green diff/inserted accent
+    (0xf9, 0x26, 0x72), // 19: red diff/deleted accent
+];
+
+/// Minimum raw diff size before spawning worker threads for parallel file parsing.
+const PARALLEL_DIFF_MIN_BYTES: usize = 8 * 1024;
+
+/// Maps a `syntect` foreground [`Color`] to CSS palette index `0` (default) or `1..=19`.
+fn color_to_palette_index(color: Color, default_fg: Option<Color>) -> u8 {
     if default_fg.is_some_and(|def| def.r == color.r && def.g == color.g && def.b == color.b) {
-        return None;
+        return 0;
     }
-    Some(alloc::format!(
-        "#{:02x}{:02x}{:02x}",
-        color.r,
-        color.g,
-        color.b
-    ))
+    for (idx, &(r, g, b)) in SYNTAX_PALETTE_RGB.iter().enumerate() {
+        if color.r == r && color.g == g && color.b == b {
+            return u8::try_from(idx + 1).unwrap_or(0);
+        }
+    }
+    // Nearest-RGB fallback if a theme ever produces a color outside the Base16 Ocean table.
+    let mut best_idx = 0usize;
+    let mut best_dist = u32::MAX;
+    for (idx, &(r, g, b)) in SYNTAX_PALETTE_RGB.iter().enumerate() {
+        let dr = i32::from(color.r) - i32::from(r);
+        let dg = i32::from(color.g) - i32::from(g);
+        let db = i32::from(color.b) - i32::from(b);
+        let dist = u32::try_from(dr * dr + dg * dg + db * db).unwrap_or(u32::MAX);
+        if dist < best_dist {
+            best_dist = dist;
+            best_idx = idx;
+        }
+    }
+    u8::try_from(best_idx + 1).unwrap_or(0)
+}
+
+struct LineHighlighter<'a> {
+    highlighter: Highlighter<'a>,
+    parse_state: ParseState,
+    highlight_state: HighlightState,
+}
+
+impl<'a> LineHighlighter<'a> {
+    fn new(syntax: &SyntaxReference, theme: &'a Theme) -> Self {
+        let highlighter = Highlighter::new(theme);
+        let highlight_state = HighlightState::new(&highlighter, ScopeStack::new());
+        Self {
+            highlighter,
+            parse_state: ParseState::new(syntax),
+            highlight_state,
+        }
+    }
+
+    fn states_equal(&self, other: &Self) -> bool {
+        self.parse_state == other.parse_state && self.highlight_state == other.highlight_state
+    }
+
+    fn sync_from(&mut self, other: &Self) {
+        self.parse_state = other.parse_state.clone();
+        self.highlight_state = other.highlight_state.clone();
+    }
+
+    fn advance_without_spans(
+        &mut self,
+        syntax_set: &SyntaxSet,
+        content: &str,
+        line_buf: &mut String,
+    ) {
+        if content.is_empty() || content.len() > MAX_HIGHLIGHT_LINE_BYTES {
+            return;
+        }
+        line_buf.clear();
+        line_buf.push_str(content);
+        line_buf.push('\n');
+        let Ok(ops) = self.parse_state.parse_line(line_buf, syntax_set) else {
+            return;
+        };
+        for _ in HighlightIterator::new(
+            &mut self.highlight_state,
+            &ops[..],
+            line_buf,
+            &self.highlighter,
+        ) {}
+    }
+
+    fn highlight_line(
+        &mut self,
+        syntax_set: &SyntaxSet,
+        default_fg: Option<Color>,
+        content: &str,
+        line_buf: &mut String,
+    ) -> Vec<SyntaxSpan> {
+        if content.is_empty() || content.len() > MAX_HIGHLIGHT_LINE_BYTES {
+            return Vec::new();
+        }
+        line_buf.clear();
+        line_buf.push_str(content);
+        line_buf.push('\n');
+        let Ok(ops) = self.parse_state.parse_line(line_buf, syntax_set) else {
+            return Vec::new();
+        };
+
+        let mut spans: Vec<SyntaxSpan> = Vec::new();
+        let mut has_styled = false;
+        for (style, raw_slice) in HighlightIterator::new(
+            &mut self.highlight_state,
+            &ops[..],
+            line_buf,
+            &self.highlighter,
+        ) {
+            let slice = raw_slice.strip_suffix('\n').unwrap_or(raw_slice);
+            if slice.is_empty() {
+                continue;
+            }
+            let Ok(span_len) = u32::try_from(slice.len()) else {
+                continue;
+            };
+            let palette_idx = color_to_palette_index(style.foreground, default_fg);
+            if palette_idx != 0 {
+                has_styled = true;
+            }
+            if let Some(last) = spans.last_mut()
+                && last.style == palette_idx
+            {
+                last.len = last.len.saturating_add(span_len);
+                continue;
+            }
+            spans.push(SyntaxSpan {
+                len: span_len,
+                style: palette_idx,
+            });
+        }
+
+        // Omit spans entirely when every token uses the default foreground color.
+        if !has_styled {
+            return Vec::new();
+        }
+        spans
+    }
 }
 
 fn find_syntax<'a>(syntax_set: &'a SyntaxSet, path: &str) -> Option<&'a SyntaxReference> {
@@ -427,51 +577,18 @@ fn find_syntax<'a>(syntax_set: &'a SyntaxSet, path: &str) -> Option<&'a SyntaxRe
     }
 }
 
-fn highlight_line(
-    highlighter: &mut HighlightLines<'_>,
-    syntax_set: &SyntaxSet,
-    default_fg: Option<Color>,
-    content: &str,
-) -> Vec<SyntaxSpan> {
-    if content.is_empty() {
-        return Vec::new();
-    }
-    let with_newline = alloc::format!("{content}\n");
-    let Ok(ranges) = highlighter.highlight_line(&with_newline, syntax_set) else {
-        return alloc::vec![SyntaxSpan {
-            text: String::from(content),
-            fg_hex: None,
-        }];
-    };
-
-    let mut spans: Vec<SyntaxSpan> = Vec::new();
-    for (style, raw_slice) in ranges {
-        let slice = raw_slice.strip_suffix('\n').unwrap_or(raw_slice);
-        if slice.is_empty() {
-            continue;
-        }
-        let fg_hex = format_fg_hex(style.foreground, default_fg);
-        if let Some(last) = spans.last_mut()
-            && last.fg_hex == fg_hex
-        {
-            last.text.push_str(slice);
-            continue;
-        }
-        spans.push(SyntaxSpan {
-            text: String::from(slice),
-            fg_hex,
-        });
-    }
-    spans
-}
-
 struct WordDiffPair {
     old_segments: Vec<WordDiffSegment>,
     new_segments: Vec<WordDiffSegment>,
 }
 
 fn compute_pair_word_diff(old_text: &str, new_text: &str) -> Option<WordDiffPair> {
-    if old_text == new_text || old_text.is_empty() || new_text.is_empty() {
+    if old_text == new_text
+        || old_text.is_empty()
+        || new_text.is_empty()
+        || old_text.len() > MAX_HIGHLIGHT_LINE_BYTES
+        || new_text.len() > MAX_HIGHLIGHT_LINE_BYTES
+    {
         return None;
     }
 
@@ -484,13 +601,16 @@ fn compute_pair_word_diff(old_text: &str, new_text: &str) -> Option<WordDiffPair
         if text.is_empty() {
             return;
         }
+        let Ok(seg_len) = u32::try_from(text.len()) else {
+            return;
+        };
         if let Some(last) = target.last_mut()
             && last.emphasized == emphasized
         {
-            last.text.push_str(text);
+            last.len = last.len.saturating_add(seg_len);
         } else {
             target.push(WordDiffSegment {
-                text: String::from(text),
+                len: seg_len,
                 emphasized,
             });
         }
@@ -571,22 +691,48 @@ fn enrich_file_chunks(path: &str, chunks: &mut [DiffChunk]) {
         return;
     };
     let default_fg = engine.theme.settings.foreground;
+    let mut line_buf = String::with_capacity(256);
 
     for chunk in chunks {
-        let mut old_hl = HighlightLines::new(syntax, &engine.theme);
-        let mut new_hl = HighlightLines::new(syntax, &engine.theme);
+        let mut old_hl = LineHighlighter::new(syntax, &engine.theme);
+        let mut new_hl = LineHighlighter::new(syntax, &engine.theme);
         for line in &mut chunk.lines {
             line.syntax_spans = match line.kind {
-                DiffLineKind::Delete => {
-                    highlight_line(&mut old_hl, &engine.syntax_set, default_fg, &line.content)
-                }
-                DiffLineKind::Add => {
-                    highlight_line(&mut new_hl, &engine.syntax_set, default_fg, &line.content)
-                }
+                DiffLineKind::Delete => old_hl.highlight_line(
+                    &engine.syntax_set,
+                    default_fg,
+                    &line.content,
+                    &mut line_buf,
+                ),
+                DiffLineKind::Add => new_hl.highlight_line(
+                    &engine.syntax_set,
+                    default_fg,
+                    &line.content,
+                    &mut line_buf,
+                ),
                 DiffLineKind::Context => {
-                    let _ =
-                        highlight_line(&mut old_hl, &engine.syntax_set, default_fg, &line.content);
-                    highlight_line(&mut new_hl, &engine.syntax_set, default_fg, &line.content)
+                    if old_hl.states_equal(&new_hl) {
+                        let spans = new_hl.highlight_line(
+                            &engine.syntax_set,
+                            default_fg,
+                            &line.content,
+                            &mut line_buf,
+                        );
+                        old_hl.sync_from(&new_hl);
+                        spans
+                    } else {
+                        old_hl.advance_without_spans(
+                            &engine.syntax_set,
+                            &line.content,
+                            &mut line_buf,
+                        );
+                        new_hl.highlight_line(
+                            &engine.syntax_set,
+                            default_fg,
+                            &line.content,
+                            &mut line_buf,
+                        )
+                    }
                 }
             };
         }
@@ -598,18 +744,38 @@ fn parse_file_block(block: &str) -> Option<tellit_types::DiffFile> {
     let header_line = *lines.first()?;
     let header_paths = parse_diff_git_header(header_line);
 
-    let minus_line = lines.iter().copied().find(|l| l.starts_with("--- "));
-    let plus_line = lines.iter().copied().find(|l| l.starts_with("+++ "));
-    let rename_from = lines
+    // Stop header scanning at the first hunk marker so large files are not scanned repeatedly.
+    let header_end = lines
         .iter()
-        .copied()
-        .find_map(|l| l.strip_prefix("rename from "))
-        .and_then(|raw| decode_git_path(raw, false));
-    let rename_to = lines
-        .iter()
-        .copied()
-        .find_map(|l| l.strip_prefix("rename to "))
-        .and_then(|raw| decode_git_path(raw, false));
+        .position(|l| l.starts_with("@@ "))
+        .unwrap_or(lines.len());
+
+    let mut minus_line: Option<&str> = None;
+    let mut plus_line: Option<&str> = None;
+    let mut rename_from: Option<String> = None;
+    let mut rename_to: Option<String> = None;
+    let mut has_new_mode = false;
+    let mut has_del_mode = false;
+
+    for &line in &lines[..header_end] {
+        if minus_line.is_none() && line.starts_with("--- ") {
+            minus_line = Some(line);
+        } else if plus_line.is_none() && line.starts_with("+++ ") {
+            plus_line = Some(line);
+        } else if rename_from.is_none()
+            && let Some(raw) = line.strip_prefix("rename from ")
+        {
+            rename_from = decode_git_path(raw, false);
+        } else if rename_to.is_none()
+            && let Some(raw) = line.strip_prefix("rename to ")
+        {
+            rename_to = decode_git_path(raw, false);
+        } else if line.starts_with("new file mode") {
+            has_new_mode = true;
+        } else if line.starts_with("deleted file mode") {
+            has_del_mode = true;
+        }
+    }
 
     let minus_path = minus_line
         .and_then(|l| l.strip_prefix("--- "))
@@ -628,9 +794,6 @@ fn parse_file_block(block: &str) -> Option<tellit_types::DiffFile> {
     let path = parsed_new.clone().or_else(|| parsed_old.clone())?;
     let old_candidate = parsed_old.unwrap_or_else(|| path.clone());
 
-    let has_new_mode = lines.iter().any(|l| l.starts_with("new file mode"));
-    let has_del_mode = lines.iter().any(|l| l.starts_with("deleted file mode"));
-
     let status = if has_new_mode || minus_line.is_some_and(|l| l.contains("/dev/null")) {
         FileStatus::Added
     } else if has_del_mode || plus_line.is_some_and(|l| l.contains("/dev/null")) {
@@ -647,7 +810,7 @@ fn parse_file_block(block: &str) -> Option<tellit_types::DiffFile> {
         None
     };
 
-    let mut chunks = parse_chunks(&lines);
+    let mut chunks = parse_chunks(&lines[header_end..]);
     let mut additions = 0u32;
     let mut deletions = 0u32;
     let mut header_sample: Vec<&str> = Vec::new();
@@ -689,36 +852,87 @@ fn parse_file_block(block: &str) -> Option<tellit_types::DiffFile> {
     })
 }
 
-/// Parses `git diff` / `jj diff --git` output into structured [`tellit_types::DiffFile`] entries.
-#[must_use]
-pub fn parse_unified_git_diff(diff_text: &str) -> Vec<tellit_types::DiffFile> {
-    let mut files = Vec::new();
+fn split_diff_blocks(diff_text: &str) -> Vec<&str> {
+    let mut blocks = Vec::new();
     let mut current_start: Option<usize> = None;
-
     let mut line_offset = 0usize;
+
     for raw_line in diff_text.split_inclusive('\n') {
         if raw_line.starts_with("diff --git ") {
-            if let Some(start) = current_start
-                && let Some(parsed) = parse_file_block(&diff_text[start..line_offset])
-            {
-                files.push(parsed);
+            if let Some(start) = current_start {
+                blocks.push(&diff_text[start..line_offset]);
             }
             current_start = Some(line_offset);
         }
         line_offset += raw_line.len();
     }
 
-    // Handle final block or input without trailing newline.
     if current_start.is_none() && diff_text.starts_with("diff --git ") {
         current_start = Some(0);
     }
-    if let Some(start) = current_start
-        && let Some(parsed) = parse_file_block(&diff_text[start..])
-    {
-        files.push(parsed);
+    if let Some(start) = current_start {
+        blocks.push(&diff_text[start..]);
     }
 
-    files
+    blocks
+}
+
+/// Parses `git diff` / `jj diff --git` output into structured [`tellit_types::DiffFile`] entries.
+///
+/// Large multi-file diffs are parsed and highlighted in parallel across available CPU cores while
+/// preserving the original file order from `diff_text`.
+#[must_use]
+pub fn parse_unified_git_diff(diff_text: &str) -> Vec<tellit_types::DiffFile> {
+    let blocks = split_diff_blocks(diff_text);
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+
+    let worker_count = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(blocks.len());
+    if worker_count <= 1 || diff_text.len() < PARALLEL_DIFF_MIN_BYTES {
+        return blocks.into_iter().filter_map(parse_file_block).collect();
+    }
+
+    // Initialize the syntax/theme `OnceLock` once before fanning out to workers.
+    let _ = highlight_engine();
+
+    let next_idx = AtomicUsize::new(0);
+    let block_count = blocks.len();
+    let worker_outputs: Vec<Vec<(usize, Option<tellit_types::DiffFile>)>> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..worker_count)
+                .map(|_| {
+                    let blocks_ref = &blocks;
+                    let next_ref = &next_idx;
+                    scope.spawn(move || {
+                        let mut local = Vec::new();
+                        loop {
+                            let idx = next_ref.fetch_add(1, Ordering::Relaxed);
+                            if idx >= block_count {
+                                break;
+                            }
+                            local.push((idx, parse_file_block(blocks_ref[idx])));
+                        }
+                        local
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap_or_default())
+                .collect()
+        });
+
+    let mut ordered: Vec<Option<tellit_types::DiffFile>> = (0..block_count).map(|_| None).collect();
+    for batch in worker_outputs {
+        for (idx, file) in batch {
+            ordered[idx] = file;
+        }
+    }
+    ordered.into_iter().flatten().collect()
 }
 
 /// Builds the virtual `"Commit Message"` [`tellit_types::DiffFile`] comparing descriptions.
@@ -951,6 +1165,20 @@ pub fn build_commit_message_file(
 mod tests {
     use super::*;
 
+    fn emphasized_word_slices(line: &DiffLine) -> Vec<&str> {
+        let mut cursor = 0usize;
+        let mut out = Vec::new();
+        for seg in &line.word_diff {
+            let end = cursor + seg.len as usize;
+            if seg.emphasized {
+                out.push(&line.content[cursor..end]);
+            }
+            cursor = end;
+        }
+        assert_eq!(cursor, line.content.len());
+        out
+    }
+
     #[test]
     fn parses_modified_rust_diff_with_syntax_and_word_spans() {
         let raw = "\
@@ -976,18 +1204,10 @@ index 1111111..2222222 100644
         let lines = &file.chunks[0].lines;
         assert_eq!(lines.len(), 4);
         assert!(!lines[0].syntax_spans.is_empty());
-        assert!(
-            lines[1]
-                .word_diff
-                .iter()
-                .any(|seg| seg.emphasized && seg.text == "old")
-        );
-        assert!(
-            lines[2]
-                .word_diff
-                .iter()
-                .any(|seg| seg.emphasized && seg.text == "new")
-        );
+        let span_sum: usize = lines[0].syntax_spans.iter().map(|s| s.len as usize).sum();
+        assert_eq!(span_sum, lines[0].content.len());
+        assert_eq!(emphasized_word_slices(&lines[1]), vec!["old"]);
+        assert_eq!(emphasized_word_slices(&lines[2]), vec!["new"]);
     }
 
     #[test]
@@ -1015,11 +1235,9 @@ index 1111111..2222222 100644
         assert_eq!(inter.status, FileStatus::Modified);
         assert_eq!(inter.additions, 1);
         assert_eq!(inter.deletions, 1);
-        assert!(
-            inter.chunks[0].lines[0]
-                .word_diff
-                .iter()
-                .any(|s| s.emphasized && s.text == "draft")
+        assert_eq!(
+            emphasized_word_slices(&inter.chunks[0].lines[0]),
+            vec!["draft"]
         );
     }
 
@@ -1053,6 +1271,82 @@ index 1111111..2222222 100644
         let comment_spans = &files[0].chunks[0].lines[0].syntax_spans;
         let fn_spans = &files[0].chunks[0].lines[1].syntax_spans;
         assert!(fn_spans.len() > 1);
-        assert_ne!(comment_spans[0].fg_hex, fn_spans[0].fg_hex);
+        assert_ne!(comment_spans[0].style, fn_spans[0].style);
+    }
+
+    #[test]
+    fn base16_ocean_dark_foreground_colors_all_map_exactly_to_palette() {
+        let engine = highlight_engine();
+        let default_fg = engine.theme.settings.foreground;
+        let mut unmapped = Vec::new();
+        for item in &engine.theme.scopes {
+            let Some(fg) = item.style.foreground else {
+                continue;
+            };
+            let is_default = default_fg.is_some_and(|d| d.r == fg.r && d.g == fg.g && d.b == fg.b);
+            let in_palette = SYNTAX_PALETTE_RGB
+                .iter()
+                .any(|&(r, g, b)| fg.r == r && fg.g == g && fg.b == b);
+            if !is_default && !in_palette {
+                unmapped.push(alloc::format!("#{:02x}{:02x}{:02x}", fg.r, fg.g, fg.b));
+            }
+        }
+        unmapped.sort();
+        unmapped.dedup();
+        assert!(
+            unmapped.is_empty(),
+            "unmapped base16-ocean.dark colors: {unmapped:?}"
+        );
+    }
+
+    #[test]
+    fn skips_highlighting_and_word_diff_on_lines_over_cutoff() {
+        let long_old = alloc::format!("let x = \"{}\";", "a".repeat(MAX_HIGHLIGHT_LINE_BYTES + 32));
+        let long_new = alloc::format!("let x = \"{}\";", "b".repeat(MAX_HIGHLIGHT_LINE_BYTES + 32));
+        let raw = alloc::format!(
+            "diff --git a/src/min.js b/src/min.js\n--- a/src/min.js\n+++ b/src/min.js\n@@ -1,2 +1,2 @@\n-{long_old}\n+{long_new}\n const ok = 42;\n"
+        );
+        let files = parse_unified_git_diff(&raw);
+        let lines = &files[0].chunks[0].lines;
+        assert!(lines[0].syntax_spans.is_empty());
+        assert!(lines[0].word_diff.is_empty());
+        assert!(lines[1].syntax_spans.is_empty());
+        assert!(lines[1].word_diff.is_empty());
+        assert!(!lines[2].syntax_spans.is_empty());
+    }
+
+    #[test]
+    fn parallel_parsing_preserves_deterministic_file_order_and_utf8_boundaries() {
+        let mut raw = String::new();
+        let count = 24usize;
+        for idx in 0..count {
+            let body = alloc::format!("pub fn f_{idx}() -> &'static str {{ \"café_🦀_{idx}\" }}");
+            let pad = "// ".to_owned() + &"x".repeat(400);
+            raw.push_str(&alloc::format!(
+                "diff --git a/src/file_{idx:02}.rs b/src/file_{idx:02}.rs\n\
+                 new file mode 100644\n\
+                 --- /dev/null\n\
+                 +++ b/src/file_{idx:02}.rs\n\
+                 @@ -0,0 +1,2 @@\n\
+                 +{body}\n\
+                 +{pad}\n"
+            ));
+        }
+        assert!(raw.len() >= PARALLEL_DIFF_MIN_BYTES);
+
+        let files = parse_unified_git_diff(&raw);
+        assert_eq!(files.len(), count);
+        for (idx, file) in files.iter().enumerate() {
+            assert_eq!(file.path, alloc::format!("src/file_{idx:02}.rs"));
+            let line = &file.chunks[0].lines[0];
+            let mut cursor = 0usize;
+            for span in &line.syntax_spans {
+                let end = cursor + span.len as usize;
+                assert!(line.content.is_char_boundary(cursor));
+                assert!(line.content.is_char_boundary(end));
+                cursor = end;
+            }
+            assert_eq!(cursor, line.content.len());
+        }
     }
 }

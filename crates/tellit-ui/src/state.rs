@@ -681,34 +681,6 @@ fn glob_match_chars(pattern: &[char], text: &[char]) -> bool {
     }
 }
 
-/// Adjusts a dark-theme `#rrggbb` syntax foreground color for legible contrast on light backgrounds.
-#[must_use]
-pub fn theme_adjusted_fg(fg_hex: &str, theme: ResolvedTheme) -> String {
-    if theme == ResolvedTheme::Dark {
-        return String::from(fg_hex);
-    }
-    let hex = fg_hex.trim().strip_prefix('#').unwrap_or("");
-    if hex.len() != 6 {
-        return String::from(fg_hex);
-    }
-    let (Ok(r), Ok(g), Ok(b)) = (
-        u32::from_str_radix(&hex[0..2], 16),
-        u32::from_str_radix(&hex[2..4], 16),
-        u32::from_str_radix(&hex[4..6], 16),
-    ) else {
-        return String::from(fg_hex);
-    };
-    let luma = (299 * r + 587 * g + 114 * b) / 1000;
-    if luma <= 120 {
-        return String::from(fg_hex);
-    }
-    let target = 105u32;
-    let nr = (r * target / luma).min(255);
-    let ng = (g * target / luma).min(255);
-    let nb = (b * target / luma).min(255);
-    alloc::format!("#{nr:02x}{ng:02x}{nb:02x}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,13 +754,5 @@ mod tests {
             &patterns
         ));
         assert!(!matches_auto_viewed_patterns("src/main.rs", &patterns));
-    }
-
-    #[test]
-    fn adjusts_bright_syntax_colors_for_light_theme() {
-        assert_eq!(theme_adjusted_fg("#eff1f5", ResolvedTheme::Dark), "#eff1f5");
-        let light = theme_adjusted_fg("#eff1f5", ResolvedTheme::Light);
-        assert_ne!(light, "#eff1f5");
-        assert!(light.starts_with('#') && light.len() == 7);
     }
 }

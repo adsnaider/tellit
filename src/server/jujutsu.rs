@@ -3,22 +3,26 @@
 extern crate alloc;
 
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::mem::size_of;
 use core::time::Duration;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Output;
+use std::sync::Mutex;
 
 use tellit_types::{
-    ApproveCommitResponse, CommentSide, JjChange, JjChangesResponse, JjCommentThread, JjCommit,
-    JjDiffResponse, JjGraphRow, JjStatusResponse, LineCountResponse, LineRangeSpec,
+    ApproveCommitResponse, CommentSide, DiffChunk, DiffFile, DiffLine, JjChange, JjChangesResponse,
+    JjCommentThread, JjCommit, JjDiffResponse, JjGraphRow, JjStatusResponse, LineCountResponse,
+    LineRangeSpec, SyntaxSpan, WordDiffSegment,
 };
 use thiserror::Error;
 use tokio::process::Command;
 
 use super::diff_parser::{self, COMMIT_MESSAGE_PATH};
-use crate::{LineRange, ThreadInfo};
+use crate::{LineRange, StoreIndex, ThreadInfo};
 
 const JJ_LOG_NODE_MARKER: &str = "__TELLIT_NODE__";
 const JJ_LOG_EDGE_MARKER: &str = "__TELLIT_EDGE__";
@@ -26,6 +30,8 @@ const ROOT_CHANGE_ID: &str = "00000000000000000000000000000000";
 const UPWARD_CONNECTING_GLYPHS: &str = "│|:╯┘'╰└`├┤┴┼+";
 const MAX_ETXTBSY_RETRIES: u32 = 10;
 const MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
+const DIFF_CACHE_MAX_ENTRIES: usize = 16;
+const DIFF_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 const JJ_CHANGE_FIELDS_EXPR: &str = r#"change_id ++ "\t" ++ change_id.shortest() ++ "\t" ++ commit_id ++ "\t" ++ if(current_working_copy, "1", "0") ++ "\t" ++ if(empty, "1", "0") ++ "\t" ++ if(immutable, "1", "0") ++ "\t" ++ if(conflict, "1", "0") ++ "\t" ++ if(root, "1", "0") ++ "\t" ++ bookmarks.map(|b| b.name()).join(",") ++ "\t" ++ parents.map(|p| p.commit_id()).join(",") ++ "\t" ++ if(author.name(), author.name(), author.email()) ++ "\t" ++ committer.timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ description.first_line()"#;
 
@@ -99,10 +105,145 @@ pub struct LineCountOutcome {
 /// Result of computing a diff for `GET /api/jj/diff` with working-copy watch metadata.
 #[derive(Debug, Clone)]
 pub struct DiffOutcome {
-    /// Serialized diff payload returned to the client.
-    pub response: JjDiffResponse,
+    /// Shared serialized diff payload returned to the client.
+    pub response: Arc<JjDiffResponse>,
     /// `true` when this diff represents the current working-copy commit (`@`) against its parent.
     pub is_working_copy_parent_diff: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DiffCacheKey {
+    commit: String,
+    explicit_base: Option<String>,
+    ignore_rebase: bool,
+}
+
+#[derive(Debug)]
+struct DiffCacheEntry {
+    key: DiffCacheKey,
+    value: Arc<JjDiffResponse>,
+    approx_bytes: usize,
+}
+
+/// Bounded in-memory LRU cache of immutable OID-keyed diff responses.
+#[derive(Debug)]
+struct DiffLruCache {
+    /// Ordered from least-recently used (front) to most-recently used (back).
+    entries: Vec<DiffCacheEntry>,
+    total_bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+impl Default for DiffLruCache {
+    fn default() -> Self {
+        Self::with_limits(DIFF_CACHE_MAX_ENTRIES, DIFF_CACHE_MAX_BYTES)
+    }
+}
+
+impl DiffLruCache {
+    fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            total_bytes: 0,
+            max_entries,
+            max_bytes,
+        }
+    }
+
+    fn get(&mut self, key: &DiffCacheKey) -> Option<Arc<JjDiffResponse>> {
+        let idx = self.entries.iter().position(|entry| &entry.key == key)?;
+        let entry = self.entries.remove(idx);
+        let value = Arc::clone(&entry.value);
+        self.entries.push(entry);
+        Some(value)
+    }
+
+    fn insert(&mut self, key: DiffCacheKey, value: Arc<JjDiffResponse>) {
+        let approx_bytes = estimate_diff_bytes(&value);
+        if self.max_entries == 0 || approx_bytes > self.max_bytes {
+            return;
+        }
+        if let Some(existing_idx) = self.entries.iter().position(|entry| entry.key == key) {
+            let removed = self.entries.remove(existing_idx);
+            self.total_bytes = self.total_bytes.saturating_sub(removed.approx_bytes);
+        }
+        while self.entries.len() >= self.max_entries
+            || self.total_bytes.saturating_add(approx_bytes) > self.max_bytes
+        {
+            if self.entries.is_empty() {
+                break;
+            }
+            let evicted = self.entries.remove(0);
+            self.total_bytes = self.total_bytes.saturating_sub(evicted.approx_bytes);
+        }
+        self.total_bytes = self.total_bytes.saturating_add(approx_bytes);
+        self.entries.push(DiffCacheEntry {
+            key,
+            value,
+            approx_bytes,
+        });
+    }
+}
+
+fn estimate_diff_bytes(diff: &JjDiffResponse) -> usize {
+    let mut total = size_of::<JjDiffResponse>() + diff.commit.len() + diff.base_commit.len();
+    for file in &diff.files {
+        total = total
+            .saturating_add(size_of::<DiffFile>())
+            .saturating_add(file.path.len())
+            .saturating_add(file.old_path.as_ref().map_or(0, String::len));
+        for chunk in &file.chunks {
+            total = total
+                .saturating_add(size_of::<DiffChunk>())
+                .saturating_add(chunk.header.len());
+            for line in &chunk.lines {
+                total = total
+                    .saturating_add(size_of::<DiffLine>())
+                    .saturating_add(line.content.len())
+                    .saturating_add(line.syntax_spans.len() * size_of::<SyntaxSpan>())
+                    .saturating_add(line.word_diff.len() * size_of::<WordDiffSegment>());
+            }
+        }
+    }
+    total
+}
+
+fn is_strict_40_hex_oid(raw: &str) -> bool {
+    raw.len() == 40 && raw.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn build_diff_cache_key(
+    target_meta: Option<&CommitMeta>,
+    base_meta: Option<&CommitMeta>,
+    normalized_base: Option<&str>,
+    ignore_rebase: bool,
+) -> Option<DiffCacheKey> {
+    let target = target_meta?;
+    if !is_strict_40_hex_oid(&target.commit_id) {
+        return None;
+    }
+    let explicit_base = match normalized_base {
+        Some(_) => {
+            let base = base_meta?;
+            if !is_strict_40_hex_oid(&base.commit_id) {
+                return None;
+            }
+            Some(base.commit_id.clone())
+        }
+        None => {
+            if target.parents.is_empty() || !target.parents.iter().all(|p| is_strict_40_hex_oid(p))
+            {
+                return None;
+            }
+            None
+        }
+    };
+    Some(DiffCacheKey {
+        commit: target.commit_id.clone(),
+        explicit_base,
+        ignore_rebase,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -133,15 +274,17 @@ struct RawEvologEntry {
 pub struct JujutsuService {
     repo_path: PathBuf,
     store_override: Option<PathBuf>,
+    diff_cache: Arc<Mutex<DiffLruCache>>,
 }
 
 impl JujutsuService {
     /// Creates a service operating on `repo_path` with an optional custom `.tellit/` path.
     #[must_use]
-    pub const fn new(repo_path: PathBuf, store_override: Option<PathBuf>) -> Self {
+    pub fn new(repo_path: PathBuf, store_override: Option<PathBuf>) -> Self {
         Self {
             repo_path,
             store_override,
+            diff_cache: Arc::new(Mutex::new(DiffLruCache::default())),
         }
     }
 
@@ -169,21 +312,26 @@ impl JujutsuService {
         commit_ish: Option<&str>,
         compare_with: Option<&str>,
     ) -> JjStatusResponse {
-        let Ok(root) = self.run_jj(&["root"]).await else {
+        let target_arg = commit_ish.unwrap_or("@");
+        let trimmed_base = compare_with.map(str::trim).filter(|s| !s.is_empty());
+
+        let (root_res, initial_target, initial_base) = tokio::join!(
+            self.run_jj(&["root"]),
+            self.resolve_initial_target_commit(target_arg),
+            async {
+                match trimmed_base {
+                    Some(base) => Some(self.resolve_revision_to_commit_id(base).await),
+                    None => None,
+                }
+            }
+        );
+
+        let Ok(root) = root_res else {
             return JjStatusResponse::not_jj();
         };
         if root.is_empty() {
             return JjStatusResponse::not_jj();
         }
-
-        let target_arg = commit_ish.unwrap_or("@");
-        let initial_target = self.resolve_initial_target_commit(target_arg).await;
-        let initial_base = match compare_with {
-            Some(base) if !base.trim().is_empty() => {
-                Some(self.resolve_revision_to_commit_id(base.trim()).await)
-            }
-            _ => None,
-        };
 
         JjStatusResponse::jj(root).with_initial_revisions(Some(initial_target), initial_base)
     }
@@ -417,16 +565,49 @@ impl JujutsuService {
             )));
         }
 
-        let target_meta = self.fetch_commit_meta(trimmed_target).await;
+        let eager_base_ref = base.map(str::trim).filter(|s| {
+            !s.is_empty()
+                && !matches!(*s, "parent" | "@-" | "@^")
+                && !is_direct_parent_expr(s, trimmed_target)
+        });
+
+        let (target_meta, eager_base_meta) = match eager_base_ref {
+            Some(base_ref) => tokio::join!(
+                self.fetch_commit_meta(trimmed_target),
+                self.fetch_commit_meta(base_ref),
+            ),
+            None => (self.fetch_commit_meta(trimmed_target).await, None),
+        };
         let resolved_target = target_meta
             .as_ref()
             .map_or_else(|| String::from(trimmed_target), |m| m.commit_id.clone());
 
         let normalized_base = normalize_interdiff_base(base, trimmed_target, &resolved_target);
         let base_meta = match normalized_base {
+            Some(base_ref) if eager_base_ref == Some(base_ref) => eager_base_meta,
             Some(base_ref) => self.fetch_commit_meta(base_ref).await,
             None => None,
         };
+
+        let is_inter_diff = normalized_base.is_some();
+        let is_working_copy_parent_diff =
+            !is_inter_diff && target_meta.as_ref().is_some_and(|m| m.is_working_copy);
+        let cache_key = build_diff_cache_key(
+            target_meta.as_ref(),
+            base_meta.as_ref(),
+            normalized_base,
+            ignore_rebase,
+        );
+
+        if let Some(ref key) = cache_key
+            && let Ok(mut guard) = self.diff_cache.lock()
+            && let Some(cached) = guard.get(key)
+        {
+            return Ok(DiffOutcome {
+                response: cached,
+                is_working_copy_parent_diff,
+            });
+        }
 
         let mut is_rebase_diff = false;
         let mut rebase_ignored = false;
@@ -478,28 +659,37 @@ impl JujutsuService {
             },
         };
 
-        let mut files = diff_parser::parse_unified_git_diff(&raw_diff);
-
-        let target_desc = match target_meta {
-            Some(ref meta) => meta.description.clone(),
-            None => self.get_commit_description(&resolved_target).await,
-        };
-        let is_inter_diff = normalized_base.is_some();
-        let base_desc = if is_inter_diff {
-            match base_meta {
-                Some(ref meta) => meta.description.clone(),
-                None => {
-                    self.get_commit_description(normalized_base.unwrap_or_default())
-                        .await
+        let (target_desc, base_desc) = tokio::join!(
+            async {
+                match target_meta {
+                    Some(ref meta) => meta.description.clone(),
+                    None => self.get_commit_description(&resolved_target).await,
+                }
+            },
+            async {
+                if is_inter_diff {
+                    match base_meta {
+                        Some(ref meta) => meta.description.clone(),
+                        None => {
+                            self.get_commit_description(normalized_base.unwrap_or_default())
+                                .await
+                        }
+                    }
+                } else {
+                    String::new()
                 }
             }
-        } else {
-            String::new()
-        };
+        );
 
-        let commit_msg_file =
-            diff_parser::build_commit_message_file(&base_desc, &target_desc, is_inter_diff);
-        files.insert(0, commit_msg_file);
+        let files = tokio::task::spawn_blocking(move || {
+            let mut files = diff_parser::parse_unified_git_diff(&raw_diff);
+            let commit_msg_file =
+                diff_parser::build_commit_message_file(&base_desc, &target_desc, is_inter_diff);
+            files.insert(0, commit_msg_file);
+            files
+        })
+        .await
+        .map_err(|err| JujutsuError::Io(io::Error::other(err)))?;
 
         let is_empty = files
             .iter()
@@ -513,19 +703,24 @@ impl JujutsuService {
                 .unwrap_or_else(|| alloc::format!("{resolved_target}-")),
         };
 
-        let is_working_copy_parent_diff =
-            !is_inter_diff && target_meta.as_ref().is_some_and(|m| m.is_working_copy);
+        let response = Arc::new(JjDiffResponse {
+            commit: resolved_target,
+            base_commit: effective_base,
+            files,
+            is_empty,
+            is_rebase_diff,
+            rebase_ignored,
+            rebase_conflict,
+        });
+
+        if let Some(key) = cache_key
+            && let Ok(mut guard) = self.diff_cache.lock()
+        {
+            guard.insert(key, Arc::clone(&response));
+        }
 
         Ok(DiffOutcome {
-            response: JjDiffResponse {
-                commit: resolved_target,
-                base_commit: effective_base,
-                files,
-                is_empty,
-                is_rebase_diff,
-                rebase_ignored,
-                rebase_conflict,
-            },
+            response,
             is_working_copy_parent_diff,
         })
     }
@@ -679,7 +874,19 @@ impl JujutsuService {
             )));
         }
 
-        let target_meta = self.fetch_commit_meta(trimmed_target).await;
+        let eager_base_ref = base.map(str::trim).filter(|s| {
+            !s.is_empty()
+                && !matches!(*s, "parent" | "@-" | "@^")
+                && !is_direct_parent_expr(s, trimmed_target)
+        });
+
+        let (target_meta, eager_base_meta) = match eager_base_ref {
+            Some(base_ref) => tokio::join!(
+                self.fetch_commit_meta(trimmed_target),
+                self.fetch_commit_meta(base_ref),
+            ),
+            None => (self.fetch_commit_meta(trimmed_target).await, None),
+        };
         let target_commit_id = target_meta
             .as_ref()
             .map_or_else(|| String::from(trimmed_target), |m| m.commit_id.clone());
@@ -687,6 +894,7 @@ impl JujutsuService {
 
         let normalized_base = normalize_interdiff_base(base, trimmed_target, &target_commit_id);
         let base_meta = match normalized_base {
+            Some(base_ref) if eager_base_ref == Some(base_ref) => eager_base_meta,
             Some(base_ref) => self.fetch_commit_meta(base_ref).await,
             None => None,
         };
@@ -891,41 +1099,24 @@ impl JujutsuService {
         let mut parsed = parse_jj_log_graph(&output);
         let mut meta_cache: HashMap<String, CommitMeta> = HashMap::new();
 
-        // Batch-load `.tellit/` threads and approvals per distinct change ID.
+        // Load the entire `.tellit/` store in a single pass rather than walking it per change.
         let store = self.store_dir();
-        let unique_change_ids: Vec<String> = {
-            let mut seen = HashSet::new();
-            parsed
-                .changes
-                .iter()
-                .filter(|c| seen.insert(c.change_id.clone()))
-                .map(|c| c.change_id.clone())
-                .collect()
-        };
-
-        let store_map = tokio::task::spawn_blocking(move || {
-            let mut map: HashMap<String, (Vec<ThreadInfo>, Vec<String>)> = HashMap::new();
-            for change_id in unique_change_ids {
-                let threads = crate::get_change_threads(&store, &change_id).unwrap_or_default();
-                let approved =
-                    crate::get_change_approved_commits(&store, &change_id).unwrap_or_default();
-                map.insert(change_id, (threads, approved));
-            }
-            map
-        })
-        .await
-        .map_err(|err| JujutsuError::Io(io::Error::other(err)))?;
+        let store_index = tokio::task::spawn_blocking(move || StoreIndex::load(&store))
+            .await
+            .map_err(|err| JujutsuError::Io(io::Error::other(err)))?;
 
         for change in &mut parsed.changes {
-            if let Some((threads, approved_commits)) = store_map.get(&change.change_id) {
-                self.populate_change_review_state(
-                    change,
-                    threads,
-                    approved_commits,
-                    &mut meta_cache,
-                )
-                .await;
-            }
+            let threads = store_index.change_threads(&change.change_id);
+            let approved_commits = store_index.change_approved_commits(&change.change_id);
+            let direct_approved = store_index.is_commit_approved(&change.commit_id);
+            self.populate_change_review_state(
+                change,
+                &threads,
+                &approved_commits,
+                direct_approved,
+                &mut meta_cache,
+            )
+            .await;
         }
 
         // Sync enriched `JjChange` values back into `graph_rows`.
@@ -1008,10 +1199,13 @@ impl JujutsuService {
         let mut change = parsed.change;
         let store = self.store_dir();
         let cid = change.change_id.clone();
-        let (threads, approved_commits) = tokio::task::spawn_blocking(move || {
-            let threads = crate::get_change_threads(&store, &cid).unwrap_or_default();
-            let approved = crate::get_change_approved_commits(&store, &cid).unwrap_or_default();
-            (threads, approved)
+        let commit_id = change.commit_id.clone();
+        let (threads, approved_commits, direct_approved) = tokio::task::spawn_blocking(move || {
+            let index = StoreIndex::load(&store);
+            let threads = index.change_threads(&cid);
+            let approved = index.change_approved_commits(&cid);
+            let direct_approved = index.is_commit_approved(&commit_id);
+            (threads, approved, direct_approved)
         })
         .await
         .map_err(|err| JujutsuError::Io(io::Error::other(err)))?;
@@ -1021,6 +1215,7 @@ impl JujutsuService {
             &mut change,
             &threads,
             &approved_commits,
+            direct_approved,
             &mut meta_cache,
         )
         .await;
@@ -1033,23 +1228,18 @@ impl JujutsuService {
         change: &mut JjChange,
         threads: &[ThreadInfo],
         approved_commits: &[String],
+        direct_store_approved: bool,
         meta_cache: &mut HashMap<String, CommitMeta>,
     ) {
         change.comment_count = threads.len();
         change.unresolved_comment_count = threads.iter().filter(|t| !t.resolved).count();
 
-        let store = self.store_dir();
-        let commit_id_owned = change.commit_id.clone();
-        let direct_store_approved = approved_commits
-            .iter()
-            .any(|id| commit_id_matches(id, &change.commit_id))
-            || tokio::task::spawn_blocking(move || {
-                crate::is_commit_approved(&store, &commit_id_owned)
-            })
-            .await
-            .unwrap_or(false);
+        let is_directly_approved = direct_store_approved
+            || approved_commits
+                .iter()
+                .any(|id| commit_id_matches(id, &change.commit_id));
 
-        if direct_store_approved {
+        if is_directly_approved {
             change.approved = true;
             change.clean_rebase_approved = false;
             return;
@@ -2226,5 +2416,161 @@ mod tests {
             normalize_interdiff_base(Some("feature-"), "abc", "abcdef"),
             Some("feature-")
         );
+    }
+
+    fn sample_diff(commit: &str, base: &str, payload_len: usize) -> Arc<JjDiffResponse> {
+        Arc::new(JjDiffResponse {
+            commit: String::from(commit),
+            base_commit: String::from(base),
+            files: alloc::vec![DiffFile {
+                path: String::from("src/lib.rs"),
+                old_path: None,
+                status: tellit_types::FileStatus::Modified,
+                additions: 1,
+                deletions: 0,
+                is_generated: false,
+                chunks: alloc::vec![DiffChunk {
+                    header: String::from("@@ -1,0 +1,1 @@"),
+                    old_start: 1,
+                    old_lines: 0,
+                    new_start: 1,
+                    new_lines: 1,
+                    lines: alloc::vec![DiffLine {
+                        kind: tellit_types::DiffLineKind::Add,
+                        content: "x".repeat(payload_len),
+                        old_line_number: None,
+                        new_line_number: Some(1),
+                        syntax_spans: Vec::new(),
+                        word_diff: Vec::new(),
+                    }],
+                }],
+            }],
+            is_empty: false,
+            is_rebase_diff: false,
+            rebase_ignored: false,
+            rebase_conflict: false,
+        })
+    }
+
+    #[test]
+    fn diff_lru_cache_enforces_lru_order_entry_limit_and_byte_budget() {
+        let oid_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let oid_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let oid_c = "cccccccccccccccccccccccccccccccccccccccc";
+        let base = "0000000000000000000000000000000000000000";
+
+        let key_a = DiffCacheKey {
+            commit: String::from(oid_a),
+            explicit_base: None,
+            ignore_rebase: true,
+        };
+        let key_b = DiffCacheKey {
+            commit: String::from(oid_b),
+            explicit_base: None,
+            ignore_rebase: true,
+        };
+        let key_c = DiffCacheKey {
+            commit: String::from(oid_c),
+            explicit_base: Some(String::from(base)),
+            ignore_rebase: true,
+        };
+
+        let d_a = sample_diff(oid_a, base, 100);
+        let d_b = sample_diff(oid_b, base, 100);
+        let d_c = sample_diff(oid_c, base, 100);
+        let single_size = estimate_diff_bytes(&d_a);
+
+        // Max 2 entries: promote A via get(), then insert C -> B is evicted, A and C remain.
+        let mut cache = DiffLruCache::with_limits(2, single_size * 10);
+        cache.insert(key_a.clone(), Arc::clone(&d_a));
+        cache.insert(key_b.clone(), Arc::clone(&d_b));
+        assert!(cache.get(&key_a).is_some());
+        cache.insert(key_c.clone(), Arc::clone(&d_c));
+        assert!(cache.get(&key_a).is_some());
+        assert!(cache.get(&key_b).is_none());
+        assert!(cache.get(&key_c).is_some());
+
+        // Byte budget smaller than 2 entries evicts LRU when inserting a second entry.
+        let mut budget_cache = DiffLruCache::with_limits(8, single_size + 16);
+        budget_cache.insert(key_a.clone(), Arc::clone(&d_a));
+        budget_cache.insert(key_b.clone(), Arc::clone(&d_b));
+        assert!(budget_cache.get(&key_a).is_none());
+        assert!(budget_cache.get(&key_b).is_some());
+
+        // Oversized single entry exceeding total budget is not cached and does not wipe existing.
+        let huge = sample_diff(oid_c, base, 8192);
+        budget_cache.insert(key_c.clone(), huge);
+        assert!(budget_cache.get(&key_c).is_none());
+        assert!(budget_cache.get(&key_b).is_some());
+    }
+
+    #[test]
+    fn diff_cache_key_rejects_missing_metadata_and_non_oid_refs() {
+        let oid_target = "1111111111111111111111111111111111111111";
+        let oid_parent = "2222222222222222222222222222222222222222";
+        let oid_parent_2 = "3333333333333333333333333333333333333333";
+        let valid_target = CommitMeta {
+            commit_id: String::from(oid_target),
+            change_id: String::from("chg1"),
+            parents: alloc::vec![String::from(oid_parent)],
+            is_working_copy: false,
+            description: String::new(),
+        };
+        let valid_base = CommitMeta {
+            commit_id: String::from(oid_parent),
+            change_id: String::from("chg0"),
+            parents: Vec::new(),
+            is_working_copy: false,
+            description: String::new(),
+        };
+
+        // Single-commit diff (`None`) and explicit-base interdiff (`Some(parent)`) must not collide.
+        let single_key = build_diff_cache_key(Some(&valid_target), None, None, true)
+            .expect("single-commit diff key must be valid");
+        let interdiff_key = build_diff_cache_key(
+            Some(&valid_target),
+            Some(&valid_base),
+            Some(oid_parent),
+            true,
+        )
+        .expect("explicit-base interdiff key must be valid");
+        assert_ne!(single_key, interdiff_key);
+        assert_eq!(single_key.explicit_base, None);
+        assert_eq!(interdiff_key.explicit_base.as_deref(), Some(oid_parent));
+
+        // 2-parent merge commit caches cleanly under `None` and stays distinct from `Some(parent_1)`.
+        let merge_target = CommitMeta {
+            parents: alloc::vec![String::from(oid_parent), String::from(oid_parent_2)],
+            ..valid_target.clone()
+        };
+        let merge_single_key = build_diff_cache_key(Some(&merge_target), None, None, true)
+            .expect("merge commit single diff key must be valid");
+        let merge_vs_p1_key = build_diff_cache_key(
+            Some(&merge_target),
+            Some(&valid_base),
+            Some(oid_parent),
+            true,
+        )
+        .expect("merge commit explicit-base key must be valid");
+        assert_ne!(merge_single_key, merge_vs_p1_key);
+
+        // Missing target metadata (transient `fetch_commit_meta` failure) must not cache.
+        assert!(build_diff_cache_key(None, None, None, true).is_none());
+        // Missing explicit base metadata must not cache.
+        assert!(build_diff_cache_key(Some(&valid_target), None, Some("@-"), true).is_none());
+        // Target with no parent OID (root fallback `{oid}-`) must not cache.
+        assert!(build_diff_cache_key(Some(&valid_base), None, None, true).is_none());
+        // Merge commit with a non-OID parent must not cache.
+        let bad_merge = CommitMeta {
+            parents: alloc::vec![String::from(oid_parent), String::from("short")],
+            ..valid_target.clone()
+        };
+        assert!(build_diff_cache_key(Some(&bad_merge), None, None, true).is_none());
+        // Short non-40-char commit ID must not cache.
+        let short_target = CommitMeta {
+            commit_id: String::from("111111111111"),
+            ..valid_target
+        };
+        assert!(build_diff_cache_key(Some(&short_target), None, None, true).is_none());
     }
 }

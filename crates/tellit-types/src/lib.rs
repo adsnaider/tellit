@@ -566,25 +566,60 @@ pub enum DiffLineKind {
     Delete,
 }
 
-/// Syntax-highlighted text span produced on the server via `syntect`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// Maximum line length in bytes that receives syntax highlighting, word-level diffing, and
+/// token splitting; longer lines render as plain text.
+pub const MAX_HIGHLIGHT_LINE_BYTES: usize = 1_024;
+
+/// Number of non-default syntax palette classes (`.syn-1`..`.syn-19`) defined by the UI CSS.
+pub const SYNTAX_PALETTE_SIZE: u8 = 19;
+
+/// Syntax-highlighted byte-length span into [`DiffLine::content`].
+///
+/// `style == 0` uses the theme's default foreground; `1..=SYNTAX_PALETTE_SIZE` maps to CSS class
+/// `.syn-<style>`. Serializes compactly as `[len, style]` to avoid duplicating line text on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "(u32, u8)", into = "(u32, u8)")]
 pub struct SyntaxSpan {
-    /// Slice of source text covered by this token style.
-    pub text: String,
-    /// Optional `#rrggbb` foreground color; `None` uses the theme's default foreground.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fg_hex: Option<String>,
+    /// Byte length of this slice inside [`DiffLine::content`].
+    pub len: u32,
+    /// Palette style index (`0` = default foreground, `1..=19` = `.syn-<style>`).
+    pub style: u8,
 }
 
-/// Inline word-level diff segment produced on paired deleted/added lines via `similar`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+impl From<(u32, u8)> for SyntaxSpan {
+    fn from((len, style): (u32, u8)) -> Self {
+        Self { len, style }
+    }
+}
+
+impl From<SyntaxSpan> for (u32, u8) {
+    fn from(span: SyntaxSpan) -> Self {
+        (span.len, span.style)
+    }
+}
+
+/// Inline word-level diff byte-length segment into [`DiffLine::content`].
+///
+/// Serializes compactly as `[len, emphasized]` to avoid duplicating line text on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "(u32, bool)", into = "(u32, bool)")]
 pub struct WordDiffSegment {
-    /// Substring of the diff line.
-    pub text: String,
+    /// Byte length of this slice inside [`DiffLine::content`].
+    pub len: u32,
     /// `true` when this word/token was inserted or deleted relative to the paired line.
     pub emphasized: bool,
+}
+
+impl From<(u32, bool)> for WordDiffSegment {
+    fn from((len, emphasized): (u32, bool)) -> Self {
+        Self { len, emphasized }
+    }
+}
+
+impl From<WordDiffSegment> for (u32, bool) {
+    fn from(seg: WordDiffSegment) -> Self {
+        (seg.len, seg.emphasized)
+    }
 }
 
 /// Single line inside a [`DiffChunk`].

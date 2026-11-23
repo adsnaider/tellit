@@ -24,7 +24,7 @@ use crate::components::file_list::status_badge_class;
 use crate::components::image_diff::ImageDiffBody;
 use crate::components::keyboard::CursorPosition;
 use crate::components::markdown_diff::{MarkdownPreviewBody, MarkdownTab};
-use crate::state::{self, DiffViewMode, ResolvedTheme};
+use crate::state::{self, DiffViewMode};
 
 use expanded::{
     DEFAULT_EXPAND_COUNT, ExpandDirection, ExpandedLinesMap, MergedChunk, merge_chunks_for_file,
@@ -107,7 +107,6 @@ enum SplitAlign {
 struct ChunkRenderCtx {
     is_commit_msg: bool,
     file_index: usize,
-    resolved_theme: Signal<ResolvedTheme>,
     active_cursor: Signal<Option<CursorPosition>>,
     highlighted_word: Signal<Option<String>>,
     on_toggle_word: Callback<String>,
@@ -131,7 +130,6 @@ pub fn TextDiffCard(
     #[prop(into)] reviewed_files: Signal<HashSet<String>>,
     #[prop(into)] collapsed_files: Signal<HashSet<String>>,
     #[prop(into)] diff_mode: Signal<DiffViewMode>,
-    #[prop(into)] resolved_theme: Signal<ResolvedTheme>,
     #[prop(into)] show_resolved_inline: Signal<bool>,
     #[prop(into)] highlighted_word: Signal<Option<String>>,
     #[prop(into)] expanded_lines: Signal<ExpandedLinesMap>,
@@ -247,7 +245,6 @@ pub fn TextDiffCard(
     let chunk_ctx = ChunkRenderCtx {
         is_commit_msg,
         file_index,
-        resolved_theme,
         active_cursor,
         highlighted_word,
         on_toggle_word,
@@ -997,7 +994,6 @@ fn render_unified_chunk(
                                             syntax_spans=line.syntax_spans.clone()
                                             word_segments=line.word_diff.clone()
                                             highlighted_word=ctx.highlighted_word
-                                            resolved_theme=ctx.resolved_theme
                                             on_toggle_word=ctx.on_toggle_word
                                         />
                                     </div>
@@ -1244,7 +1240,6 @@ fn render_split_chunk(
                                                 syntax_spans=l.syntax_spans
                                                 word_segments=l.word_diff
                                                 highlighted_word=ctx.highlighted_word
-                                                resolved_theme=ctx.resolved_theme
                                                 on_toggle_word=ctx.on_toggle_word
                                             />
                                         </div>
@@ -1291,7 +1286,6 @@ fn render_split_chunk(
                                                 syntax_spans=l.syntax_spans
                                                 word_segments=l.word_diff
                                                 highlighted_word=ctx.highlighted_word
-                                                resolved_theme=ctx.resolved_theme
                                                 on_toggle_word=ctx.on_toggle_word
                                             />
                                         </div>

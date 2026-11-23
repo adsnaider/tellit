@@ -27,6 +27,25 @@
   --tok-cmt: #8b949e;
   --tok-num: #79c0ff;
   --tok-typ: #ffa657;
+  --syn-1: #2b303b;
+  --syn-2: #343d46;
+  --syn-3: #4f5b66;
+  --syn-4: #65737e;
+  --syn-5: #a7adba;
+  --syn-6: #dfe1e8;
+  --syn-7: #eff1f5;
+  --syn-8: #bf616a;
+  --syn-9: #d08770;
+  --syn-10: #ebcb8b;
+  --syn-11: #a3be8c;
+  --syn-12: #96b5b4;
+  --syn-13: #8fa1b3;
+  --syn-14: #b48ead;
+  --syn-15: #ab7967;
+  --syn-16: #565656;
+  --syn-17: #967efb;
+  --syn-18: #a6e22e;
+  --syn-19: #f92672;
   --app-font-size: 14px;
   --app-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial,
     sans-serif;
@@ -65,8 +84,47 @@
   --tok-cmt: #59636e;
   --tok-num: #0550ae;
   --tok-typ: #953800;
+  --syn-1: #2b303b;
+  --syn-2: #343d46;
+  --syn-3: #4f5b66;
+  --syn-4: #65737e;
+  --syn-5: #656971;
+  --syn-6: #68696c;
+  --syn-7: #68696b;
+  --syn-8: #9f5058;
+  --syn-9: #8d5c4c;
+  --syn-10: #786747;
+  --syn-11: #617153;
+  --syn-12: #5c6f6e;
+  --syn-13: #5f6b77;
+  --syn-14: #795f74;
+  --syn-15: #875f51;
+  --syn-16: #565656;
+  --syn-17: #6b5ab3;
+  --syn-18: #5d7e19;
+  --syn-19: #f92672;
   color-scheme: light;
 }
+
+.syn-1 { color: var(--syn-1); }
+.syn-2 { color: var(--syn-2); }
+.syn-3 { color: var(--syn-3); }
+.syn-4 { color: var(--syn-4); }
+.syn-5 { color: var(--syn-5); }
+.syn-6 { color: var(--syn-6); }
+.syn-7 { color: var(--syn-7); }
+.syn-8 { color: var(--syn-8); }
+.syn-9 { color: var(--syn-9); }
+.syn-10 { color: var(--syn-10); }
+.syn-11 { color: var(--syn-11); }
+.syn-12 { color: var(--syn-12); }
+.syn-13 { color: var(--syn-13); }
+.syn-14 { color: var(--syn-14); }
+.syn-15 { color: var(--syn-15); }
+.syn-16 { color: var(--syn-16); }
+.syn-17 { color: var(--syn-17); }
+.syn-18 { color: var(--syn-18); }
+.syn-19 { color: var(--syn-19); }
 
 [data-color-vision="deuteranopia"] {
   --color-accent-bright: #58a6ff;

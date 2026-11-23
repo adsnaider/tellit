@@ -8,20 +8,21 @@ use core::ops::Range;
 
 use leptos::ev;
 use leptos::prelude::*;
-use tellit_types::{DiffLineKind, SyntaxSpan, WordDiffSegment};
-
-use crate::state::{self, ResolvedTheme};
+use tellit_types::{
+    DiffLineKind, MAX_HIGHLIGHT_LINE_BYTES, SYNTAX_PALETTE_SIZE, SyntaxSpan, WordDiffSegment,
+};
 
 const MIN_WORD_LEN: usize = 2;
 const MAX_WORD_LEN: usize = 100;
 
-/// Single styled slice within a diff code line combining syntax color, word-diff emphasis, and clickable word token.
+/// Single styled slice within a diff code line combining syntax palette class, word-diff emphasis,
+/// and clickable word token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineRun<'a> {
     /// Substring of the line content covered by this slice.
     pub text: &'a str,
-    /// Optional foreground RGB hex color from `syntect`.
-    pub fg_hex: Option<&'a str>,
+    /// CSS syntax palette index (`0` = default foreground, `1..=SYNTAX_PALETTE_SIZE` = `.syn-<n>`).
+    pub syntax_style: u8,
     /// `true` when this slice belongs to an emphasized word-diff token.
     pub word_emphasized: bool,
     /// Clickable identifier token if this slice belongs to a valid word token.
@@ -36,10 +37,11 @@ struct TokenInterval<'a> {
 }
 
 /// Byte interval covered by one [`SyntaxSpan`].
-#[derive(Debug, Clone)]
-struct SyntaxInterval<'a> {
-    range: Range<usize>,
-    fg_hex: Option<&'a str>,
+#[derive(Debug, Clone, Copy)]
+struct SyntaxInterval {
+    start: usize,
+    end: usize,
+    style: u8,
 }
 
 /// Returns `true` when `token` is an ASCII word token of valid highlightable length (`2..=100`).
@@ -56,6 +58,31 @@ pub fn is_valid_word_token(token: &str) -> bool {
 #[must_use]
 pub fn normalize_word(word: &str) -> String {
     word.to_ascii_lowercase()
+}
+
+fn syntax_style_class(style: u8) -> Option<&'static str> {
+    match style {
+        1 => Some("syn-1"),
+        2 => Some("syn-2"),
+        3 => Some("syn-3"),
+        4 => Some("syn-4"),
+        5 => Some("syn-5"),
+        6 => Some("syn-6"),
+        7 => Some("syn-7"),
+        8 => Some("syn-8"),
+        9 => Some("syn-9"),
+        10 => Some("syn-10"),
+        11 => Some("syn-11"),
+        12 => Some("syn-12"),
+        13 => Some("syn-13"),
+        14 => Some("syn-14"),
+        15 => Some("syn-15"),
+        16 => Some("syn-16"),
+        17 => Some("syn-17"),
+        18 => Some("syn-18"),
+        19 => Some("syn-19"),
+        _ => None,
+    }
 }
 
 fn detect_word_intervals(text: &str) -> Vec<TokenInterval<'_>> {
@@ -84,26 +111,28 @@ fn detect_word_intervals(text: &str) -> Vec<TokenInterval<'_>> {
     intervals
 }
 
-fn build_syntax_intervals<'a>(
-    content: &str,
-    syntax_spans: &'a [SyntaxSpan],
-) -> Vec<SyntaxInterval<'a>> {
-    let mut intervals = Vec::new();
+fn build_syntax_intervals(content: &str, syntax_spans: &[SyntaxSpan]) -> Vec<SyntaxInterval> {
+    let mut intervals = Vec::with_capacity(syntax_spans.len());
     let mut cursor = 0usize;
 
     for span in syntax_spans {
-        let end = cursor.saturating_add(span.text.len()).min(content.len());
-        if end > cursor
+        let end = cursor.saturating_add(span.len as usize).min(content.len());
+        if span.style > 0
+            && span.style <= SYNTAX_PALETTE_SIZE
+            && end > cursor
             && content.is_char_boundary(cursor)
             && content.is_char_boundary(end)
-            && let Some(fg) = span.fg_hex.as_deref()
         {
             intervals.push(SyntaxInterval {
-                range: cursor..end,
-                fg_hex: Some(fg),
+                start: cursor,
+                end,
+                style: span.style,
             });
         }
         cursor = end;
+        if cursor >= content.len() {
+            break;
+        }
     }
 
     intervals
@@ -114,7 +143,7 @@ fn build_word_diff_intervals(content: &str, segments: &[WordDiffSegment]) -> Vec
     let mut cursor = 0usize;
 
     for seg in segments {
-        let end = cursor.saturating_add(seg.text.len()).min(content.len());
+        let end = cursor.saturating_add(seg.len as usize).min(content.len());
         if seg.emphasized
             && end > cursor
             && content.is_char_boundary(cursor)
@@ -123,74 +152,106 @@ fn build_word_diff_intervals(content: &str, segments: &[WordDiffSegment]) -> Vec
             intervals.push(cursor..end);
         }
         cursor = end;
+        if cursor >= content.len() {
+            break;
+        }
     }
 
     intervals
 }
 
-/// Splits `content` at all syntax, word-diff, and word-token boundaries for unified rendering.
+/// Splits `content` at all syntax, word-diff, and word-token boundaries in linear `O(S + D + W)`
+/// time using a 3-pointer sweep.
+///
+/// Lines longer than [`MAX_HIGHLIGHT_LINE_BYTES`] take a plain-text fast path without splitting.
 #[must_use]
 pub fn build_line_runs<'a>(
     content: &'a str,
-    syntax_spans: &'a [SyntaxSpan],
+    syntax_spans: &[SyntaxSpan],
     word_segments: &[WordDiffSegment],
 ) -> Vec<LineRun<'a>> {
     if content.is_empty() {
         return Vec::new();
     }
+    if content.len() > MAX_HIGHLIGHT_LINE_BYTES {
+        return alloc::vec![LineRun {
+            text: content,
+            syntax_style: 0,
+            word_emphasized: false,
+            word_token: None,
+        }];
+    }
 
-    let word_intervals = detect_word_intervals(content);
     let syntax_intervals = build_syntax_intervals(content, syntax_spans);
     let diff_intervals = build_word_diff_intervals(content, word_segments);
+    let word_intervals = detect_word_intervals(content);
 
-    let mut boundaries = Vec::new();
-    boundaries.push(0usize);
-    boundaries.push(content.len());
+    let mut runs = Vec::with_capacity(
+        syntax_intervals.len() + diff_intervals.len() + word_intervals.len() + 1,
+    );
+    let mut pos = 0usize;
+    let mut si = 0usize;
+    let mut di = 0usize;
+    let mut wi = 0usize;
 
-    for syn in &syntax_intervals {
-        boundaries.push(syn.range.start);
-        boundaries.push(syn.range.end);
-    }
-
-    for diff in &diff_intervals {
-        boundaries.push(diff.start);
-        boundaries.push(diff.end);
-    }
-
-    for tok in &word_intervals {
-        boundaries.push(tok.range.start);
-        boundaries.push(tok.range.end);
-    }
-
-    boundaries.sort_unstable();
-    boundaries.dedup();
-
-    let mut runs = Vec::with_capacity(boundaries.len().saturating_sub(1));
-    for win in boundaries.windows(2) {
-        let start = win[0];
-        let end = win[1];
-        if start >= end {
-            continue;
+    while pos < content.len() {
+        while si < syntax_intervals.len() && syntax_intervals[si].end <= pos {
+            si += 1;
+        }
+        while di < diff_intervals.len() && diff_intervals[di].end <= pos {
+            di += 1;
+        }
+        while wi < word_intervals.len() && word_intervals[wi].range.end <= pos {
+            wi += 1;
         }
 
-        let fg_hex = syntax_intervals
-            .iter()
-            .find(|s| s.range.start <= start && end <= s.range.end)
-            .and_then(|s| s.fg_hex);
-        let word_emphasized = diff_intervals
-            .iter()
-            .any(|d| d.start <= start && end <= d.end);
-        let word_token = word_intervals
-            .iter()
-            .find(|w| w.range.start <= start && end <= w.range.end)
-            .map(|w| w.word);
+        let mut next_pos = content.len();
 
+        let syntax_style = if let Some(syn) = syntax_intervals.get(si) {
+            if syn.start <= pos {
+                next_pos = next_pos.min(syn.end);
+                syn.style
+            } else {
+                next_pos = next_pos.min(syn.start);
+                0
+            }
+        } else {
+            0
+        };
+
+        let word_emphasized = if let Some(diff) = diff_intervals.get(di) {
+            if diff.start <= pos {
+                next_pos = next_pos.min(diff.end);
+                true
+            } else {
+                next_pos = next_pos.min(diff.start);
+                false
+            }
+        } else {
+            false
+        };
+
+        let word_token = if let Some(tok) = word_intervals.get(wi) {
+            if tok.range.start <= pos {
+                next_pos = next_pos.min(tok.range.end);
+                Some(tok.word)
+            } else {
+                next_pos = next_pos.min(tok.range.start);
+                None
+            }
+        } else {
+            None
+        };
+
+        // Every interval endpoint is verified to be a valid UTF-8 char boundary in `0..=content.len()`.
+        debug_assert!(next_pos > pos);
         runs.push(LineRun {
-            text: &content[start..end],
-            fg_hex,
+            text: &content[pos..next_pos],
+            syntax_style,
             word_emphasized,
             word_token,
         });
+        pos = next_pos;
     }
 
     runs
@@ -206,7 +267,8 @@ fn has_active_text_selection() -> bool {
     !sel.is_collapsed()
 }
 
-/// Renders one diff code line with syntax colors, word-level diff highlights, and clickable word tokens.
+/// Renders one diff code line with syntax palette classes, word-level diff highlights, and
+/// clickable word tokens.
 #[component]
 pub fn CodeLineContent(
     line_kind: DiffLineKind,
@@ -214,11 +276,13 @@ pub fn CodeLineContent(
     syntax_spans: Vec<SyntaxSpan>,
     word_segments: Vec<WordDiffSegment>,
     #[prop(into)] highlighted_word: Signal<Option<String>>,
-    #[prop(into)] resolved_theme: Signal<ResolvedTheme>,
     on_toggle_word: Callback<String>,
 ) -> impl IntoView {
     if content.is_empty() {
         return view! { <code class="diff-code-text">"\u{00a0}"</code> }.into_any();
+    }
+    if content.len() > MAX_HIGHLIGHT_LINE_BYTES {
+        return view! { <code class="diff-code-text">{content}</code> }.into_any();
     }
 
     let runs = build_line_runs(&content, &syntax_spans, &word_segments);
@@ -226,13 +290,13 @@ pub fn CodeLineContent(
         .into_iter()
         .map(|run| {
             let text = run.text.to_owned();
-            let fg_hex = run.fg_hex.map(String::from);
-            let fg_style_tok = fg_hex.clone();
-            let fg_style_plain = fg_hex;
             let token_norm = run.word_token.map(normalize_word);
             let token_click = token_norm.clone();
 
-            let mut base_classes = Vec::new();
+            let mut base_classes = Vec::with_capacity(3);
+            if let Some(syn_class) = syntax_style_class(run.syntax_style) {
+                base_classes.push(syn_class);
+            }
             if run.word_emphasized {
                 match line_kind {
                     DiffLineKind::Add => base_classes.push("word-diff--added"),
@@ -257,12 +321,6 @@ pub fn CodeLineContent(
                                 base_for_class.clone()
                             }
                         }
-                        style=move || {
-                            fg_style_tok.as_deref().map(|fg| {
-                                let adjusted = state::theme_adjusted_fg(fg, resolved_theme.get());
-                                alloc::format!("color: {adjusted}")
-                            })
-                        }
                         on:click=move |ev: ev::MouseEvent| {
                             if has_active_text_selection() {
                                 return;
@@ -277,21 +335,10 @@ pub fn CodeLineContent(
                     </span>
                 }
                 .into_any()
+            } else if base_class.is_empty() {
+                view! { <span>{text}</span> }.into_any()
             } else {
-                view! {
-                    <span
-                        class=base_class
-                        style=move || {
-                            fg_style_plain.as_deref().map(|fg| {
-                                let adjusted = state::theme_adjusted_fg(fg, resolved_theme.get());
-                                alloc::format!("color: {adjusted}")
-                            })
-                        }
-                    >
-                        {text}
-                    </span>
-                }
-                .into_any()
+                view! { <span class=base_class>{text}</span> }.into_any()
             }
         })
         .collect_view();
@@ -310,32 +357,23 @@ mod tests {
     fn builds_line_runs_combining_syntax_word_diff_and_tokens() {
         let content = "let alpha_1 = beta;";
         let spans = alloc::vec![
-            SyntaxSpan {
-                text: String::from("let "),
-                fg_hex: Some(String::from("#ff7b72")),
-            },
-            SyntaxSpan {
-                text: String::from("alpha_1"),
-                fg_hex: Some(String::from("#79c0ff")),
-            },
-            SyntaxSpan {
-                text: String::from(" = beta;"),
-                fg_hex: None,
-            },
+            SyntaxSpan { len: 4, style: 14 }, // "let "
+            SyntaxSpan { len: 7, style: 13 }, // "alpha_1"
+            SyntaxSpan { len: 8, style: 0 },  // " = beta;"
         ];
         let diff_segs = alloc::vec![
             WordDiffSegment {
-                text: String::from("let alpha_1 = "),
+                len: 14,
                 emphasized: false,
-            },
+            }, // "let alpha_1 = "
             WordDiffSegment {
-                text: String::from("beta"),
+                len: 4,
                 emphasized: true,
-            },
+            }, // "beta"
             WordDiffSegment {
-                text: String::from(";"),
+                len: 1,
                 emphasized: false,
-            },
+            }, // ";"
         ];
 
         let runs = build_line_runs(content, &spans, &diff_segs);
@@ -343,21 +381,48 @@ mod tests {
         assert_eq!(reconstructed, content);
 
         let alpha_run = runs.iter().find(|r| r.text == "alpha_1").unwrap();
-        assert_eq!(alpha_run.fg_hex, Some("#79c0ff"));
+        assert_eq!(alpha_run.syntax_style, 13);
         assert_eq!(alpha_run.word_token, Some("alpha_1"));
         assert!(!alpha_run.word_emphasized);
 
         let beta_run = runs.iter().find(|r| r.text == "beta").unwrap();
+        assert_eq!(beta_run.syntax_style, 0);
         assert!(beta_run.word_emphasized);
         assert_eq!(beta_run.word_token, Some("beta"));
     }
 
     #[test]
-    fn handles_utf8_and_single_char_tokens_safely() {
+    fn handles_utf8_invalid_span_boundaries_and_single_char_tokens_safely() {
         let content = "let a = \"café\";";
-        let runs = build_line_runs(content, &[], &[]);
+        // Intentionally split mid-character inside the 2-byte UTF-8 'é' (bytes 12..14) and
+        // overflow past `content.len()` to verify slicing never panics.
+        let malformed_spans = alloc::vec![
+            SyntaxSpan { len: 13, style: 11 },
+            SyntaxSpan { len: 99, style: 8 },
+        ];
+        let malformed_diff = alloc::vec![WordDiffSegment {
+            len: 13,
+            emphasized: true,
+        }];
+        let runs = build_line_runs(content, &malformed_spans, &malformed_diff);
         let rebuilt: String = runs.iter().map(|r| r.text).collect();
         assert_eq!(rebuilt, content);
         assert!(runs.iter().all(|r| r.word_token != Some("a")));
+    }
+
+    #[test]
+    fn long_lines_take_plain_text_fast_path() {
+        let long = "token_name ".repeat(MAX_HIGHLIGHT_LINE_BYTES / 10 + 5);
+        assert!(long.len() > MAX_HIGHLIGHT_LINE_BYTES);
+        let spans = alloc::vec![SyntaxSpan {
+            len: u32::try_from(long.len()).unwrap(),
+            style: 11,
+        }];
+        let runs = build_line_runs(&long, &spans, &[]);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, long.as_str());
+        assert_eq!(runs[0].syntax_style, 0);
+        assert!(!runs[0].word_emphasized);
+        assert_eq!(runs[0].word_token, None);
     }
 }

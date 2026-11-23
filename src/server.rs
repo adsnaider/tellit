@@ -713,8 +713,24 @@ async fn get_jj_diff(
         } else {
             API_NO_STORE_CACHE
         };
-    let mut response = Json(outcome.response).into_response();
-    response.headers_mut().insert(
+    let response_arc = outcome.response;
+    let body = if response_arc.files.len() > 4 {
+        tokio::task::spawn_blocking(move || serde_json::to_vec(response_arc.as_ref()))
+            .await
+            .map_err(|err| JujutsuError::Io(io::Error::other(err)))?
+            .map_err(|err| JujutsuError::Io(io::Error::other(err)))?
+    } else {
+        serde_json::to_vec(response_arc.as_ref())
+            .map_err(|err| JujutsuError::Io(io::Error::other(err)))?
+    };
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static(cache_control),
     );

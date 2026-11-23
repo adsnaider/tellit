@@ -986,6 +986,179 @@ fn is_approval_file_approved(approval_file: &Path) -> bool {
     true
 }
 
+#[derive(Debug)]
+struct IndexedChangeDir {
+    name: String,
+    threads: Vec<ThreadInfo>,
+    approved_commits: Vec<String>,
+}
+
+/// Single-pass in-memory index of `.tellit/<change_id>/<commit_id>/` threads and approvals.
+#[derive(Debug, Default)]
+pub struct StoreIndex {
+    changes: Vec<IndexedChangeDir>,
+    all_approved_commits: Vec<String>,
+}
+
+impl StoreIndex {
+    /// Reads `store` in a single directory pass to answer change-thread and commit-approval
+    /// queries without repeated filesystem walks.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let dir = tempfile::tempdir()?;
+    /// let commit_dir = dir.path().join("change123").join("commit456");
+    /// std::fs::create_dir_all(&commit_dir)?;
+    /// std::fs::write(
+    ///     commit_dir.join("approval.json"),
+    ///     r#"{"approved":true,"timestamp":"2026-01-01T00:00:00Z"}"#,
+    /// )?;
+    ///
+    /// let index = tellit_cli::StoreIndex::load(dir.path());
+    /// assert_eq!(index.change_approved_commits("change123"), vec!["commit456"]);
+    /// assert!(index.is_commit_approved("commit456"));
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    #[must_use]
+    pub fn load(store: &Path) -> Self {
+        if !store.exists() {
+            return Self::default();
+        }
+        let Ok(change_entries) = std::fs::read_dir(store) else {
+            return Self::default();
+        };
+
+        let mut changes = Vec::new();
+        let mut all_approved_commits = Vec::new();
+
+        for change_entry in change_entries.filter_map(|e| e.ok()) {
+            if !change_entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                continue;
+            }
+            let change_name = change_entry.file_name().to_string_lossy().into_owned();
+            let mut threads = Vec::new();
+            let mut approved_commits = Vec::new();
+
+            let Ok(commit_entries) = std::fs::read_dir(change_entry.path()) else {
+                continue;
+            };
+            for commit_entry in commit_entries.filter_map(|e| e.ok()) {
+                if !commit_entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                    continue;
+                }
+                let commit_id = commit_entry.file_name().to_string_lossy().into_owned();
+                let commit_path = commit_entry.path();
+
+                if is_approval_file_approved(&commit_path.join("approval.json")) {
+                    approved_commits.push(commit_id.clone());
+                    all_approved_commits.push(commit_id.clone());
+                }
+
+                let Ok(file_entries) = std::fs::read_dir(&commit_path) else {
+                    continue;
+                };
+                for file_entry in file_entries.filter_map(|e| e.ok()) {
+                    let path = file_entry.path();
+                    if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("json")
+                    {
+                        continue;
+                    }
+                    let thread_id = path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    if thread_id == "approval" {
+                        continue;
+                    }
+                    if let Ok(bytes) = std::fs::read(&path)
+                        && let Ok(thread_data) = serde_json::from_slice::<ThreadData>(&bytes)
+                    {
+                        threads.push(ThreadInfo {
+                            thread_id,
+                            change_id: change_name.clone(),
+                            commit_id: commit_id.clone(),
+                            git_commit_hash: commit_id.clone(),
+                            filepath: thread_data.filepath,
+                            line_range: thread_data.line_range,
+                            comments: thread_data.comments,
+                            resolved: thread_data.resolved,
+                        });
+                    }
+                }
+            }
+
+            changes.push(IndexedChangeDir {
+                name: change_name,
+                threads,
+                approved_commits,
+            });
+        }
+
+        changes.sort_by(|a, b| a.name.cmp(&b.name));
+        Self {
+            changes,
+            all_approved_commits,
+        }
+    }
+
+    fn matching_change_dirs<'a>(&'a self, change_query: &str) -> Vec<&'a IndexedChangeDir> {
+        let mut exact_match: Option<&'a IndexedChangeDir> = None;
+        let mut matched = Vec::new();
+        for dir in &self.changes {
+            if dir.name == change_query {
+                exact_match = Some(dir);
+                matched.push(dir);
+            } else if dir.name.starts_with(change_query)
+                || (dir.name.len() >= 6 && change_query.starts_with(&dir.name))
+            {
+                matched.push(dir);
+            }
+        }
+        if change_query.len() < 6
+            && let Some(exact) = exact_match
+        {
+            return vec![exact];
+        }
+        matched
+    }
+
+    /// Returns all comment threads stored under change directories matching `change_query`,
+    /// sorted by `thread_id`.
+    #[must_use]
+    pub fn change_threads(&self, change_query: &str) -> Vec<ThreadInfo> {
+        let mut threads = Vec::new();
+        for dir in self.matching_change_dirs(change_query) {
+            threads.extend(dir.threads.iter().cloned());
+        }
+        threads.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
+        threads
+    }
+
+    /// Returns sorted, deduplicated approved commit IDs under change directories matching
+    /// `change_query`.
+    #[must_use]
+    pub fn change_approved_commits(&self, change_query: &str) -> Vec<String> {
+        let mut approved = Vec::new();
+        for dir in self.matching_change_dirs(change_query) {
+            approved.extend(dir.approved_commits.iter().cloned());
+        }
+        approved.sort();
+        approved.dedup();
+        approved
+    }
+
+    /// Returns `true` when any commit matching `commit_query` (exact or 6+ char prefix) is
+    /// approved anywhere in the indexed store.
+    #[must_use]
+    pub fn is_commit_approved(&self, commit_query: &str) -> bool {
+        self.all_approved_commits
+            .iter()
+            .any(|id| commit_id_matches(id, commit_query))
+    }
+}
+
 /// Returns sorted, deduplicated commit IDs approved under changes matching `change_query`.
 ///
 /// Returns an empty list if `store` does not exist.
@@ -1873,5 +2046,75 @@ esac
             }
             stop.store(true, Ordering::Relaxed);
         });
+    }
+
+    #[test]
+    fn store_index_matches_direct_filesystem_lookups() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path();
+
+        let full_change = "ysxkykzrroroabcdef1234567890abcd";
+        let prefix_change = "ysxkykzrroro";
+        let commit_a = "1111111111111111111111111111111111111111";
+        let commit_b = "2222222222222222222222222222222222222222";
+        let other_change = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+        let commit_c = "3333333333333333333333333333333333333333";
+
+        let dir_a = store.join(prefix_change).join(&commit_a[..12]);
+        let dir_b = store.join(full_change).join(commit_b);
+        let dir_c = store.join(other_change).join(commit_c);
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::create_dir_all(&dir_c).unwrap();
+
+        std::fs::write(
+            dir_a.join("approval.json"),
+            r#"{"approved":true,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir_b.join("approval.json"),
+            r#"{"approved":false,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir_c.join("approval.json"),
+            r#"{"approved":true,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let thread_json = |msg: &str, resolved: bool| {
+            serde_json::to_string(&ThreadData {
+                filepath: String::from("src/lib.rs"),
+                line_range: Some(LineRange { start: 1, end: 2 }),
+                comments: vec![String::from(msg)],
+                resolved,
+            })
+            .unwrap()
+        };
+        std::fs::write(dir_a.join("t-1.json"), thread_json("first", false)).unwrap();
+        std::fs::write(dir_b.join("t-2.json"), thread_json("second", true)).unwrap();
+
+        let index = StoreIndex::load(store);
+        assert_eq!(
+            index.change_threads(full_change),
+            get_change_threads(store, full_change).unwrap()
+        );
+        assert_eq!(
+            index.change_approved_commits(full_change),
+            get_change_approved_commits(store, full_change).unwrap()
+        );
+        assert_eq!(
+            index.change_approved_commits(other_change),
+            get_change_approved_commits(store, other_change).unwrap()
+        );
+        assert_eq!(
+            index.is_commit_approved(commit_a),
+            is_commit_approved(store, commit_a)
+        );
+        assert!(index.is_commit_approved(commit_a));
+        assert!(!index.is_commit_approved(commit_b));
+        assert!(index.is_commit_approved(commit_c));
+        assert!(!index.is_commit_approved("4444444444444444444444444444444444444444"));
     }
 }

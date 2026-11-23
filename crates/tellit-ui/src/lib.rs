@@ -1494,7 +1494,6 @@ pub fn App() -> impl IntoView {
                                                                         reviewed_files=ctx.reviewed_files
                                                                         collapsed_files=ctx.collapsed_files
                                                                         diff_mode=ctx.diff_mode
-                                                                        resolved_theme=ctx.resolved_theme
                                                                         show_resolved_inline=ctx.show_resolved_inline
                                                                         highlighted_word=ctx.highlighted_word
                                                                         expanded_lines=ctx.expanded_lines

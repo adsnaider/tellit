@@ -24,6 +24,7 @@ use crate::components::comments::{
 };
 use crate::components::file_list::status_badge_class;
 use crate::components::image_diff::ImageDiffBody;
+use crate::components::is_plain_primary_click;
 use crate::components::markdown_diff::{MarkdownPreviewBody, MarkdownTab};
 use crate::state::{self, AutoCollapseReason, DiffViewMode};
 
@@ -257,6 +258,25 @@ struct ChunkRenderCtx {
     on_toggle_resolve: Callback<(String, bool)>,
 }
 
+/// Navigation controls merged into [`TextDiffCard`]'s sticky header in single-file view.
+#[derive(Clone, Copy)]
+pub struct SingleFileHeaderProps {
+    /// Target URL for returning to the change overview (`/c/<change_id>`).
+    pub overview_url: Signal<String>,
+    /// Human-readable file position counter such as `"3 / 330"`.
+    pub position_label: Signal<String>,
+    /// Path of the previous file in diff order, if any.
+    pub prev_path: Signal<Option<String>>,
+    /// Path of the next file in diff order, if any.
+    pub next_path: Signal<Option<String>>,
+    /// Navigates back to the change overview via SPA routing.
+    pub on_back_to_overview: Callback<()>,
+    /// Opens a sibling file path via SPA routing.
+    pub on_open_file: Callback<String>,
+    /// Marks the active file viewed and advances to the next unviewed file.
+    pub on_viewed_and_next: Callback<String>,
+}
+
 /// Interactive diff card supporting Text, Markdown, Image views, expansion, drag selection, and threads.
 #[component]
 pub fn TextDiffCard(
@@ -279,6 +299,7 @@ pub fn TextDiffCard(
     #[prop(into)] expanded_lines: Signal<ExpandedLinesMap>,
     #[prop(into)] expand_loading: Signal<bool>,
     #[prop(default = true)] show_collapse_toggle: bool,
+    #[prop(optional)] single_file_header: Option<SingleFileHeaderProps>,
     on_register_card: Callback<(String, web_sys::Element)>,
     on_unregister_card: Callback<web_sys::Element>,
     on_request_file_diff: Callback<String>,
@@ -299,6 +320,7 @@ pub fn TextDiffCard(
     let path_attr = path.clone();
     let path_toggle_collapse = path.clone();
     let path_toggle_viewed = path.clone();
+    let path_viewed_and_next = path.clone();
     let path_for_viewed = path.clone();
     let path_for_collapsed = path.clone();
     let path_for_threads = path.clone();
@@ -476,6 +498,13 @@ pub fn TextDiffCard(
     };
 
     let show_code = Memo::new(move |_| !is_md || md_tab.get() == MarkdownTab::Code);
+    let display_path = Memo::new(move |_| {
+        file.with(|f| match f.old_path {
+            Some(ref old) => alloc::format!("{old} -> {path_for_title}"),
+            None => path_for_title.clone(),
+        })
+    });
+    let is_single_file = single_file_header.is_some();
 
     view! {
         <article
@@ -483,34 +512,73 @@ pub fn TextDiffCard(
             id=path_for_id
             data-file=path_attr
             data-file-idx=move || file_index.get().to_string()
-            class=move || if is_viewed_sig.get() {
-                "diff-card diff-card--viewed"
-            } else {
-                "diff-card"
+            class=move || {
+                match (is_single_file, is_viewed_sig.get()) {
+                    (true, true) => "diff-card diff-card--single diff-card--viewed",
+                    (true, false) => "diff-card diff-card--single",
+                    (false, true) => "diff-card diff-card--viewed",
+                    (false, false) => "diff-card",
+                }
             }
         >
-            <header class="diff-card__header">
+            <header class={if is_single_file {
+                "diff-card__header diff-card__header--single"
+            } else {
+                "diff-card__header"
+            }}>
                 <div class="diff-card__left">
-                    {show_collapse_toggle.then(|| view! {
-                        <button
-                            type="button"
-                            class="icon-btn"
-                            title=move || if is_collapsed_sig.get() { "Expand file" } else { "Collapse file" }
-                            aria-expanded=move || !is_collapsed_sig.get()
-                            on:click=move |_| on_toggle_collapse.run(path_toggle_collapse.clone())
-                        >
-                            {move || if is_collapsed_sig.get() { "▸" } else { "▾" }}
-                        </button>
+                    {if let Some(nav) = single_file_header {
+                        view! {
+                            <a
+                                class="btn btn--ghost btn--xs overview-action-link single-file-bar__back"
+                                href=move || nav.overview_url.get()
+                                title="Return to change overview (u)"
+                                on:click=move |ev: web_sys::MouseEvent| {
+                                    if is_plain_primary_click(&ev) {
+                                        ev.prevent_default();
+                                        nav.on_back_to_overview.run(());
+                                    }
+                                }
+                            >
+                                "← Overview"
+                            </a>
+                        }
+                        .into_any()
+                    } else if show_collapse_toggle {
+                        view! {
+                            <button
+                                type="button"
+                                class="icon-btn"
+                                title=move || if is_collapsed_sig.get() { "Expand file" } else { "Collapse file" }
+                                aria-expanded=move || !is_collapsed_sig.get()
+                                on:click=move |_| on_toggle_collapse.run(path_toggle_collapse.clone())
+                            >
+                                {move || if is_collapsed_sig.get() { "▸" } else { "▾" }}
+                            </button>
+                        }
+                        .into_any()
+                    } else {
+                        ().into_any()
+                    }}
+                    {if is_commit_msg {
+                        view! { <span class="file-status file-status--commit">"CM"</span> }.into_any()
+                    } else {
+                        view! {
+                            <span class=move || file.with(|f| status_badge_class(f.status))>
+                                {move || file.with(|f| f.status.short_code())}
+                            </span>
+                        }
+                        .into_any()
+                    }}
+                    <span class="diff-card__path" title=move || display_path.get()>
+                        {move || display_path.get()}
+                    </span>
+                    {is_single_file.then(|| view! {
+                        <span class="diff-totals">
+                            <span class="stat-add">{move || alloc::format!("+{}", file.with(|f| f.additions))}</span>
+                            <span class="stat-del">{move || alloc::format!("-{}", file.with(|f| f.deletions))}</span>
+                        </span>
                     })}
-                    <span class=move || file.with(|f| status_badge_class(f.status))>
-                        {move || file.with(|f| f.status.short_code())}
-                    </span>
-                    <span class="diff-card__path">
-                        {move || file.with(|f| match f.old_path {
-                            Some(ref old) => alloc::format!("{old} -> {path_for_title}"),
-                            None => path_for_title.clone(),
-                        })}
-                    </span>
                     {move || file.with(|f| state::auto_collapse_reason(f)).map(|reason| {
                         let cls = if reason == AutoCollapseReason::Deleted {
                             "pill-tag pill-tag--del"
@@ -527,6 +595,11 @@ pub fn TextDiffCard(
                             </span>
                         })
                     }}
+                    {single_file_header.map(|nav| view! {
+                        <span class="single-file-bar__counter">
+                            {move || nav.position_label.get()}
+                        </span>
+                    })}
                 </div>
 
                 <div class="diff-card__right">
@@ -582,12 +655,45 @@ pub fn TextDiffCard(
                         }
                     })}
 
-                    <span class="diff-totals">
-                        <span class="stat-add">{move || alloc::format!("+{}", file.with(|f| f.additions))}</span>
-                        <span class="stat-del">{move || alloc::format!("-{}", file.with(|f| f.deletions))}</span>
-                    </span>
+                    {(!is_single_file).then(|| view! {
+                        <span class="diff-totals">
+                            <span class="stat-add">{move || alloc::format!("+{}", file.with(|f| f.additions))}</span>
+                            <span class="stat-del">{move || alloc::format!("-{}", file.with(|f| f.deletions))}</span>
+                        </span>
+                    })}
 
-                    <label class="viewed-toggle">
+                    {single_file_header.map(|nav| view! {
+                        <>
+                            <button
+                                type="button"
+                                class="btn btn--ghost btn--xs"
+                                title="Previous file ([)"
+                                disabled=move || nav.prev_path.with(Option::is_none)
+                                on:click=move |_| {
+                                    if let Some(prev) = nav.prev_path.get_untracked() {
+                                        nav.on_open_file.run(prev);
+                                    }
+                                }
+                            >
+                                "← Prev"
+                            </button>
+                            <button
+                                type="button"
+                                class="btn btn--ghost btn--xs"
+                                title="Next file (])"
+                                disabled=move || nav.next_path.with(Option::is_none)
+                                on:click=move |_| {
+                                    if let Some(next) = nav.next_path.get_untracked() {
+                                        nav.on_open_file.run(next);
+                                    }
+                                }
+                            >
+                                "Next →"
+                            </button>
+                        </>
+                    })}
+
+                    <label class="viewed-toggle" title="Toggle viewed (v)">
                         <input
                             type="checkbox"
                             class="file-checkbox"
@@ -596,6 +702,20 @@ pub fn TextDiffCard(
                         />
                         <span>"Viewed"</span>
                     </label>
+
+                    {single_file_header.map(|nav| {
+                        let next_path = path_viewed_and_next.clone();
+                        view! {
+                            <button
+                                type="button"
+                                class="btn btn--primary btn--xs"
+                                title="Mark viewed and go to next unviewed file (Shift+V)"
+                                on:click=move |_| nav.on_viewed_and_next.run(next_path.clone())
+                            >
+                                "Viewed & Next"
+                            </button>
+                        }
+                    })}
                 </div>
             </header>
 

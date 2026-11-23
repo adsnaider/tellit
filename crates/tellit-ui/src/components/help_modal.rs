@@ -75,11 +75,11 @@ pub fn HelpModal(#[prop(into)] is_open: Signal<bool>, on_close: Callback<()>) ->
                             <ShortcutRow keys=&["v"] label="Toggle viewed on active file" />
                             <ShortcutRow keys=&["Shift+V"] label="Mark viewed and open next unviewed (or overview)" />
                             <ShortcutRow keys=&["c"] label="Comment on focused line" />
-                            <ShortcutRow keys=&["Shift+L"] label="Toggle comments drawer" />
+                            <ShortcutRow keys=&["Shift+L"] label="Toggle comments panel" />
                             <ShortcutRow keys=&["Shift+C"] label="Copy all comments prompt" />
                             <ShortcutRow keys=&["Shift+R"] label="Refresh diff" />
                             <ShortcutRow keys=&["?"] label="Toggle this help" />
-                            <ShortcutRow keys=&["Esc"] label="Close active modal or drawer" />
+                            <ShortcutRow keys=&["Esc"] label="Close active modal or comments panel" />
                         </section>
                     </div>
 

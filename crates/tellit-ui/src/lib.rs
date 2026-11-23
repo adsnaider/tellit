@@ -2437,10 +2437,12 @@ pub fn App() -> impl IntoView {
                                 } else {
                                     "btn btn--ghost"
                                 }
-                                title="Toggle review comments drawer"
+                                title="Toggle comments panel (Shift+L)"
+                                aria-label="Toggle comments panel"
+                                aria-pressed=move || ctx.drawer_open.get()
                                 on:click=move |_| ctx.drawer_open.update(|v| *v = !*v)
                             >
-                                "Drawer"
+                                "Comments"
                             </button>
                         </>
                     })}

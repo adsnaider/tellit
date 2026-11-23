@@ -12,15 +12,12 @@ use wasm_bindgen::JsCast;
 use web_sys::{HtmlInputElement, MouseEvent};
 
 use crate::components::file_list::status_badge_class;
+use crate::components::is_plain_primary_click;
 use crate::components::text_diff::TextDiffCard;
 use crate::components::text_diff::expanded::ExpandedLinesMap;
 use crate::route::{AppRoute, COMMIT_MESSAGE_PATH, RouteQuery};
 use crate::state::{self, AutoCollapseReason, DiffViewMode};
 use crate::{DiffCardCallbacks, FileCardSlot};
-
-fn is_plain_primary_click(ev: &MouseEvent) -> bool {
-    ev.button() == 0 && !ev.ctrl_key() && !ev.meta_key() && !ev.shift_key() && !ev.alt_key()
-}
 
 fn select_commit_message_body(
     cm_file: Option<&DiffFile>,

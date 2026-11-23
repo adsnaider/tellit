@@ -8,7 +8,8 @@ use alloc::vec::Vec;
 use leptos::ev;
 use leptos::prelude::*;
 use tellit_types::JjCommentThread;
-use wasm_bindgen::JsCast;
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::JsFuture;
 use web_sys::{HtmlInputElement, HtmlTextAreaElement, KeyboardEvent, Node};
 
 use crate::api;
@@ -88,6 +89,7 @@ pub fn CommentComposer(
     #[prop(default = "Leave a comment...")] placeholder: &'static str,
     #[prop(default = None)] selected_code: Option<String>,
     #[prop(default = false)] embedded: bool,
+    #[prop(default = true)] autofocus: bool,
     on_submit: Callback<CommentSubmitEvent>,
     on_cancel: Callback<()>,
 ) -> impl IntoView {
@@ -95,6 +97,25 @@ pub fn CommentComposer(
     let submitting = RwSignal::new(false);
     let submit_error = RwSignal::new(Option::<String>::None);
     let selected_code_for_suggest = selected_code.clone();
+    let textarea_ref = NodeRef::<leptos::html::Textarea>::new();
+    let focused_once = StoredValue::new_local(false);
+
+    // Focus once on mount after the triggering click/keydown finishes so typing starts immediately
+    // without stealing focus on later reactive updates.
+    Effect::new(move |_| {
+        if !autofocus || focused_once.get_value() {
+            return;
+        }
+        if let Some(el) = textarea_ref.get() {
+            focused_once.set_value(true);
+            leptos::task::spawn_local(async move {
+                let _ = JsFuture::from(js_sys::Promise::resolve(&JsValue::UNDEFINED)).await;
+                if el.is_connected() {
+                    let _ = el.focus();
+                }
+            });
+        }
+    });
 
     let trigger_submit = move || {
         if submitting.get_untracked() {
@@ -154,6 +175,9 @@ pub fn CommentComposer(
                                     }
                                     cur.push_str(&snippet);
                                 });
+                                if let Some(el) = textarea_ref.get_untracked() {
+                                    let _ = el.focus();
+                                }
                             }
                         >
                             "+ Suggestion"
@@ -163,6 +187,7 @@ pub fn CommentComposer(
             </div>
 
             <textarea
+                node_ref=textarea_ref
                 class="comment-form__textarea"
                 rows=3
                 placeholder=placeholder
@@ -491,7 +516,7 @@ pub fn CommentsDrawer(
                 .collect();
 
             view! {
-                <aside class="comments-drawer" aria-label="Review comments drawer">
+                <aside class="comments-drawer" aria-label="Comments panel">
                     <div class="comments-drawer__header">
                         <div class="comments-drawer__title">
                             <span>"Comments"</span>
@@ -528,8 +553,8 @@ pub fn CommentsDrawer(
                             <button
                                 type="button"
                                 class="icon-btn"
-                                title="Close comments drawer"
-                                aria-label="Close comments drawer"
+                                title="Close comments panel"
+                                aria-label="Close comments panel"
                                 on:click=move |_| on_close.run(())
                             >
                                 "×"
@@ -696,7 +721,7 @@ pub fn UnresolvedJumpMenu(
                                     on_open_drawer.run(());
                                 }
                             >
-                                "Open Drawer"
+                                "Open Comments"
                             </button>
                         </div>
                         <div class="dropdown-popover__list">

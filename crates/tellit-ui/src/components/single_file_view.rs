@@ -1,24 +1,66 @@
-//! Dedicated Gerrit-style single-file diff view with file switcher, prev/next stepping, and viewed-and-next flow.
+//! Dedicated Gerrit-style single-file diff view with prev/next stepping and viewed-and-next flow.
 
 extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use leptos::prelude::*;
 use tellit_types::JjCommentThread;
-use wasm_bindgen::JsCast;
-use web_sys::{HtmlSelectElement, MouseEvent};
+use web_sys::MouseEvent;
 
-use crate::components::text_diff::TextDiffCard;
+use crate::components::is_plain_primary_click;
 use crate::components::text_diff::expanded::ExpandedLinesMap;
+use crate::components::text_diff::{SingleFileHeaderProps, TextDiffCard};
 use crate::route::{AppRoute, RouteQuery};
 use crate::state::DiffViewMode;
 use crate::{DiffCardCallbacks, FileCardSlot};
 
-fn is_plain_primary_click(ev: &MouseEvent) -> bool {
-    ev.button() == 0 && !ev.ctrl_key() && !ev.meta_key() && !ev.shift_key() && !ev.alt_key()
+/// Position and adjacent file targets for the active single-file diff view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SingleFileNavState {
+    /// Zero-based index of the active file in the ordered diff list, if present.
+    pub position: Option<usize>,
+    /// Total number of files in the active diff.
+    pub total: usize,
+    /// Path of the previous file in diff order, if any.
+    pub prev_path: Option<String>,
+    /// Path of the next file in diff order, if any.
+    pub next_path: Option<String>,
+}
+
+impl SingleFileNavState {
+    /// Formats the 1-based position counter shown in the single-file header (e.g. `"3 / 330"`).
+    #[must_use]
+    pub fn position_label(&self) -> String {
+        match self.position {
+            Some(i) => alloc::format!("{} / {}", i + 1, self.total),
+            None => alloc::format!("— / {}", self.total),
+        }
+    }
+}
+
+/// Computes position and adjacent file paths for `target_path` inside an ordered list of paths.
+#[must_use]
+pub fn compute_single_file_nav<S: AsRef<str>>(
+    paths: &[S],
+    target_path: &str,
+) -> SingleFileNavState {
+    let total = paths.len();
+    let position = paths.iter().position(|p| p.as_ref() == target_path);
+    let prev_path = position
+        .and_then(|i| i.checked_sub(1))
+        .map(|i| String::from(paths[i].as_ref()));
+    let next_path = position
+        .and_then(|i| (i + 1 < total).then_some(i + 1))
+        .map(|i| String::from(paths[i].as_ref()));
+    SingleFileNavState {
+        position,
+        total,
+        prev_path,
+        next_path,
+    }
 }
 
 /// Focused single-file diff page (`/c/<change_id>/file/<encoded_path>`).
@@ -50,34 +92,27 @@ pub fn SingleFileView(
         .to_url()
     });
 
-    let thread_counts = Memo::new(move |_| {
-        all_threads.with(|list| {
-            let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
-            for t in list {
-                let entry = counts.entry(t.file_path.clone()).or_insert((0, 0));
-                entry.0 += 1;
-                if !t.resolved {
-                    entry.1 += 1;
-                }
-            }
-            counts
+    let nav_state = Memo::new(move |_| {
+        let target_path = file_path.get();
+        ordered_file_slots.with(|slots| {
+            let paths: Vec<&str> = slots.iter().map(|s| s.path.as_str()).collect();
+            compute_single_file_nav(&paths, &target_path)
         })
     });
 
-    let active_match = Memo::new(move |_| {
-        let target_path = file_path.get();
-        ordered_file_slots.with(|slots| {
-            let total = slots.len();
-            let pos = slots.iter().position(|s| s.path == target_path);
-            let prev_path = pos
-                .and_then(|i| i.checked_sub(1))
-                .map(|i| slots[i].path.clone());
-            let next_path = pos
-                .and_then(|i| (i + 1 < total).then_some(i + 1))
-                .map(|i| slots[i].path.clone());
-            (pos, total, prev_path, next_path)
-        })
-    });
+    let position_label = Signal::derive(move || nav_state.with(SingleFileNavState::position_label));
+    let prev_path = Signal::derive(move || nav_state.with(|n| n.prev_path.clone()));
+    let next_path = Signal::derive(move || nav_state.with(|n| n.next_path.clone()));
+
+    let header_props = SingleFileHeaderProps {
+        overview_url: overview_url.into(),
+        position_label,
+        prev_path,
+        next_path,
+        on_back_to_overview,
+        on_open_file,
+        on_viewed_and_next,
+    };
 
     let active_slot_list = Memo::new(move |_| {
         let target_path = file_path.get();
@@ -91,149 +126,8 @@ pub fn SingleFileView(
         })
     });
 
-    let is_active_viewed = Memo::new(move |_| {
-        let p = file_path.get();
-        reviewed_files.with(|set| set.contains(&p))
-    });
-
-    let switcher_options = Memo::new(move |_| {
-        ordered_file_slots.with(|slots| {
-            reviewed_files.with(|reviewed| {
-                thread_counts.with(|counts| {
-                    slots
-                        .iter()
-                        .map(|s| {
-                            let is_done = reviewed.contains(&s.path);
-                            let (total, unresolved) =
-                                counts.get(&s.path).copied().unwrap_or((0, 0));
-                            let prefix = if is_done { "✓ " } else { "  " };
-                            let suffix = if unresolved > 0 {
-                                alloc::format!(" ({unresolved} unresolved / {total})")
-                            } else if total > 0 {
-                                alloc::format!(" ({total} resolved)")
-                            } else {
-                                String::new()
-                            };
-                            (s.path.clone(), alloc::format!("{prefix}{}{suffix}", s.path))
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-        })
-    });
-
     view! {
         <div class="single-file-view">
-            <header class="single-file-bar">
-                <div class="single-file-bar__left">
-                    <a
-                        class="btn btn--ghost btn--xs overview-action-link"
-                        href=move || overview_url.get()
-                        title="Return to change overview (u)"
-                        on:click=move |ev: MouseEvent| {
-                            if is_plain_primary_click(&ev) {
-                                ev.prevent_default();
-                                on_back_to_overview.run(());
-                            }
-                        }
-                    >
-                        "← Overview"
-                    </a>
-
-                    <select
-                        class="single-file-bar__select"
-                        aria-label="Switch file"
-                        prop:value=move || file_path.get()
-                        on:change=move |ev| {
-                            if let Some(sel) = ev
-                                .target()
-                                .and_then(|t| t.dyn_into::<HtmlSelectElement>().ok())
-                            {
-                                let next = sel.value();
-                                if !next.is_empty() {
-                                    on_open_file.run(next);
-                                }
-                            }
-                        }
-                    >
-                        {move || {
-                            let current = file_path.get();
-                            switcher_options
-                                .get()
-                                .into_iter()
-                                .map(|(path, label)| {
-                                    let is_selected = path == current;
-                                    view! {
-                                        <option value=path selected=is_selected>{label}</option>
-                                    }
-                                })
-                                .collect_view()
-                        }}
-                    </select>
-
-                    <span class="single-file-bar__counter">
-                        {move || {
-                            let (pos, total, _, _) = active_match.get();
-                            match pos {
-                                Some(i) => alloc::format!("{} / {total}", i + 1),
-                                None => alloc::format!("— / {total}"),
-                            }
-                        }}
-                    </span>
-                </div>
-
-                <div class="single-file-bar__right">
-                    <button
-                        type="button"
-                        class="btn btn--ghost btn--xs"
-                        title="Previous file ([)"
-                        disabled=move || active_match.with(|m| m.2.is_none())
-                        on:click=move |_| {
-                            if let Some(prev) = active_match.with_untracked(|m| m.2.clone()) {
-                                on_open_file.run(prev);
-                            }
-                        }
-                    >
-                        "← Prev"
-                    </button>
-                    <button
-                        type="button"
-                        class="btn btn--ghost btn--xs"
-                        title="Next file (])"
-                        disabled=move || active_match.with(|m| m.3.is_none())
-                        on:click=move |_| {
-                            if let Some(next) = active_match.with_untracked(|m| m.3.clone()) {
-                                on_open_file.run(next);
-                            }
-                        }
-                    >
-                        "Next →"
-                    </button>
-
-                    {move || active_match.with(|m| m.0.is_some()).then(|| view! {
-                        <>
-                            <label class="viewed-toggle" title="Toggle viewed (v)">
-                                <input
-                                    type="checkbox"
-                                    class="file-checkbox"
-                                    prop:checked=move || is_active_viewed.get()
-                                    on:change=move |_| callbacks.on_toggle_viewed.run(file_path.get_untracked())
-                                />
-                                <span>"Viewed"</span>
-                            </label>
-                            <button
-                                type="button"
-                                class="btn btn--primary btn--xs"
-                                title="Mark viewed and go to next unviewed file (Shift+V)"
-                                on:click=move |_| on_viewed_and_next.run(file_path.get_untracked())
-                            >
-                                "Viewed & Next"
-                            </button>
-                        </>
-                    })}
-                </div>
-            </header>
-
             <For
                 each=move || active_slot_list.get()
                 key=|slot| slot.path.clone()
@@ -259,6 +153,7 @@ pub fn SingleFileView(
                             expanded_lines=expanded_lines
                             expand_loading=expand_loading
                             show_collapse_toggle=false
+                            single_file_header=header_props
                             on_register_card=callbacks.on_register_card
                             on_unregister_card=callbacks.on_unregister_card
                             on_request_file_diff=callbacks.on_request_file_diff
@@ -279,21 +174,97 @@ pub fn SingleFileView(
             {move || active_slot_list.with(Vec::is_empty).then(|| {
                 let missing = file_path.get();
                 view! {
-                    <div class="empty-diff-card">
-                        <h2>"File not found in this revision"</h2>
-                        <p>{alloc::format!("The path \"{missing}\" is not part of the loaded diff.")}</p>
-                        <div class="empty-diff-card__actions">
-                            <button
-                                type="button"
-                                class="btn btn--primary"
-                                on:click=move |_| on_back_to_overview.run(())
-                            >
-                                "← Back to Overview"
-                            </button>
+                    <>
+                        <header class="single-file-bar">
+                            <div class="single-file-bar__left">
+                                <a
+                                    class="btn btn--ghost btn--xs overview-action-link"
+                                    href=move || overview_url.get()
+                                    title="Return to change overview (u)"
+                                    on:click=move |ev: MouseEvent| {
+                                        if is_plain_primary_click(&ev) {
+                                            ev.prevent_default();
+                                            on_back_to_overview.run(());
+                                        }
+                                    }
+                                >
+                                    "← Overview"
+                                </a>
+                                <span class="single-file-bar__counter">
+                                    {move || position_label.get()}
+                                </span>
+                            </div>
+                        </header>
+                        <div class="empty-diff-card">
+                            <h2>"File not found in this revision"</h2>
+                            <p>{alloc::format!("The path \"{missing}\" is not part of the loaded diff.")}</p>
+                            <div class="empty-diff-card__actions">
+                                <button
+                                    type="button"
+                                    class="btn btn--primary"
+                                    on:click=move |_| on_back_to_overview.run(())
+                                >
+                                    "← Back to Overview"
+                                </button>
+                            </div>
                         </div>
-                    </div>
+                    </>
                 }
             })}
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn computes_nav_state_for_first_middle_last_and_single_files() {
+        let files = ["Commit Message", "src/a.rs", "src/b.rs"];
+
+        let first = compute_single_file_nav(&files, "Commit Message");
+        assert_eq!(first.position, Some(0));
+        assert_eq!(first.total, 3);
+        assert_eq!(first.prev_path, None);
+        assert_eq!(first.next_path.as_deref(), Some("src/a.rs"));
+        assert_eq!(first.position_label(), "1 / 3");
+
+        let middle = compute_single_file_nav(&files, "src/a.rs");
+        assert_eq!(middle.position, Some(1));
+        assert_eq!(middle.prev_path.as_deref(), Some("Commit Message"));
+        assert_eq!(middle.next_path.as_deref(), Some("src/b.rs"));
+        assert_eq!(middle.position_label(), "2 / 3");
+
+        let last = compute_single_file_nav(&files, "src/b.rs");
+        assert_eq!(last.position, Some(2));
+        assert_eq!(last.prev_path.as_deref(), Some("src/a.rs"));
+        assert_eq!(last.next_path, None);
+        assert_eq!(last.position_label(), "3 / 3");
+
+        let single = compute_single_file_nav(&["only.rs"], "only.rs");
+        assert_eq!(single.position, Some(0));
+        assert_eq!(single.prev_path, None);
+        assert_eq!(single.next_path, None);
+        assert_eq!(single.position_label(), "1 / 1");
+    }
+
+    #[test]
+    fn computes_nav_state_for_missing_and_empty_lists() {
+        let files = ["src/a.rs", "src/b.rs"];
+        let missing = compute_single_file_nav(&files, "src/missing.rs");
+        assert_eq!(missing.position, None);
+        assert_eq!(missing.total, 2);
+        assert_eq!(missing.prev_path, None);
+        assert_eq!(missing.next_path, None);
+        assert_eq!(missing.position_label(), "— / 2");
+
+        let empty: [&str; 0] = [];
+        let none = compute_single_file_nav(&empty, "src/a.rs");
+        assert_eq!(none.position, None);
+        assert_eq!(none.total, 0);
+        assert_eq!(none.prev_path, None);
+        assert_eq!(none.next_path, None);
+        assert_eq!(none.position_label(), "— / 0");
     }
 }

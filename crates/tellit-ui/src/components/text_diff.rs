@@ -6,46 +6,35 @@ pub(crate) mod expanded;
 pub(crate) mod split;
 pub(crate) mod word_highlight;
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use leptos::ev;
 use leptos::prelude::*;
+use leptos::task::spawn_local;
 use tellit_types::{
     CommentSide, DiffFile, DiffLine, DiffLineKind, FileStatus, JjCommentThread, LineRangeSpec,
 };
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::JsFuture;
 
 use crate::components::comments::{
     CommentComposer, CommentReplyEvent, CommentSubmitEvent, CommentThreadCard,
 };
 use crate::components::file_list::status_badge_class;
 use crate::components::image_diff::ImageDiffBody;
-use crate::components::keyboard::CursorPosition;
 use crate::components::markdown_diff::{MarkdownPreviewBody, MarkdownTab};
 use crate::state::{self, DiffViewMode};
 
 use expanded::{
-    DEFAULT_EXPAND_COUNT, ExpandDirection, ExpandedLinesMap, MergedChunk, merge_chunks_for_file,
+    DEFAULT_EXPAND_COUNT, ExpandDirection, ExpandedLinesMap, FileExpandedState, MergedChunk,
+    merge_chunks_for_file,
 };
 use split::pair_side_by_side_rows;
-use word_highlight::CodeLineContent;
+use word_highlight::render_code_line;
 
 const COMMIT_MESSAGE_PATH: &str = "Commit Message";
-
-/// Trigger signal emitted when the user presses `c` on a keyboard-focused diff line.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyboardCommentTrigger {
-    /// Monotonic counter so repeated triggers on the same line still open the composer.
-    pub seq: u64,
-    /// Target file path of the focused row.
-    pub file_path: String,
-    /// Diff side (`Old` or `New`) of the focused row.
-    pub side: CommentSide,
-    /// 1-based line number of the focused row.
-    pub line_num: u32,
-}
 
 /// Event emitted when the user submits a new inline or file-level review comment.
 #[derive(Clone)]
@@ -75,18 +64,48 @@ pub struct ExpandLinesEvent {
     pub count: u32,
 }
 
+/// Active line-range drag state for one diff card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LineSelectionDrag {
-    side: CommentSide,
-    anchor_line: u32,
-    current_line: u32,
+pub struct LineSelectionDrag {
+    /// Diff side (`Old` or `New`) anchored by the drag start.
+    pub side: CommentSide,
+    /// 1-based line number where dragging began.
+    pub anchor_line: u32,
+    /// 1-based line number currently under the pointer.
+    pub current_line: u32,
 }
 
+/// Active inline comment composer anchored to a line range inside one diff card.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ActiveComposer {
+pub struct ActiveComposer {
+    /// Diff side (`Old` or `New`) where the comment attaches.
+    pub side: CommentSide,
+    /// Inclusive 1-based line range covered by the comment.
+    pub range: LineRangeSpec,
+    /// Extracted source code lines shown as context inside the composer.
+    pub code_snippet: String,
+}
+
+/// Parses a `data-gutter-side` DOM attribute value (`"old"` / `"new"`).
+#[must_use]
+pub fn parse_comment_side(raw: &str) -> Option<CommentSide> {
+    match raw {
+        "old" => Some(CommentSide::Old),
+        "new" => Some(CommentSide::New),
+        _ => None,
+    }
+}
+
+/// Extracts the newline-joined source snippet for `range` on `side` across `file` and its expanded lines.
+#[must_use]
+pub fn extract_snippet_for_file(
+    file: &Arc<DiffFile>,
+    exp_state: Option<&FileExpandedState>,
     side: CommentSide,
     range: LineRangeSpec,
-    code_snippet: String,
+) -> String {
+    let merged = merge_chunks_for_file(file, exp_state);
+    extract_snippet_across_merged(&merged, side, range)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,17 +122,79 @@ enum SplitAlign {
     Full,
 }
 
+/// Pre-indexed inline review threads for `O(1)` per-row placement lookup.
+#[derive(Debug, Default)]
+struct ThreadIndex {
+    by_side_and_end_line: HashMap<(CommentSide, u32), Vec<JjCommentThread>>,
+}
+
+impl ThreadIndex {
+    fn from_threads(threads: &[JjCommentThread]) -> Self {
+        let mut by_side_and_end_line: HashMap<(CommentSide, u32), Vec<JjCommentThread>> =
+            HashMap::new();
+        for thread in threads {
+            if let Some(range) = thread.line_range {
+                by_side_and_end_line
+                    .entry((thread.side, range.end))
+                    .or_default()
+                    .push(thread.clone());
+            }
+        }
+        Self {
+            by_side_and_end_line,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_side_and_end_line.is_empty()
+    }
+
+    fn at(&self, side: CommentSide, end_line: u32) -> &[JjCommentThread] {
+        self.by_side_and_end_line
+            .get(&(side, end_line))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    fn unified_line_threads<'a>(&'a self, line: &DiffLine) -> Vec<&'a JjCommentThread> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        let mut matched = Vec::new();
+        let mut seen_ids: HashSet<&'a str> = HashSet::new();
+
+        let (primary_num, primary_side) = if line.kind == DiffLineKind::Delete {
+            (line.old_line_number, CommentSide::Old)
+        } else {
+            (line.new_line_number, CommentSide::New)
+        };
+
+        if let Some(num) = primary_num {
+            for thread in self.at(primary_side, num) {
+                if seen_ids.insert(thread.id.as_str()) {
+                    matched.push(thread);
+                }
+            }
+        }
+
+        if line.kind == DiffLineKind::Context
+            && let Some(old_num) = line.old_line_number
+        {
+            for thread in self.at(CommentSide::Old, old_num) {
+                if seen_ids.insert(thread.id.as_str()) {
+                    matched.push(thread);
+                }
+            }
+        }
+
+        matched
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ChunkRenderCtx {
     is_commit_msg: bool,
-    file_index: usize,
-    active_cursor: Signal<Option<CursorPosition>>,
-    highlighted_word: Signal<Option<String>>,
-    on_toggle_word: Callback<String>,
-    drag_state: RwSignal<Option<LineSelectionDrag>>,
-    selection_anchor: RwSignal<Option<(CommentSide, u32)>>,
+    composer_selector: StoredValue<Selector<Option<(CommentSide, u32)>>, LocalStorage>,
     active_composer: RwSignal<Option<ActiveComposer>>,
-    on_open_in_editor: Callback<(String, usize)>,
     on_create_thread: Callback<CreateThreadEvent>,
     on_reply: Callback<CommentReplyEvent>,
     on_toggle_resolve: Callback<(String, bool)>,
@@ -122,22 +203,20 @@ struct ChunkRenderCtx {
 /// Interactive diff card supporting Text, Markdown, Image views, expansion, drag selection, and threads.
 #[component]
 pub fn TextDiffCard(
-    file: DiffFile,
-    file_index: usize,
-    base_commit: String,
-    target_commit: String,
+    path: String,
+    #[prop(into)] file: Signal<Arc<DiffFile>>,
+    #[prop(into)] file_index: Signal<usize>,
+    #[prop(into)] commits: Signal<(String, String)>,
+    drag_state: RwSignal<Option<LineSelectionDrag>>,
+    active_composer: RwSignal<Option<ActiveComposer>>,
+    md_tab: RwSignal<MarkdownTab>,
     #[prop(into)] all_threads: Signal<Vec<JjCommentThread>>,
     #[prop(into)] reviewed_files: Signal<HashSet<String>>,
     #[prop(into)] collapsed_files: Signal<HashSet<String>>,
     #[prop(into)] diff_mode: Signal<DiffViewMode>,
     #[prop(into)] show_resolved_inline: Signal<bool>,
-    #[prop(into)] highlighted_word: Signal<Option<String>>,
     #[prop(into)] expanded_lines: Signal<ExpandedLinesMap>,
     #[prop(into)] expand_loading: Signal<bool>,
-    #[prop(into)] active_cursor: Signal<Option<CursorPosition>>,
-    #[prop(into)] keyboard_comment_trigger: Signal<Option<KeyboardCommentTrigger>>,
-    on_hover_file: Callback<Option<usize>>,
-    on_toggle_word: Callback<String>,
     on_toggle_viewed: Callback<String>,
     on_toggle_collapse: Callback<String>,
     on_open_in_editor: Callback<(String, usize)>,
@@ -147,138 +226,162 @@ pub fn TextDiffCard(
     on_reply: Callback<CommentReplyEvent>,
     on_toggle_resolve: Callback<(String, bool)>,
 ) -> impl IntoView {
-    let file = Arc::new(file);
-    let path = file.path.clone();
     let is_commit_msg = path == COMMIT_MESSAGE_PATH;
     let is_md = !is_commit_msg && state::is_markdown_file(&path);
     let is_img = !is_commit_msg && state::is_image_file(&path);
-    let md_tab = RwSignal::new(MarkdownTab::Preview);
-    let is_expandable = !is_commit_msg
-        && !is_img
-        && file.status != FileStatus::Added
-        && file.status != FileStatus::Deleted;
-    let has_chunks = !file.chunks.is_empty();
-    let hunks_count = file.chunks.len();
-    let is_generated = file.is_generated;
     let path_for_id = state::file_element_id(&path);
+    let path_attr = path.clone();
     let path_toggle_collapse = path.clone();
     let path_toggle_viewed = path.clone();
     let path_for_viewed = path.clone();
     let path_for_collapsed = path.clone();
     let path_for_threads = path.clone();
-    let path_for_kbd = path.clone();
+    let path_for_title = path.clone();
+    let path_for_edit = path.clone();
+    let path_for_exp = path.clone();
+    let path_for_body = path.clone();
 
-    let is_viewed_sig = Signal::derive(move || reviewed_files.get().contains(&path_for_viewed));
+    let is_viewed_sig =
+        Memo::new(move |_| reviewed_files.with(|set| set.contains(&path_for_viewed)));
     let is_collapsed_sig =
-        Signal::derive(move || collapsed_files.get().contains(&path_for_collapsed));
-
-    let header_title = match file.old_path {
-        Some(ref old) => alloc::format!("{old} -> {path}"),
-        None => path.clone(),
-    };
+        Memo::new(move |_| collapsed_files.with(|set| set.contains(&path_for_collapsed)));
 
     let whole_file_composing = RwSignal::new(false);
-    let drag_state = RwSignal::new(Option::<LineSelectionDrag>::None);
-    let selection_anchor = RwSignal::new(Option::<(CommentSide, u32)>::None);
-    let active_composer = RwSignal::new(Option::<ActiveComposer>::None);
+    let card_ref = NodeRef::<leptos::html::Article>::new();
+    let marked_selection_els = StoredValue::new_local(Vec::<web_sys::Element>::new());
+    let selection_sync_pending = StoredValue::new_local(false);
 
-    let file_for_mouseup = StoredValue::new_local(Arc::clone(&file));
-    let file_for_kbd = StoredValue::new_local(Arc::clone(&file));
-    let file_for_prefetch = StoredValue::new_local(Arc::clone(&file));
+    let visible_threads = Memo::new(move |_| {
+        let show_resolved = show_resolved_inline.get();
+        all_threads.with(|list| {
+            list.iter()
+                .filter(|t| t.file_path == path_for_threads && (show_resolved || !t.resolved))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    });
+    let total_thread_count = Memo::new(move |_| visible_threads.with(Vec::len));
 
-    Effect::new(move |_| {
-        let Some(trig) = keyboard_comment_trigger.get() else {
-            return;
-        };
-        if trig.file_path != path_for_kbd {
-            return;
-        }
-        if is_md {
-            md_tab.set(MarkdownTab::Code);
-        }
-        let range = LineRangeSpec {
-            start: trig.line_num,
-            end: trig.line_num,
-        };
-        let snippet = file_for_kbd.with_value(|f| {
-            let exp_map = expanded_lines.get_untracked();
-            let merged = merge_chunks_for_file(f, exp_map.get(&f.path));
-            extract_snippet_across_merged(&merged, trig.side, range)
-        });
-        active_composer.set(Some(ActiveComposer {
-            side: trig.side,
-            range,
-            code_snippet: snippet,
-        }));
+    let file_exp_memo =
+        Memo::new(move |_| expanded_lines.with(|map| map.get(&path_for_exp).cloned()));
+    let merged_chunks_memo = Memo::new(move |_| {
+        Arc::new(file.with(|f| file_exp_memo.with(|exp| merge_chunks_for_file(f, exp.as_ref()))))
     });
 
-    let mouseup_handle = window_event_listener(ev::mouseup, move |_| {
-        let Some(drag) = drag_state.get_untracked() else {
-            return;
-        };
-        drag_state.set(None);
-        let min = drag.anchor_line.min(drag.current_line);
-        let max = drag.anchor_line.max(drag.current_line);
-        let range = LineRangeSpec {
-            start: min,
-            end: max,
-        };
-        let snippet = file_for_mouseup.with_value(|f| {
-            let exp_map = expanded_lines.get_untracked();
-            let merged = merge_chunks_for_file(f, exp_map.get(&f.path));
-            extract_snippet_across_merged(&merged, drag.side, range)
-        });
-        active_composer.set(Some(ActiveComposer {
-            side: drag.side,
-            range,
-            code_snippet: snippet,
-        }));
-    });
-    on_cleanup(move || mouseup_handle.remove());
+    let composer_selector = StoredValue::new_local(Selector::new(move || {
+        active_composer.with(|c| c.as_ref().map(|c| (c.side, c.range.end)))
+    }));
 
     Effect::new(move |_| {
-        if is_expandable && has_chunks && !is_collapsed_sig.get() {
-            file_for_prefetch.with_value(|f| on_prefetch_line_count.run(Arc::clone(f)));
+        let can_expand = file.with(|f| {
+            !is_commit_msg
+                && !is_img
+                && f.status != FileStatus::Added
+                && f.status != FileStatus::Deleted
+                && !f.chunks.is_empty()
+        });
+        let has_line_counts = file_exp_memo.with(|exp| {
+            exp.as_ref()
+                .is_some_and(|e| e.old_total_lines.is_some() || e.new_total_lines.is_some())
+        });
+        if can_expand && !is_collapsed_sig.get() && !has_line_counts {
+            on_prefetch_line_count.run(file.get_untracked());
         }
+    });
+
+    // Apply drag/composer highlight classes directly to matching rows/cells on this card,
+    // avoiding per-row reactive closures across thousands of diff lines.
+    Effect::new(move |_| {
+        let drag = drag_state.get();
+        let comp = active_composer.get();
+
+        if drag.is_none() && comp.is_none() {
+            marked_selection_els.update_value(|els| {
+                for el in els.drain(..) {
+                    let list = el.class_list();
+                    let _ = list.remove_2("line-row--drag-selected", "line-row--comment-selected");
+                }
+            });
+            return;
+        }
+
+        // Only subscribe to layout/table re-renders while a drag or composer is active on this card.
+        if is_collapsed_sig.get() {
+            marked_selection_els.update_value(|els| {
+                for el in els.drain(..) {
+                    let list = el.class_list();
+                    let _ = list.remove_2("line-row--drag-selected", "line-row--comment-selected");
+                }
+            });
+            return;
+        }
+        diff_mode.track();
+        merged_chunks_memo.track();
+
+        if selection_sync_pending.get_value() {
+            return;
+        }
+        selection_sync_pending.set_value(true);
+        spawn_local(async move {
+            let _ = JsFuture::from(js_sys::Promise::resolve(&JsValue::UNDEFINED)).await;
+            let _ = selection_sync_pending.try_set_value(false);
+
+            let _ = marked_selection_els.try_update_value(|els| {
+                for el in els.drain(..) {
+                    let list = el.class_list();
+                    let _ = list.remove_2("line-row--drag-selected", "line-row--comment-selected");
+                }
+            });
+
+            let drag_now = drag_state.try_get_untracked().flatten();
+            let comp_now = active_composer.try_get_untracked().flatten();
+            if drag_now.is_none() && comp_now.is_none() {
+                return;
+            }
+            if is_collapsed_sig.try_get_untracked().unwrap_or(true) {
+                return;
+            }
+            let Some(mode_now) = diff_mode.try_get_untracked() else {
+                return;
+            };
+            let Some(article) = card_ref.get_untracked() else {
+                return;
+            };
+            let article_el: &web_sys::Element = article.as_ref();
+            let mut newly_marked = Vec::new();
+            apply_selection_classes_to_card(
+                article_el,
+                mode_now,
+                drag_now,
+                comp_now.as_ref(),
+                &mut newly_marked,
+            );
+            let _ = marked_selection_els.try_set_value(newly_marked);
+        });
     });
 
     let chunk_ctx = ChunkRenderCtx {
         is_commit_msg,
-        file_index,
-        active_cursor,
-        highlighted_word,
-        on_toggle_word,
-        drag_state,
-        selection_anchor,
+        composer_selector,
         active_composer,
-        on_open_in_editor,
         on_create_thread,
         on_reply,
         on_toggle_resolve,
     };
 
-    let visible_threads = Signal::derive(move || {
-        let show_resolved = show_resolved_inline.get();
-        all_threads
-            .get()
-            .into_iter()
-            .filter(|t| t.file_path == path_for_threads && (show_resolved || !t.resolved))
-            .collect::<Vec<_>>()
-    });
-
-    let total_thread_count = Signal::derive(move || visible_threads.get().len());
-    let file_for_body = Arc::clone(&file);
+    let show_code = Memo::new(move |_| !is_md || md_tab.get() == MarkdownTab::Code);
 
     view! {
         <article
+            node_ref=card_ref
             id=path_for_id
+            data-file=path_attr
+            data-file-idx=move || file_index.get().to_string()
             class=move || if is_viewed_sig.get() {
                 "diff-card diff-card--viewed"
             } else {
                 "diff-card"
             }
-            on:mouseenter=move |_| on_hover_file.run(Some(file_index))
-            on:mouseleave=move |_| on_hover_file.run(None)
         >
             <header class="diff-card__header">
                 <div class="diff-card__left">
@@ -291,9 +394,16 @@ pub fn TextDiffCard(
                     >
                         {move || if is_collapsed_sig.get() { "▸" } else { "▾" }}
                     </button>
-                    <span class=status_badge_class(file.status)>{file.status.short_code()}</span>
-                    <span class="diff-card__path">{header_title}</span>
-                    {file.is_generated.then(|| view! {
+                    <span class=move || file.with(|f| status_badge_class(f.status))>
+                        {move || file.with(|f| f.status.short_code())}
+                    </span>
+                    <span class="diff-card__path">
+                        {move || file.with(|f| match f.old_path {
+                            Some(ref old) => alloc::format!("{old} -> {path_for_title}"),
+                            None => path_for_title.clone(),
+                        })}
+                    </span>
+                    {move || file.with(|f| f.is_generated).then(|| view! {
                         <span class="pill-tag">"generated"</span>
                     })}
                     {move || {
@@ -345,8 +455,8 @@ pub fn TextDiffCard(
                         "+ Comment"
                     </button>
 
-                    {(!is_commit_msg && file.status != FileStatus::Deleted).then(|| {
-                        let edit_path = path.clone();
+                    {move || (!is_commit_msg && file.with(|f| f.status != FileStatus::Deleted)).then(|| {
+                        let edit_path = path_for_edit.clone();
                         view! {
                             <button
                                 type="button"
@@ -360,8 +470,8 @@ pub fn TextDiffCard(
                     })}
 
                     <span class="diff-totals">
-                        <span class="stat-add">{alloc::format!("+{}", file.additions)}</span>
-                        <span class="stat-del">{alloc::format!("-{}", file.deletions)}</span>
+                        <span class="stat-add">{move || alloc::format!("+{}", file.with(|f| f.additions))}</span>
+                        <span class="stat-del">{move || alloc::format!("-{}", file.with(|f| f.deletions))}</span>
                     </span>
 
                     <label class="viewed-toggle">
@@ -377,6 +487,7 @@ pub fn TextDiffCard(
             </header>
 
             {move || if is_collapsed_sig.get() {
+                let (hunks_count, is_generated) = file.with(|f| (f.chunks.len(), f.is_generated));
                 (hunks_count > 0).then(|| view! {
                     <div class="diff-card__collapsed-note">
                         {if is_generated {
@@ -387,11 +498,8 @@ pub fn TextDiffCard(
                     </div>
                 }).into_any()
             } else {
-                let file_snapshot = Arc::clone(&file_for_body);
-                let base_for_body = base_commit.clone();
-                let target_for_body = target_commit.clone();
-                let path_for_whole_submit = file_snapshot.path.clone();
-                let path_for_line_submit = file_snapshot.path.clone();
+                let path_for_whole_submit = path_for_body.clone();
+                let path_for_line_submit = path_for_body.clone();
 
                 view! {
                     <div class="diff-card__body diff-card__body--flush">
@@ -432,42 +540,39 @@ pub fn TextDiffCard(
                             view! {
                                 <>
                                     {move || render_file_threads_section(visible_threads.get(), on_reply, on_toggle_resolve)}
-                                    <ImageDiffBody
-                                        file=(*file_snapshot).clone()
-                                        base_commit=base_for_body
-                                        target_commit=target_for_body
-                                    />
+                                    {move || {
+                                        let file_arc = file.get();
+                                        let (base_c, target_c) = commits.get();
+                                        view! {
+                                            <ImageDiffBody
+                                                file=file_arc
+                                                base_commit=base_c
+                                                target_commit=target_c
+                                            />
+                                        }
+                                    }}
                                 </>
                             }.into_any()
                         } else {
-                            let path_for_exp = file_snapshot.path.clone();
-                            let file_for_chunks = StoredValue::new_local(Arc::clone(&file_snapshot));
-                            let file_exp_memo = Memo::new(move |_| {
-                                expanded_lines.with(|map| map.get(&path_for_exp).cloned())
-                            });
-                            let merged_chunks_memo = Memo::new(move |_| {
-                                Arc::new(file_for_chunks.with_value(|f| {
-                                    file_exp_memo.with(|exp| merge_chunks_for_file(f, exp.as_ref()))
-                                }))
-                            });
-                            let show_code = Memo::new(move |_| !is_md || md_tab.get() == MarkdownTab::Code);
-
                             let md_preview_panel = is_md.then(|| {
-                                let md_file = Arc::clone(&file_snapshot);
-                                let md_base = base_for_body.clone();
-                                let md_target = target_for_body.clone();
                                 view! {
                                     <div style:display=move || show_code.get().then_some("none")>
                                         {move || (!show_code.get()).then(|| {
                                             render_file_threads_section(visible_threads.get(), on_reply, on_toggle_resolve)
                                         })}
-                                        <MarkdownPreviewBody
-                                            file=md_file
-                                            merged_chunks=merged_chunks_memo
-                                            base_commit=md_base
-                                            target_commit=md_target
-                                            active_tab=md_tab
-                                        />
+                                        {move || {
+                                            let md_file = file.get();
+                                            let (md_base, md_target) = commits.get();
+                                            view! {
+                                                <MarkdownPreviewBody
+                                                    file=md_file
+                                                    merged_chunks=merged_chunks_memo
+                                                    base_commit=md_base
+                                                    target_commit=md_target
+                                                    active_tab=md_tab
+                                                />
+                                            }
+                                        }}
                                     </div>
                                 }
                             });
@@ -477,23 +582,34 @@ pub fn TextDiffCard(
                                     {md_preview_panel}
                                     {move || {
                                         if !show_code.get() {
+                                            composer_selector.with_value(Selector::clear);
                                             return ().into_any();
                                         }
 
-                                        let active_threads = visible_threads.get();
                                         let merged_chunks = merged_chunks_memo.get();
                                         let mode = diff_mode.get();
+                                        let file_snapshot = file.get_untracked();
+                                        // Evict stale subscriber entries from prior mode or chunk renders.
+                                        composer_selector.with_value(Selector::clear);
 
-                                        let mut placed_ids = HashSet::new();
-                                        for mc in merged_chunks.iter() {
-                                            collect_placed_thread_ids(mc, &active_threads, mode, &mut placed_ids);
-                                        }
-
-                                        let unplaced: Vec<JjCommentThread> = active_threads
-                                            .iter()
-                                            .filter(|t| !placed_ids.contains(&t.id))
-                                            .cloned()
-                                            .collect();
+                                        let (thread_index, unplaced) = visible_threads.with(|active_threads| {
+                                            let idx = ThreadIndex::from_threads(active_threads);
+                                            if active_threads.is_empty() {
+                                                return (idx, Vec::new());
+                                            }
+                                            let mut placed_ids = HashSet::new();
+                                            if !idx.is_empty() {
+                                                for mc in merged_chunks.iter() {
+                                                    collect_placed_thread_ids(mc, &idx, mode, &mut placed_ids);
+                                                }
+                                            }
+                                            let unplaced = active_threads
+                                                .iter()
+                                                .filter(|t| !placed_ids.contains(t.id.as_str()))
+                                                .cloned()
+                                                .collect::<Vec<_>>();
+                                            (idx, unplaced)
+                                        });
 
                                         let chunk_count = merged_chunks.len();
                                         let path_clone = file_snapshot.path.clone();
@@ -522,9 +638,6 @@ pub fn TextDiffCard(
                                                             let file_top = Arc::clone(&file_snapshot);
                                                             let file_mid = Arc::clone(&file_snapshot);
                                                             let file_bot = Arc::clone(&file_snapshot);
-                                                            let fpath = path_clone.clone();
-                                                            let lsubmit = path_for_line_submit.clone();
-                                                            let t_list = active_threads.clone();
 
                                                             view! {
                                                                 <div class="diff-chunk-wrapper">
@@ -595,17 +708,17 @@ pub fn TextDiffCard(
                                                                     {if mode == DiffViewMode::Split {
                                                                         render_split_chunk(
                                                                             mc,
-                                                                            &fpath,
-                                                                            &t_list,
-                                                                            &lsubmit,
+                                                                            &path_clone,
+                                                                            &thread_index,
+                                                                            &path_for_line_submit,
                                                                             chunk_ctx,
                                                                         ).into_any()
                                                                     } else {
                                                                         render_unified_chunk(
                                                                             mc,
-                                                                            &fpath,
-                                                                            &t_list,
-                                                                            &lsubmit,
+                                                                            &path_clone,
+                                                                            &thread_index,
+                                                                            &path_for_line_submit,
                                                                             chunk_ctx,
                                                                         ).into_any()
                                                                     }}
@@ -652,6 +765,77 @@ pub fn TextDiffCard(
                 }.into_any()
             }}
         </article>
+    }
+}
+
+fn apply_selection_classes_to_card(
+    article_el: &web_sys::Element,
+    mode: DiffViewMode,
+    drag: Option<LineSelectionDrag>,
+    composer: Option<&ActiveComposer>,
+    marked: &mut Vec<web_sys::Element>,
+) {
+    match mode {
+        DiffViewMode::Unified => {
+            let Ok(rows) = article_el.query_selector_all("tr[data-old-line], tr[data-new-line]")
+            else {
+                return;
+            };
+            for idx in 0..rows.length() {
+                let Some(node) = rows.item(idx) else {
+                    continue;
+                };
+                let Ok(el) = node.dyn_into::<web_sys::Element>() else {
+                    continue;
+                };
+                let old_num = el
+                    .get_attribute("data-old-line")
+                    .and_then(|s| s.parse::<u32>().ok());
+                let new_num = el
+                    .get_attribute("data-new-line")
+                    .and_then(|s| s.parse::<u32>().ok());
+
+                let sel_new = selection_class(drag, composer, CommentSide::New, new_num);
+                let sel = if sel_new.is_empty() {
+                    selection_class(drag, composer, CommentSide::Old, old_num)
+                } else {
+                    sel_new
+                };
+                if !sel.is_empty() {
+                    let _ = el.class_list().add_1(sel);
+                    marked.push(el);
+                }
+            }
+        }
+        DiffViewMode::Split => {
+            let Ok(cells) = article_el.query_selector_all("td[data-split-side][data-split-line]")
+            else {
+                return;
+            };
+            for idx in 0..cells.length() {
+                let Some(node) = cells.item(idx) else {
+                    continue;
+                };
+                let Ok(el) = node.dyn_into::<web_sys::Element>() else {
+                    continue;
+                };
+                let Some(side) = el
+                    .get_attribute("data-split-side")
+                    .as_deref()
+                    .and_then(parse_comment_side)
+                else {
+                    continue;
+                };
+                let line_num = el
+                    .get_attribute("data-split-line")
+                    .and_then(|s| s.parse::<u32>().ok());
+                let sel = selection_class(drag, composer, side, line_num);
+                if !sel.is_empty() {
+                    let _ = el.class_list().add_1(sel);
+                    marked.push(el);
+                }
+            }
+        }
     }
 }
 
@@ -788,29 +972,31 @@ fn ExpandBar(
     }
 }
 
+fn side_attr(side: CommentSide) -> &'static str {
+    match side {
+        CommentSide::Old => "old",
+        CommentSide::New => "new",
+    }
+}
+
 fn render_line_actions(
     side: CommentSide,
     line_num: u32,
     editor_line: Option<u32>,
-    edit_path: String,
-    lines_for_drag: Arc<[DiffLine]>,
-    ctx: ChunkRenderCtx,
 ) -> impl IntoView {
+    let side_str = side_attr(side);
+    let line_str = line_num.to_string();
     view! {
         <span class="diff-line-actions">
             {editor_line.map(|line_n| {
+                let edit_line_str = line_n.to_string();
                 view! {
                     <button
                         type="button"
                         class="line-action-btn"
                         title="Open line in external editor"
-                        on:mousedown=move |ev| ev.stop_propagation()
-                        on:click=move |ev| {
-                            ev.stop_propagation();
-                            if let Ok(line_usize) = usize::try_from(line_n) {
-                                ctx.on_open_in_editor.run((edit_path.clone(), line_usize));
-                            }
-                        }
+                        data-line-action="open-editor"
+                        data-action-line=edit_line_str
                     >
                         "↗"
                     </button>
@@ -820,17 +1006,9 @@ fn render_line_actions(
                 type="button"
                 class="line-action-btn line-action-btn--comment"
                 title="Comment on line (Shift+click or drag for range)"
-                on:mousedown=move |ev: ev::MouseEvent| {
-                    handle_gutter_mousedown(
-                        &ev,
-                        side,
-                        line_num,
-                        &lines_for_drag,
-                        ctx.drag_state,
-                        ctx.selection_anchor,
-                        ctx.active_composer,
-                    );
-                }
+                data-line-action="comment"
+                data-gutter-side=side_str
+                data-gutter-line=line_str
             >
                 "+"
             </button>
@@ -841,17 +1019,21 @@ fn render_line_actions(
 fn render_unified_chunk(
     mc: &MergedChunk,
     file_path: &str,
-    threads: &[JjCommentThread],
+    thread_index: &ThreadIndex,
     submit_file_path: &str,
     ctx: ChunkRenderCtx,
 ) -> impl IntoView {
-    let all_lines: Arc<[DiffLine]> = Arc::from(mc.lines.as_slice());
-
     view! {
         <table class="diff-table diff-table--unified">
+            <colgroup>
+                <col class="col-num" />
+                <col class="col-num" />
+                <col class="col-code" />
+            </colgroup>
             <tbody>
-                {mc.lines.iter().enumerate().map(|(idx, line)| {
-                    let is_expanded = mc.expanded_line_flags.get(idx).copied().unwrap_or(false);
+                {(0..mc.lines.len()).filter_map(|idx| {
+                    let line = mc.line(idx)?;
+                    let is_expanded = mc.is_line_expanded(idx);
                     let row_class_base = unified_row_class(line.kind, is_expanded);
                     let default_side = if line.kind == DiffLineKind::Delete {
                         CommentSide::Old
@@ -863,12 +1045,7 @@ fn render_unified_chunk(
                         CommentSide::New => line.new_line_number.or(line.old_line_number),
                     };
 
-                    let line_threads = unified_line_threads(line, threads);
-                    let lines_for_old = Arc::clone(&all_lines);
-                    let lines_for_new = Arc::clone(&all_lines);
-                    let lines_for_plus = Arc::clone(&all_lines);
-                    let lines_for_snippet = Arc::clone(&all_lines);
-                    let edit_path = String::from(file_path);
+                    let line_threads = thread_index.unified_line_threads(line);
                     let editor_line = (!ctx.is_commit_msg && line.kind != DiffLineKind::Delete)
                         .then(|| line.new_line_number.or(line.old_line_number))
                         .flatten();
@@ -877,184 +1054,140 @@ fn render_unified_chunk(
                     let kind = line.kind;
                     let sigil = line_sigil(kind);
                     let sigil_class = line_sigil_class(kind);
-                    let line_src = mc.line_sources.get(idx).copied().flatten();
+                    let line_src = mc.line_source(idx);
                     let row_id = line_src.map(|(oc, ol)| {
                         state::diff_line_element_id(file_path, oc, ol, default_side)
                     });
 
-                    let row_class = move || {
-                        let drag = ctx.drag_state.get();
-                        let comp = ctx.active_composer.get();
-                        let sel_new = if kind != DiffLineKind::Delete {
-                            selection_class(drag, comp.as_ref(), CommentSide::New, new_num)
-                        } else {
-                            ""
-                        };
-                        let sel = if sel_new.is_empty() && kind != DiffLineKind::Add {
-                            selection_class(drag, comp.as_ref(), CommentSide::Old, old_num)
-                        } else {
-                            sel_new
-                        };
-                        let is_kbd = line_src.is_some_and(|(oc, ol)| {
-                            ctx.active_cursor.get().is_some_and(|cur| {
-                                cur.file_index == ctx.file_index
-                                    && cur.chunk_index == oc
-                                    && cur.line_index == ol
-                            })
-                        });
-                        let kbd_cls = if is_kbd { "diff-row--kbd-active" } else { "" };
-                        combine_classes(row_class_base, sel, kbd_cls)
-                    };
+                    let data_old_line = (kind != DiffLineKind::Add)
+                        .then_some(old_num)
+                        .flatten()
+                        .map(|n| n.to_string());
+                    let data_new_line = (kind != DiffLineKind::Delete)
+                        .then_some(new_num)
+                        .flatten()
+                        .map(|n| n.to_string());
+                    let old_gutter_line = old_num.map(|n| n.to_string());
+                    let new_gutter_line = new_num.map(|n| n.to_string());
 
-                    let composer_here = move || {
-                        ctx.active_composer.get().filter(|comp| match comp.side {
-                            CommentSide::Old => {
-                                kind != DiffLineKind::Add && old_num == Some(comp.range.end)
-                            }
-                            CommentSide::New => {
-                                kind != DiffLineKind::Delete && new_num == Some(comp.range.end)
-                            }
-                        })
+                    let old_gutter_text = old_gutter_line.clone().unwrap_or_default();
+                    let new_gutter_text = new_gutter_line.clone().unwrap_or_default();
+
+                    let is_composer_here = move || {
+                        (kind != DiffLineKind::Delete
+                            && new_num.is_some_and(|n| {
+                                ctx.composer_selector
+                                    .with_value(|sel| sel.selected(&Some((CommentSide::New, n))))
+                            }))
+                            || (kind != DiffLineKind::Add
+                                && old_num.is_some_and(|n| {
+                                    ctx.composer_selector.with_value(|sel| {
+                                        sel.selected(&Some((CommentSide::Old, n)))
+                                    })
+                                }))
                     };
                     let submit_path = String::from(submit_file_path);
 
-                    view! {
+                    let thread_views = line_threads
+                        .into_iter()
+                        .map(|thread| {
+                            let snippet = thread.line_range.map(|lr| {
+                                extract_chunk_line_range_snippet(mc, thread.side, lr)
+                            });
+                            view! {
+                                <tr class="diff-inline-slot">
+                                    <td colspan=3 class="diff-inline-cell">
+                                        <div class="diff-inline-inner">
+                                            <CommentThreadCard
+                                                thread=thread.clone()
+                                                code_snippet=snippet
+                                                on_reply=ctx.on_reply
+                                                on_toggle_resolve=ctx.on_toggle_resolve
+                                            />
+                                        </div>
+                                    </td>
+                                </tr>
+                            }
+                        })
+                        .collect_view();
+
+                    Some(view! {
                         <>
                             <tr
                                 id=row_id
-                                class=row_class
-                                on:mouseenter=move |_| {
-                                    if let Some(drag) = ctx.drag_state.get_untracked()
-                                        && let Some(ln) = match drag.side {
-                                            CommentSide::Old => old_num,
-                                            CommentSide::New => new_num,
-                                        }
-                                    {
-                                        ctx.drag_state.set(Some(LineSelectionDrag {
-                                            current_line: ln,
-                                            ..drag
-                                        }));
-                                    }
-                                }
+                                class=row_class_base
+                                data-old-line=data_old_line
+                                data-new-line=data_new_line
                             >
                                 <td
                                     class="diff-gutter diff-gutter--num"
                                     title={old_num.map(|_| "Click or drag to comment on old line")}
-                                    on:mousedown=move |ev: ev::MouseEvent| {
-                                        if let Some(ln) = old_num {
-                                            handle_gutter_mousedown(
-                                                &ev,
-                                                CommentSide::Old,
-                                                ln,
-                                                &lines_for_old,
-                                                ctx.drag_state,
-                                                ctx.selection_anchor,
-                                                ctx.active_composer,
-                                            );
-                                        }
-                                    }
+                                    data-gutter-side=old_num.map(|_| "old")
+                                    data-gutter-line=old_gutter_line
                                 >
-                                    {old_num.map_or_else(String::new, |n| n.to_string())}
+                                    {old_gutter_text}
                                 </td>
                                 <td
                                     class="diff-gutter diff-gutter--num diff-gutter--actions"
                                     title={new_num.map(|_| "Click or drag to comment on new line")}
-                                    on:mousedown=move |ev: ev::MouseEvent| {
-                                        if let Some(ln) = new_num {
-                                            handle_gutter_mousedown(
-                                                &ev,
-                                                CommentSide::New,
-                                                ln,
-                                                &lines_for_new,
-                                                ctx.drag_state,
-                                                ctx.selection_anchor,
-                                                ctx.active_composer,
-                                            );
-                                        }
-                                    }
+                                    data-gutter-side=new_num.map(|_| "new")
+                                    data-gutter-line=new_gutter_line
                                 >
-                                    <span>{new_num.map_or_else(String::new, |n| n.to_string())}</span>
+                                    <span>{new_gutter_text}</span>
                                     {default_num.map(|ln| {
-                                        render_line_actions(
-                                            default_side,
-                                            ln,
-                                            editor_line,
-                                            edit_path.clone(),
-                                            lines_for_plus.clone(),
-                                            ctx,
-                                        )
+                                        render_line_actions(default_side, ln, editor_line)
                                     })}
                                 </td>
                                 <td class="diff-code-cell">
                                     <div class="diff-code-inner">
                                         <span class=sigil_class>{sigil}</span>
-                                        <CodeLineContent
-                                            line_kind=line.kind
-                                            content=line.content.clone()
-                                            syntax_spans=line.syntax_spans.clone()
-                                            word_segments=line.word_diff.clone()
-                                            highlighted_word=ctx.highlighted_word
-                                            on_toggle_word=ctx.on_toggle_word
-                                        />
+                                        {render_code_line(line)}
                                     </div>
                                 </td>
                             </tr>
 
-                            {line_threads.into_iter().map(|thread| {
-                                let snippet = thread.line_range.map(|lr| {
-                                    extract_line_range_snippet(&lines_for_snippet, thread.side, lr)
-                                });
-                                view! {
-                                    <tr class="diff-inline-slot">
-                                        <td colspan=3 class="diff-inline-cell">
-                                            <div class="diff-inline-inner">
-                                                <CommentThreadCard
-                                                    thread=thread
-                                                    code_snippet=snippet
-                                                    on_reply=ctx.on_reply
-                                                    on_toggle_resolve=ctx.on_toggle_resolve
-                                                />
-                                            </div>
-                                        </td>
-                                    </tr>
-                                }
-                            }).collect_view()}
+                            {thread_views}
 
-                            {move || composer_here().map(|comp| {
-                                let sp = submit_path.clone();
-                                let title = format_composer_title(comp.range, comp.side);
-                                view! {
-                                    <tr class="diff-inline-slot">
-                                        <td colspan=3 class="diff-inline-cell">
-                                            <div class="diff-inline-inner">
-                                                <CommentComposer
-                                                    title=title
-                                                    selected_code=Some(comp.code_snippet.clone())
-                                                    on_submit=Callback::new(move |evt: CommentSubmitEvent| {
-                                                        let on_done = evt.on_done;
-                                                        let wrapped = Callback::new(move |res: Result<(), String>| {
-                                                            if res.is_ok() {
-                                                                let _ = ctx.active_composer.try_set(None);
-                                                            }
-                                                            on_done.run(res);
-                                                        });
-                                                        ctx.on_create_thread.run(CreateThreadEvent {
-                                                            file_path: sp.clone(),
-                                                            side: comp.side,
-                                                            line_range: Some(comp.range),
-                                                            body: evt.body,
-                                                            on_done: wrapped,
-                                                        });
-                                                    })
-                                                    on_cancel=Callback::new(move |()| ctx.active_composer.set(None))
-                                                />
-                                            </div>
-                                        </td>
-                                    </tr>
+                            {move || {
+                                if !is_composer_here() {
+                                    return None;
                                 }
-                            })}
+                                ctx.active_composer.get().map(|comp| {
+                                    let sp = submit_path.clone();
+                                    let title = format_composer_title(comp.range, comp.side);
+                                    view! {
+                                        <tr class="diff-inline-slot">
+                                            <td colspan=3 class="diff-inline-cell">
+                                                <div class="diff-inline-inner">
+                                                    <CommentComposer
+                                                        title=title
+                                                        selected_code=Some(comp.code_snippet.clone())
+                                                        on_submit=Callback::new(move |evt: CommentSubmitEvent| {
+                                                            let on_done = evt.on_done;
+                                                            let wrapped = Callback::new(move |res: Result<(), String>| {
+                                                                if res.is_ok() {
+                                                                    let _ = ctx.active_composer.try_set(None);
+                                                                }
+                                                                on_done.run(res);
+                                                            });
+                                                            ctx.on_create_thread.run(CreateThreadEvent {
+                                                                file_path: sp.clone(),
+                                                                side: comp.side,
+                                                                line_range: Some(comp.range),
+                                                                body: evt.body,
+                                                                on_done: wrapped,
+                                                            });
+                                                        })
+                                                        on_cancel=Callback::new(move |()| ctx.active_composer.set(None))
+                                                    />
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    }
+                                })
+                            }}
                         </>
-                    }
+                    })
                 }).collect_view()}
             </tbody>
         </table>
@@ -1064,12 +1197,11 @@ fn render_unified_chunk(
 fn render_split_chunk(
     mc: &MergedChunk,
     file_path: &str,
-    threads: &[JjCommentThread],
+    thread_index: &ThreadIndex,
     submit_file_path: &str,
     ctx: ChunkRenderCtx,
 ) -> impl IntoView {
-    let rows = pair_side_by_side_rows(&mc.lines, &mc.expanded_line_flags, &mc.line_sources);
-    let all_lines: Arc<[DiffLine]> = Arc::from(mc.lines.as_slice());
+    let rows = pair_side_by_side_rows(mc);
 
     view! {
         <table class="diff-table diff-table--split">
@@ -1081,243 +1213,176 @@ fn render_split_chunk(
             </colgroup>
             <tbody>
                 {rows.into_iter().map(|row| {
-                    let old_num = row.old_line.as_ref().and_then(|l| l.old_line_number);
-                    let new_num = row.new_line.as_ref().and_then(|l| l.new_line_number);
+                    let old_line = row.old_line_idx.and_then(|i| mc.line(i));
+                    let new_line = row.new_line_idx.and_then(|i| mc.line(i));
+                    let old_is_expanded = row.old_line_idx.is_some_and(|i| mc.is_line_expanded(i));
+                    let new_is_expanded = row.new_line_idx.is_some_and(|i| mc.is_line_expanded(i));
+                    let old_src = row.old_line_idx.and_then(|i| mc.line_source(i));
+                    let new_src = row.new_line_idx.and_then(|i| mc.line_source(i));
 
-                    let old_class_base = match row.old_line {
-                        Some(ref l) => split_cell_class(l.kind, row.old_is_expanded),
+                    let old_num = old_line.and_then(|l| l.old_line_number);
+                    let new_num = new_line.and_then(|l| l.new_line_number);
+
+                    let old_class_base = match old_line {
+                        Some(l) => split_cell_class(l.kind, old_is_expanded),
                         None => "diff-cell--blank",
                     };
-                    let new_class_base = match row.new_line {
-                        Some(ref l) => split_cell_class(l.kind, row.new_is_expanded),
+                    let new_class_base = match new_line {
+                        Some(l) => split_cell_class(l.kind, new_is_expanded),
                         None => "diff-cell--blank",
                     };
 
-                    let old_threads = old_num.map_or_else(Vec::new, |ln| {
-                        split_side_threads(threads, CommentSide::Old, ln)
-                    });
-                    let new_threads = new_num.map_or_else(Vec::new, |ln| {
-                        split_side_threads(threads, CommentSide::New, ln)
-                    });
+                    let old_threads = old_num
+                        .map_or(&[][..], |ln| thread_index.at(CommentSide::Old, ln));
+                    let new_threads = new_num
+                        .map_or(&[][..], |ln| thread_index.at(CommentSide::New, ln));
 
-                    let is_context_pair = row.old_line.as_ref().is_some_and(|l| l.kind == DiffLineKind::Context)
-                        && row.new_line.as_ref().is_some_and(|l| l.kind == DiffLineKind::Context);
+                    let is_context_pair = old_line.is_some_and(|l| l.kind == DiffLineKind::Context)
+                        && new_line.is_some_and(|l| l.kind == DiffLineKind::Context);
 
-                    let old_lines_drag = Arc::clone(&all_lines);
-                    let new_lines_drag = Arc::clone(&all_lines);
-                    let snippet_lines = Arc::clone(&all_lines);
-                    let old_action_lines = Arc::clone(&all_lines);
-                    let new_action_lines = Arc::clone(&all_lines);
-                    let edit_path = String::from(file_path);
                     let submit_old = String::from(submit_file_path);
                     let submit_new = String::from(submit_file_path);
 
-                    let old_src = row.old_source;
-                    let new_src = row.new_source;
                     let old_id = old_src.map(|(oc, ol)| {
                         state::diff_line_element_id(file_path, oc, ol, CommentSide::Old)
                     });
                     let new_id = new_src.map(|(oc, ol)| {
                         state::diff_line_element_id(file_path, oc, ol, CommentSide::New)
                     });
-                    let old_sel_class = move || {
-                        let sel = selection_class(
-                            ctx.drag_state.get(),
-                            ctx.active_composer.get().as_ref(),
-                            CommentSide::Old,
-                            old_num,
-                        );
-                        let kbd = if old_src.is_some_and(|(oc, ol)| {
-                            ctx.active_cursor.get().is_some_and(|cur| {
-                                cur.file_index == ctx.file_index
-                                    && cur.chunk_index == oc
-                                    && cur.line_index == ol
-                                    && cur.side == CommentSide::Old
-                            })
-                        }) {
-                            " diff-row--kbd-active"
-                        } else {
-                            ""
-                        };
-                        if kbd.is_empty() {
-                            String::from(sel)
-                        } else {
-                            alloc::format!("{sel}{kbd}")
-                        }
+
+                    let old_line_str = old_num.map(|n| n.to_string());
+                    let new_line_str = new_num.map(|n| n.to_string());
+                    let old_line_text = old_line_str.clone().unwrap_or_default();
+                    let new_line_text = new_line_str.clone().unwrap_or_default();
+
+                    let old_composer_here = move || {
+                        old_num.is_some_and(|n| {
+                            ctx.composer_selector
+                                .with_value(|sel| sel.selected(&Some((CommentSide::Old, n))))
+                        })
                     };
-                    let new_sel_class = move || {
-                        let sel = selection_class(
-                            ctx.drag_state.get(),
-                            ctx.active_composer.get().as_ref(),
-                            CommentSide::New,
-                            new_num,
-                        );
-                        let kbd = if new_src.is_some_and(|(oc, ol)| {
-                            ctx.active_cursor.get().is_some_and(|cur| {
-                                cur.file_index == ctx.file_index
-                                    && cur.chunk_index == oc
-                                    && cur.line_index == ol
-                                    && cur.side == CommentSide::New
-                            })
-                        }) {
-                            " diff-row--kbd-active"
-                        } else {
-                            ""
-                        };
-                        if kbd.is_empty() {
-                            String::from(sel)
-                        } else {
-                            alloc::format!("{sel}{kbd}")
-                        }
+                    let new_composer_here = move || {
+                        new_num.is_some_and(|n| {
+                            ctx.composer_selector
+                                .with_value(|sel| sel.selected(&Some((CommentSide::New, n))))
+                        })
                     };
 
-                    let old_composer = move || {
-                        ctx.active_composer.get().filter(|comp| {
-                            comp.side == CommentSide::Old && old_num == Some(comp.range.end)
+                    let old_gutter_cls = alloc::format!("{old_class_base} diff-gutter diff-gutter--num diff-gutter--actions");
+                    let old_code_cls = alloc::format!("{old_class_base} diff-code-cell diff-code-cell--split");
+                    let new_gutter_cls = alloc::format!("{new_class_base} diff-gutter diff-gutter--num diff-gutter--actions");
+                    let new_code_cls = alloc::format!("{new_class_base} diff-code-cell diff-code-cell--split");
+
+                    let old_thread_views = old_threads
+                        .iter()
+                        .map(|thread| {
+                            let align = if is_context_pair { SplitAlign::Full } else { SplitAlign::Left };
+                            let snippet = thread.line_range.map(|lr| {
+                                extract_chunk_line_range_snippet(mc, CommentSide::Old, lr)
+                            });
+                            render_split_thread_row(thread.clone(), snippet, align, ctx.on_reply, ctx.on_toggle_resolve)
                         })
-                    };
-                    let new_composer = move || {
-                        ctx.active_composer.get().filter(|comp| {
-                            comp.side == CommentSide::New && new_num == Some(comp.range.end)
+                        .collect_view();
+
+                    let new_thread_views = new_threads
+                        .iter()
+                        .map(|thread| {
+                            let align = if is_context_pair { SplitAlign::Full } else { SplitAlign::Right };
+                            let snippet = thread.line_range.map(|lr| {
+                                extract_chunk_line_range_snippet(mc, CommentSide::New, lr)
+                            });
+                            render_split_thread_row(thread.clone(), snippet, align, ctx.on_reply, ctx.on_toggle_resolve)
                         })
-                    };
+                        .collect_view();
 
                     view! {
                         <>
                             <tr
                                 class="diff-split-row"
-                                on:mouseenter=move |_| {
-                                    if let Some(drag) = ctx.drag_state.get_untracked()
-                                        && let Some(ln) = match drag.side {
-                                            CommentSide::Old => old_num,
-                                            CommentSide::New => new_num,
-                                        }
-                                    {
-                                        ctx.drag_state.set(Some(LineSelectionDrag {
-                                            current_line: ln,
-                                            ..drag
-                                        }));
-                                    }
-                                }
+                                data-old-line=old_line_str.clone()
+                                data-new-line=new_line_str.clone()
                             >
                                 <td
                                     id=old_id
-                                    class=move || combine_classes(old_class_base, "diff-gutter diff-gutter--num diff-gutter--actions", &old_sel_class())
+                                    class=old_gutter_cls
                                     title={old_num.map(|_| "Click or drag to comment on old side")}
-                                    on:mousedown=move |ev: ev::MouseEvent| {
-                                        if let Some(ln) = old_num {
-                                            handle_gutter_mousedown(
-                                                &ev,
-                                                CommentSide::Old,
-                                                ln,
-                                                &old_lines_drag,
-                                                ctx.drag_state,
-                                                ctx.selection_anchor,
-                                                ctx.active_composer,
-                                            );
-                                        }
-                                    }
+                                    data-gutter-side=old_num.map(|_| "old")
+                                    data-gutter-line=old_line_str.clone()
+                                    data-split-side=old_num.map(|_| "old")
+                                    data-split-line=old_line_str.clone()
                                 >
-                                    <span>{old_num.map_or_else(String::new, |n| n.to_string())}</span>
+                                    <span>{old_line_text}</span>
                                     {old_num.map(|ln| {
-                                        render_line_actions(
-                                            CommentSide::Old,
-                                            ln,
-                                            None,
-                                            edit_path.clone(),
-                                            old_action_lines,
-                                            ctx,
-                                        )
+                                        render_line_actions(CommentSide::Old, ln, None)
                                     })}
                                 </td>
-                                <td class=move || combine_classes(old_class_base, "diff-code-cell diff-code-cell--split", &old_sel_class())>
-                                    {row.old_line.map(|l| view! {
+                                <td
+                                    class=old_code_cls
+                                    data-split-side=old_num.map(|_| "old")
+                                    data-split-line=old_line_str.clone()
+                                >
+                                    {old_line.map(|l| view! {
                                         <div class="diff-code-inner">
                                             <span class=line_sigil_class(l.kind)>{line_sigil(l.kind)}</span>
-                                            <CodeLineContent
-                                                line_kind=l.kind
-                                                content=l.content
-                                                syntax_spans=l.syntax_spans
-                                                word_segments=l.word_diff
-                                                highlighted_word=ctx.highlighted_word
-                                                on_toggle_word=ctx.on_toggle_word
-                                            />
+                                            {render_code_line(l)}
                                         </div>
                                     })}
                                 </td>
 
                                 <td
                                     id=new_id
-                                    class=move || combine_classes(new_class_base, "diff-gutter diff-gutter--num diff-gutter--actions", &new_sel_class())
+                                    class=new_gutter_cls
                                     title={new_num.map(|_| "Click or drag to comment on new side")}
-                                    on:mousedown=move |ev: ev::MouseEvent| {
-                                        if let Some(ln) = new_num {
-                                            handle_gutter_mousedown(
-                                                &ev,
-                                                CommentSide::New,
-                                                ln,
-                                                &new_lines_drag,
-                                                ctx.drag_state,
-                                                ctx.selection_anchor,
-                                                ctx.active_composer,
-                                            );
-                                        }
-                                    }
+                                    data-gutter-side=new_num.map(|_| "new")
+                                    data-gutter-line=new_line_str.clone()
+                                    data-split-side=new_num.map(|_| "new")
+                                    data-split-line=new_line_str.clone()
                                 >
-                                    <span>{new_num.map_or_else(String::new, |n| n.to_string())}</span>
+                                    <span>{new_line_text}</span>
                                     {new_num.map(|ln| {
                                         render_line_actions(
                                             CommentSide::New,
                                             ln,
                                             (!ctx.is_commit_msg).then_some(ln),
-                                            edit_path.clone(),
-                                            new_action_lines,
-                                            ctx,
                                         )
                                     })}
                                 </td>
-                                <td class=move || combine_classes(new_class_base, "diff-code-cell diff-code-cell--split", &new_sel_class())>
-                                    {row.new_line.map(|l| view! {
+                                <td
+                                    class=new_code_cls
+                                    data-split-side=new_num.map(|_| "new")
+                                    data-split-line=new_line_str.clone()
+                                >
+                                    {new_line.map(|l| view! {
                                         <div class="diff-code-inner">
                                             <span class=line_sigil_class(l.kind)>{line_sigil(l.kind)}</span>
-                                            <CodeLineContent
-                                                line_kind=l.kind
-                                                content=l.content
-                                                syntax_spans=l.syntax_spans
-                                                word_segments=l.word_diff
-                                                highlighted_word=ctx.highlighted_word
-                                                on_toggle_word=ctx.on_toggle_word
-                                            />
+                                            {render_code_line(l)}
                                         </div>
                                     })}
                                 </td>
                             </tr>
 
-                            {old_threads.into_iter().map(|thread| {
-                                let align = if is_context_pair { SplitAlign::Full } else { SplitAlign::Left };
-                                let snippet = thread.line_range.map(|lr| {
-                                    extract_line_range_snippet(&snippet_lines, CommentSide::Old, lr)
-                                });
-                                render_split_thread_row(thread, snippet, align, ctx.on_reply, ctx.on_toggle_resolve)
-                            }).collect_view()}
+                            {old_thread_views}
+                            {new_thread_views}
 
-                            {new_threads.into_iter().map(|thread| {
-                                let align = if is_context_pair { SplitAlign::Full } else { SplitAlign::Right };
-                                let snippet = thread.line_range.map(|lr| {
-                                    extract_line_range_snippet(&snippet_lines, CommentSide::New, lr)
-                                });
-                                render_split_thread_row(thread, snippet, align, ctx.on_reply, ctx.on_toggle_resolve)
-                            }).collect_view()}
+                            {move || {
+                                if !old_composer_here() {
+                                    return None;
+                                }
+                                ctx.active_composer.get().map(|comp| {
+                                    let align = if is_context_pair { SplitAlign::Full } else { SplitAlign::Left };
+                                    render_split_composer_row(comp, submit_old.clone(), align, ctx.active_composer, ctx.on_create_thread)
+                                })
+                            }}
 
-                            {move || old_composer().map(|comp| {
-                                let align = if is_context_pair { SplitAlign::Full } else { SplitAlign::Left };
-                                render_split_composer_row(comp, submit_old.clone(), align, ctx.active_composer, ctx.on_create_thread)
-                            })}
-
-                            {move || new_composer().map(|comp| {
-                                let align = if is_context_pair { SplitAlign::Full } else { SplitAlign::Right };
-                                render_split_composer_row(comp, submit_new.clone(), align, ctx.active_composer, ctx.on_create_thread)
-                            })}
+                            {move || {
+                                if !new_composer_here() {
+                                    return None;
+                                }
+                                ctx.active_composer.get().map(|comp| {
+                                    let align = if is_context_pair { SplitAlign::Full } else { SplitAlign::Right };
+                                    render_split_composer_row(comp, submit_new.clone(), align, ctx.active_composer, ctx.on_create_thread)
+                                })
+                            }}
                         </>
                     }
                 }).collect_view()}
@@ -1391,129 +1456,38 @@ fn render_split_composer_row(
     }
 }
 
-fn handle_gutter_mousedown(
-    ev: &ev::MouseEvent,
-    side: CommentSide,
-    line_num: u32,
-    chunk_lines: &[DiffLine],
-    drag_state: RwSignal<Option<LineSelectionDrag>>,
-    selection_anchor: RwSignal<Option<(CommentSide, u32)>>,
-    active_composer: RwSignal<Option<ActiveComposer>>,
-) {
-    if ev.button() != 0 {
-        return;
-    }
-    ev.prevent_default();
-    ev.stop_propagation();
-
-    if ev.shift_key() {
-        let (start, end) = match selection_anchor.get_untracked() {
-            Some((prev_side, prev_line)) if prev_side == side => {
-                (prev_line.min(line_num), prev_line.max(line_num))
-            }
-            _ => (line_num, line_num),
-        };
-        selection_anchor.set(Some((side, line_num)));
-        let range = LineRangeSpec { start, end };
-        let snippet = extract_line_range_snippet(chunk_lines, side, range);
-        active_composer.set(Some(ActiveComposer {
-            side,
-            range,
-            code_snippet: snippet,
-        }));
-        return;
-    }
-
-    selection_anchor.set(Some((side, line_num)));
-    drag_state.set(Some(LineSelectionDrag {
-        side,
-        anchor_line: line_num,
-        current_line: line_num,
-    }));
-}
-
-fn unified_line_threads(line: &DiffLine, threads: &[JjCommentThread]) -> Vec<JjCommentThread> {
-    let mut matched = Vec::new();
-    let mut seen_ids = HashSet::new();
-
-    let (primary_num, primary_side) = if line.kind == DiffLineKind::Delete {
-        (line.old_line_number, CommentSide::Old)
-    } else {
-        (line.new_line_number, CommentSide::New)
-    };
-
-    if let Some(num) = primary_num {
-        for thread in threads {
-            if thread.side == primary_side
-                && thread.line_range.is_some_and(|r| r.end == num)
-                && seen_ids.insert(thread.id.clone())
-            {
-                matched.push(thread.clone());
-            }
-        }
-    }
-
-    if line.kind == DiffLineKind::Context
-        && let Some(old_num) = line.old_line_number
-    {
-        for thread in threads {
-            if thread.side == CommentSide::Old
-                && thread.line_range.is_some_and(|r| r.end == old_num)
-                && seen_ids.insert(thread.id.clone())
-            {
-                matched.push(thread.clone());
-            }
-        }
-    }
-
-    matched
-}
-
-fn split_side_threads(
-    threads: &[JjCommentThread],
-    side: CommentSide,
-    line_num: u32,
-) -> Vec<JjCommentThread> {
-    threads
-        .iter()
-        .filter(|t| t.side == side && t.line_range.is_some_and(|r| r.end == line_num))
-        .cloned()
-        .collect()
-}
-
-fn collect_placed_thread_ids(
+fn collect_placed_thread_ids<'a>(
     mc: &MergedChunk,
-    threads: &[JjCommentThread],
+    thread_index: &'a ThreadIndex,
     mode: DiffViewMode,
-    placed: &mut HashSet<String>,
+    placed: &mut HashSet<&'a str>,
 ) {
-    for line in &mc.lines {
+    for line in mc.iter_lines() {
         if mode == DiffViewMode::Split {
             if let Some(old_n) = line.old_line_number {
-                for t in split_side_threads(threads, CommentSide::Old, old_n) {
-                    placed.insert(t.id);
+                for t in thread_index.at(CommentSide::Old, old_n) {
+                    placed.insert(t.id.as_str());
                 }
             }
             if let Some(new_n) = line.new_line_number {
-                for t in split_side_threads(threads, CommentSide::New, new_n) {
-                    placed.insert(t.id);
+                for t in thread_index.at(CommentSide::New, new_n) {
+                    placed.insert(t.id.as_str());
                 }
             }
         } else {
-            for t in unified_line_threads(line, threads) {
-                placed.insert(t.id);
+            for t in thread_index.unified_line_threads(line) {
+                placed.insert(t.id.as_str());
             }
         }
     }
 }
 
-fn extract_line_range_snippet(
-    lines: &[DiffLine],
+fn extract_chunk_line_range_snippet(
+    mc: &MergedChunk,
     side: CommentSide,
     range: LineRangeSpec,
 ) -> String {
-    lines
-        .iter()
+    mc.iter_lines()
         .filter_map(|l| {
             let ln = match side {
                 CommentSide::Old => l.old_line_number,
@@ -1532,7 +1506,7 @@ fn extract_snippet_across_merged(
 ) -> String {
     let mut parts = Vec::new();
     for chunk in chunks {
-        let s = extract_line_range_snippet(&chunk.lines, side, range);
+        let s = extract_chunk_line_range_snippet(chunk, side, range);
         if !s.is_empty() {
             parts.push(s);
         }
@@ -1611,14 +1585,6 @@ fn split_slot_class(align: SplitAlign) -> &'static str {
     }
 }
 
-fn combine_classes(a: &str, b: &str, c: &str) -> String {
-    if c.is_empty() {
-        alloc::format!("{a} {b}")
-    } else {
-        alloc::format!("{a} {b} {c}")
-    }
-}
-
 fn line_sigil(kind: DiffLineKind) -> &'static str {
     match kind {
         DiffLineKind::Add => "+",
@@ -1638,6 +1604,7 @@ fn line_sigil_class(kind: DiffLineKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tellit_types::DiffChunk;
 
     fn mk_line(kind: DiffLineKind, old_n: Option<u32>, new_n: Option<u32>, text: &str) -> DiffLine {
         DiffLine {
@@ -1652,27 +1619,76 @@ mod tests {
 
     #[test]
     fn extracts_line_range_snippet_for_requested_side() {
-        let lines = alloc::vec![
-            mk_line(DiffLineKind::Context, Some(1), Some(1), "ctx 1"),
-            mk_line(DiffLineKind::Delete, Some(2), None, "old 2"),
-            mk_line(DiffLineKind::Add, None, Some(2), "new 2"),
-            mk_line(DiffLineKind::Add, None, Some(3), "new 3"),
-        ];
+        let file = Arc::new(DiffFile {
+            path: String::from("src/lib.rs"),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 2,
+            deletions: 1,
+            is_generated: false,
+            chunks: alloc::vec![DiffChunk {
+                old_start: 1,
+                old_lines: 2,
+                new_start: 1,
+                new_lines: 3,
+                header: String::from("@@ -1,2 +1,3 @@"),
+                lines: alloc::vec![
+                    mk_line(DiffLineKind::Context, Some(1), Some(1), "ctx 1"),
+                    mk_line(DiffLineKind::Delete, Some(2), None, "old 2"),
+                    mk_line(DiffLineKind::Add, None, Some(2), "new 2"),
+                    mk_line(DiffLineKind::Add, None, Some(3), "new 3"),
+                ],
+            }],
+        });
+
         assert_eq!(
-            extract_line_range_snippet(
-                &lines,
+            extract_snippet_for_file(
+                &file,
+                None,
                 CommentSide::New,
                 LineRangeSpec { start: 1, end: 3 }
             ),
             "ctx 1\nnew 2\nnew 3"
         );
         assert_eq!(
-            extract_line_range_snippet(
-                &lines,
+            extract_snippet_for_file(
+                &file,
+                None,
                 CommentSide::Old,
                 LineRangeSpec { start: 2, end: 2 }
             ),
             "old 2"
         );
+    }
+
+    #[test]
+    fn thread_index_resolves_unified_and_split_threads_in_constant_time() {
+        let mk_thread = |id: &str, side: CommentSide, end: u32| JjCommentThread {
+            id: String::from(id),
+            file_path: String::from("src/lib.rs"),
+            line_range: Some(LineRangeSpec { start: end, end }),
+            side,
+            resolved: false,
+            commit_id: String::from("abc"),
+            change_id: String::from("ch1"),
+            comments: Vec::new(),
+        };
+
+        let threads = alloc::vec![
+            mk_thread("t-new-2", CommentSide::New, 2),
+            mk_thread("t-old-2", CommentSide::Old, 2),
+        ];
+        let idx = ThreadIndex::from_threads(&threads);
+
+        let ctx_line = mk_line(DiffLineKind::Context, Some(2), Some(2), "ctx");
+        let unified_ids: Vec<&str> = idx
+            .unified_line_threads(&ctx_line)
+            .into_iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        assert_eq!(unified_ids, alloc::vec!["t-new-2", "t-old-2"]);
+        assert_eq!(idx.at(CommentSide::Old, 2).len(), 1);
+        assert_eq!(idx.at(CommentSide::New, 2).len(), 1);
+        assert!(idx.at(CommentSide::New, 99).is_empty());
     }
 }

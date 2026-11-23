@@ -3,6 +3,7 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::sync::Arc;
 
 use leptos::ev;
 use leptos::prelude::*;
@@ -127,7 +128,11 @@ fn SingleImageCard(
 
 /// Interactive image diff viewer supporting single-sided, side-by-side, swipe, and onion-skin modes.
 #[component]
-pub fn ImageDiffBody(file: DiffFile, base_commit: String, target_commit: String) -> impl IntoView {
+pub fn ImageDiffBody(
+    file: Arc<DiffFile>,
+    base_commit: String,
+    target_commit: String,
+) -> impl IntoView {
     let old_meta = RwSignal::new(ImageMetadata::default());
     let new_meta = RwSignal::new(ImageMetadata::default());
     let compare_mode = RwSignal::new(ImageCompareMode::SideBySide);

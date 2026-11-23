@@ -733,7 +733,7 @@ fn build_preview_blocks(chunks: &[MergedChunk]) -> Vec<PreviewBlock> {
     let mut in_change = false;
 
     for chunk in chunks {
-        for line in &chunk.lines {
+        for line in chunk.iter_lines() {
             match line.kind {
                 DiffLineKind::Delete => {
                     pending_deletes.push(line.content.clone());
@@ -1294,76 +1294,80 @@ mod tests {
 
     #[test]
     fn groups_fenced_code_blocks_and_strips_frontmatter_in_diff_preview() {
-        let chunks = alloc::vec![MergedChunk {
-            old_start: 1,
-            old_lines: 6,
-            new_start: 1,
-            new_lines: 6,
-            header: String::from("@@ -1,6 +1,6 @@"),
-            lines: alloc::vec![
-                DiffLine {
-                    kind: DiffLineKind::Context,
-                    content: String::from("---"),
-                    old_line_number: Some(1),
-                    new_line_number: Some(1),
-                    syntax_spans: Vec::new(),
-                    word_diff: Vec::new(),
-                },
-                DiffLine {
-                    kind: DiffLineKind::Delete,
-                    content: String::from("title: Old"),
-                    old_line_number: Some(2),
-                    new_line_number: None,
-                    syntax_spans: Vec::new(),
-                    word_diff: Vec::new(),
-                },
-                DiffLine {
-                    kind: DiffLineKind::Add,
-                    content: String::from("title: New"),
-                    old_line_number: None,
-                    new_line_number: Some(2),
-                    syntax_spans: Vec::new(),
-                    word_diff: Vec::new(),
-                },
-                DiffLine {
-                    kind: DiffLineKind::Context,
-                    content: String::from("---"),
-                    old_line_number: Some(3),
-                    new_line_number: Some(3),
-                    syntax_spans: Vec::new(),
-                    word_diff: Vec::new(),
-                },
-                DiffLine {
-                    kind: DiffLineKind::Context,
-                    content: String::from("```rust"),
-                    old_line_number: Some(4),
-                    new_line_number: Some(4),
-                    syntax_spans: Vec::new(),
-                    word_diff: Vec::new(),
-                },
-                DiffLine {
-                    kind: DiffLineKind::Add,
-                    content: String::from("let x = 1;"),
-                    old_line_number: None,
-                    new_line_number: Some(5),
-                    syntax_spans: Vec::new(),
-                    word_diff: Vec::new(),
-                },
-                DiffLine {
-                    kind: DiffLineKind::Context,
-                    content: String::from("```"),
-                    old_line_number: Some(5),
-                    new_line_number: Some(6),
-                    syntax_spans: Vec::new(),
-                    word_diff: Vec::new(),
-                },
-            ],
-            original_indices: alloc::vec![0],
-            hidden_lines_before: 0,
-            hidden_lines_after: Some(0),
-            expanded_line_flags: alloc::vec![false; 7],
-            line_sources: (0..7).map(|li| Some((0, li))).collect(),
-        }];
+        let file = Arc::new(DiffFile {
+            path: String::from("README.md"),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 2,
+            deletions: 1,
+            is_generated: false,
+            chunks: alloc::vec![tellit_types::DiffChunk {
+                old_start: 1,
+                old_lines: 6,
+                new_start: 1,
+                new_lines: 6,
+                header: String::from("@@ -1,6 +1,6 @@"),
+                lines: alloc::vec![
+                    DiffLine {
+                        kind: DiffLineKind::Context,
+                        content: String::from("---"),
+                        old_line_number: Some(1),
+                        new_line_number: Some(1),
+                        syntax_spans: Vec::new(),
+                        word_diff: Vec::new(),
+                    },
+                    DiffLine {
+                        kind: DiffLineKind::Delete,
+                        content: String::from("title: Old"),
+                        old_line_number: Some(2),
+                        new_line_number: None,
+                        syntax_spans: Vec::new(),
+                        word_diff: Vec::new(),
+                    },
+                    DiffLine {
+                        kind: DiffLineKind::Add,
+                        content: String::from("title: New"),
+                        old_line_number: None,
+                        new_line_number: Some(2),
+                        syntax_spans: Vec::new(),
+                        word_diff: Vec::new(),
+                    },
+                    DiffLine {
+                        kind: DiffLineKind::Context,
+                        content: String::from("---"),
+                        old_line_number: Some(3),
+                        new_line_number: Some(3),
+                        syntax_spans: Vec::new(),
+                        word_diff: Vec::new(),
+                    },
+                    DiffLine {
+                        kind: DiffLineKind::Context,
+                        content: String::from("```rust"),
+                        old_line_number: Some(4),
+                        new_line_number: Some(4),
+                        syntax_spans: Vec::new(),
+                        word_diff: Vec::new(),
+                    },
+                    DiffLine {
+                        kind: DiffLineKind::Add,
+                        content: String::from("let x = 1;"),
+                        old_line_number: None,
+                        new_line_number: Some(5),
+                        syntax_spans: Vec::new(),
+                        word_diff: Vec::new(),
+                    },
+                    DiffLine {
+                        kind: DiffLineKind::Context,
+                        content: String::from("```"),
+                        old_line_number: Some(5),
+                        new_line_number: Some(6),
+                        syntax_spans: Vec::new(),
+                        word_diff: Vec::new(),
+                    },
+                ],
+            }],
+        });
+        let chunks = crate::components::text_diff::expanded::merge_chunks_for_file(&file, None);
 
         let raw = build_preview_blocks(&chunks);
         let stripped = strip_frontmatter_blocks(

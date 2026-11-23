@@ -1176,6 +1176,7 @@ button {
   border: 1px solid var(--color-border);
   border-radius: 8px;
   overflow: hidden;
+  contain: style;
 }
 
 .diff-card--viewed {
@@ -1372,6 +1373,11 @@ button {
   padding: 0;
 }
 
+.diff-chunk-wrapper {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 240px;
+}
+
 .diff-chunk-wrapper + .diff-chunk-wrapper {
   border-top: 1px solid var(--color-border);
 }
@@ -1414,6 +1420,14 @@ button {
 
 .diff-table--unified col.col-num {
   width: 52px;
+}
+
+.diff-table--unified col.col-code {
+  width: auto;
+}
+
+.diff-table--unified .diff-code-cell {
+  width: auto;
 }
 
 .diff-table--split .col-num {
@@ -1582,14 +1596,8 @@ tr:hover .diff-gutter--actions .diff-line-actions,
   border-radius: 2px;
 }
 
-.word-token {
-  cursor: pointer;
-  border-radius: 2px;
-}
-
-.word-token--active {
+::highlight(tellit-word-match) {
   background-color: rgba(227, 179, 65, 0.36);
-  outline: 1px solid rgba(227, 179, 65, 0.75);
 }
 
 .diff-inline-cell {

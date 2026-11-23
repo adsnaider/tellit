@@ -3,6 +3,7 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use std::collections::HashMap;
 
@@ -46,9 +47,37 @@ pub struct FileExpandedState {
     pub expanded_ranges: Vec<ExpandedRange>,
 }
 
+/// Reference to one line inside a [`MergedChunk`], avoiding cloning original [`DiffLine`] entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkLineRef {
+    /// Original line indexed by `(chunk_index, line_index)` inside `DiffFile::chunks`.
+    Original(usize, usize),
+    /// Context line materialized on demand from `/api/blob`.
+    Expanded(Arc<DiffLine>),
+}
+
+impl ChunkLineRef {
+    /// Returns `true` when this line came from `/api/blob` context expansion.
+    #[must_use]
+    pub fn is_expanded(&self) -> bool {
+        matches!(self, Self::Expanded(_))
+    }
+
+    /// Returns the original `(chunk_index, line_index)` coordinate when this line is not expanded.
+    #[must_use]
+    pub fn source(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Original(ci, li) => Some((*ci, *li)),
+            Self::Expanded(_) => None,
+        }
+    }
+}
+
 /// Diff hunk combined with expanded context lines and merged adjacent hunks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergedChunk {
+    /// Shared owning file whose original chunk lines are referenced by [`ChunkLineRef::Original`].
+    pub file: Arc<DiffFile>,
     /// Start line on the old side after upward expansion.
     pub old_start: u32,
     /// Line span on the old side across merged hunks.
@@ -59,18 +88,48 @@ pub struct MergedChunk {
     pub new_lines: u32,
     /// Original hunk header string.
     pub header: String,
-    /// Ordered diff and expanded context lines.
-    pub lines: Vec<DiffLine>,
+    /// Ordered references to diff and expanded context lines.
+    pub lines: Vec<ChunkLineRef>,
     /// Sorted original indices in [`DiffFile::chunks`] merged into this block.
     pub original_indices: Vec<usize>,
     /// Hidden lines still collapsed immediately above this block.
     pub hidden_lines_before: u32,
     /// Hidden lines still collapsed immediately below the last block (`None` when total file length is unknown).
     pub hidden_lines_after: Option<u32>,
-    /// Line indices inside [`MergedChunk::lines`] that came from `/api/blob` expansion rather than the original hunk.
-    pub expanded_line_flags: Vec<bool>,
-    /// Original `(chunk_index, line_index)` coordinates for non-expanded lines.
-    pub line_sources: Vec<Option<(usize, usize)>>,
+}
+
+impl MergedChunk {
+    /// Resolves `line_ref` into a borrowed [`DiffLine`] without cloning.
+    #[must_use]
+    pub fn resolve_line<'a>(&'a self, line_ref: &'a ChunkLineRef) -> Option<&'a DiffLine> {
+        match line_ref {
+            ChunkLineRef::Original(ci, li) => self.file.chunks.get(*ci)?.lines.get(*li),
+            ChunkLineRef::Expanded(line) => Some(line.as_ref()),
+        }
+    }
+
+    /// Resolves the line at `idx` inside this merged chunk without cloning.
+    #[must_use]
+    pub fn line(&self, idx: usize) -> Option<&DiffLine> {
+        self.resolve_line(self.lines.get(idx)?)
+    }
+
+    /// Iterates over every resolved [`DiffLine`] in order without cloning.
+    pub fn iter_lines(&self) -> impl Iterator<Item = &DiffLine> {
+        self.lines.iter().filter_map(|r| self.resolve_line(r))
+    }
+
+    /// Returns `true` when the line at `idx` came from context expansion.
+    #[must_use]
+    pub fn is_line_expanded(&self, idx: usize) -> bool {
+        self.lines.get(idx).is_some_and(ChunkLineRef::is_expanded)
+    }
+
+    /// Returns the original `(chunk_index, line_index)` for the line at `idx`, if not expanded.
+    #[must_use]
+    pub fn line_source(&self, idx: usize) -> Option<(usize, usize)> {
+        self.lines.get(idx).and_then(ChunkLineRef::source)
+    }
 }
 
 /// Map of file paths to their cached [`FileExpandedState`].
@@ -153,17 +212,15 @@ pub fn record_expand_all_before(
 }
 
 struct ExpandedChunkLines {
-    lines: Vec<DiffLine>,
-    flags: Vec<bool>,
-    sources: Vec<Option<(usize, usize)>>,
+    lines: Vec<ChunkLineRef>,
     old_start: u32,
     new_start: u32,
 }
 
-/// Computes merged, expansion-aware diff chunks for `file`.
+/// Computes merged, expansion-aware diff chunks for `file` without cloning original diff lines.
 #[must_use]
 pub fn merge_chunks_for_file(
-    file: &DiffFile,
+    file: &Arc<DiffFile>,
     state: Option<&FileExpandedState>,
 ) -> Vec<MergedChunk> {
     let mut merged: Vec<MergedChunk> = Vec::with_capacity(file.chunks.len());
@@ -171,8 +228,6 @@ pub fn merge_chunks_for_file(
     for (idx, chunk) in file.chunks.iter().enumerate() {
         let ExpandedChunkLines {
             lines,
-            flags,
-            sources,
             old_start: start_old,
             new_start: start_new,
         } = expand_single_chunk(file, chunk, idx, state);
@@ -183,13 +238,12 @@ pub fn merge_chunks_for_file(
             && hidden_before == 0
         {
             last.lines.extend(lines);
-            last.expanded_line_flags.extend(flags);
-            last.line_sources.extend(sources);
             last.original_indices.push(idx);
             last.hidden_lines_after = hidden_after;
             update_merged_spans(last);
         } else {
             let mut item = MergedChunk {
+                file: Arc::clone(file),
                 old_start: start_old,
                 old_lines: chunk.old_lines,
                 new_start: start_new,
@@ -199,8 +253,6 @@ pub fn merge_chunks_for_file(
                 original_indices: alloc::vec![idx],
                 hidden_lines_before: hidden_before,
                 hidden_lines_after: hidden_after,
-                expanded_line_flags: flags,
-                line_sources: sources,
             };
             update_merged_spans(&mut item);
             merged.push(item);
@@ -316,16 +368,15 @@ fn expand_single_chunk(
     chunk_index: usize,
     state: Option<&FileExpandedState>,
 ) -> ExpandedChunkLines {
-    let orig_sources = |count: usize| -> Vec<Option<(usize, usize)>> {
-        (0..count).map(|li| Some((chunk_index, li))).collect()
+    let orig_refs = |count: usize| -> Vec<ChunkLineRef> {
+        (0..count)
+            .map(|li| ChunkLineRef::Original(chunk_index, li))
+            .collect()
     };
 
     let Some(st) = state else {
-        let len = chunk.lines.len();
         return ExpandedChunkLines {
-            lines: chunk.lines.clone(),
-            flags: alloc::vec![false; len],
-            sources: orig_sources(len),
+            lines: orig_refs(chunk.lines.len()),
             old_start: chunk.old_start,
             new_start: chunk.new_start,
         };
@@ -334,11 +385,8 @@ fn expand_single_chunk(
     let expanded_up = expanded_count_in(st, chunk_index, ExpandDirection::Up);
     let expanded_down = expanded_count_in(st, chunk_index, ExpandDirection::Down);
     if expanded_up == 0 && expanded_down == 0 {
-        let len = chunk.lines.len();
         return ExpandedChunkLines {
-            lines: chunk.lines.clone(),
-            flags: alloc::vec![false; len],
-            sources: orig_sources(len),
+            lines: orig_refs(chunk.lines.len()),
             old_start: chunk.old_start,
             new_start: chunk.new_start,
         };
@@ -347,9 +395,8 @@ fn expand_single_chunk(
     let old_content = st.old_content.as_deref().unwrap_or(&[]);
     let new_content = st.new_content.as_deref().unwrap_or(&[]);
 
-    let mut out_lines = Vec::new();
-    let mut out_flags = Vec::new();
-    let mut out_sources = Vec::new();
+    let mut out_lines =
+        Vec::with_capacity(chunk.lines.len() + expanded_up as usize + expanded_down as usize);
 
     if expanded_up > 0 {
         let prev = chunk_index.checked_sub(1).and_then(|p| file.chunks.get(p));
@@ -387,23 +434,19 @@ fn expand_single_chunk(
             let old_num = start_old_zero + offset + 1;
             let new_num = start_new_zero + offset + 1;
             let content = pick_context_line(file, old_content, new_content, old_num, new_num);
-            out_lines.push(DiffLine {
+            out_lines.push(ChunkLineRef::Expanded(Arc::new(DiffLine {
                 kind: DiffLineKind::Context,
                 content,
                 old_line_number: Some(old_num),
                 new_line_number: Some(new_num),
                 syntax_spans: Vec::new(),
                 word_diff: Vec::new(),
-            });
-            out_flags.push(true);
-            out_sources.push(None);
+            })));
         }
     }
 
-    for (li, line) in chunk.lines.iter().enumerate() {
-        out_lines.push(line.clone());
-        out_flags.push(false);
-        out_sources.push(Some((chunk_index, li)));
+    for li in 0..chunk.lines.len() {
+        out_lines.push(ChunkLineRef::Original(chunk_index, li));
     }
 
     if expanded_down > 0 {
@@ -436,32 +479,30 @@ fn expand_single_chunk(
             let old_num = chunk_end_old + offset + 1;
             let new_num = chunk_end_new + offset + 1;
             let content = pick_context_line(file, old_content, new_content, old_num, new_num);
-            out_lines.push(DiffLine {
+            out_lines.push(ChunkLineRef::Expanded(Arc::new(DiffLine {
                 kind: DiffLineKind::Context,
                 content,
                 old_line_number: Some(old_num),
                 new_line_number: Some(new_num),
                 syntax_spans: Vec::new(),
                 word_diff: Vec::new(),
-            });
-            out_flags.push(true);
-            out_sources.push(None);
+            })));
         }
     }
 
-    let first_old = out_lines
-        .first()
+    let first_line = out_lines.first().and_then(|r| match r {
+        ChunkLineRef::Original(ci, li) => file.chunks.get(*ci)?.lines.get(*li),
+        ChunkLineRef::Expanded(l) => Some(l.as_ref()),
+    });
+    let first_old = first_line
         .and_then(|l| l.old_line_number)
         .unwrap_or(chunk.old_start);
-    let first_new = out_lines
-        .first()
+    let first_new = first_line
         .and_then(|l| l.new_line_number)
         .unwrap_or(chunk.new_start);
 
     ExpandedChunkLines {
         lines: out_lines,
-        flags: out_flags,
-        sources: out_sources,
         old_start: first_old,
         new_start: first_new,
     }
@@ -493,16 +534,31 @@ fn pick_context_line(
 }
 
 fn update_merged_spans(chunk: &mut MergedChunk) {
-    if let Some(first_old) = chunk.lines.iter().find_map(|l| l.old_line_number) {
+    let first_old = chunk.iter_lines().find_map(|l| l.old_line_number);
+    let first_new = chunk.iter_lines().find_map(|l| l.new_line_number);
+    let last_old = chunk
+        .lines
+        .iter()
+        .rev()
+        .filter_map(|r| chunk.resolve_line(r))
+        .find_map(|l| l.old_line_number);
+    let last_new = chunk
+        .lines
+        .iter()
+        .rev()
+        .filter_map(|r| chunk.resolve_line(r))
+        .find_map(|l| l.new_line_number);
+
+    if let Some(first_old) = first_old {
         chunk.old_start = first_old;
     }
-    if let Some(first_new) = chunk.lines.iter().find_map(|l| l.new_line_number) {
+    if let Some(first_new) = first_new {
         chunk.new_start = first_new;
     }
-    if let Some(last_old) = chunk.lines.iter().rev().find_map(|l| l.old_line_number) {
+    if let Some(last_old) = last_old {
         chunk.old_lines = last_old.saturating_sub(chunk.old_start).saturating_add(1);
     }
-    if let Some(last_new) = chunk.lines.iter().rev().find_map(|l| l.new_line_number) {
+    if let Some(last_new) = last_new {
         chunk.new_lines = last_new.saturating_sub(chunk.new_start).saturating_add(1);
     }
 }
@@ -529,7 +585,7 @@ mod tests {
 
     #[test]
     fn expands_and_merges_two_chunks_when_gap_closes() {
-        let file = DiffFile {
+        let file = Arc::new(DiffFile {
             path: String::from("src/lib.rs"),
             old_path: None,
             status: FileStatus::Modified,
@@ -559,7 +615,7 @@ mod tests {
                     lines: alloc::vec![sample_line(DiffLineKind::Add, None, Some(6), "line 6")],
                 },
             ],
-        };
+        });
 
         let mut map = ExpandedLinesMap::new();
         map.insert(
@@ -583,17 +639,17 @@ mod tests {
         let after = merge_chunks_for_file(&file, map.get("src/lib.rs"));
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].lines.len(), 5);
-        assert_eq!(after[0].lines[1].content, "line 3");
-        assert_eq!(after[0].lines[3].content, "line 5");
-        assert_eq!(
-            after[0].expanded_line_flags,
-            vec![false, true, true, true, false]
-        );
+        assert_eq!(after[0].line(1).unwrap().content, "line 3");
+        assert_eq!(after[0].line(3).unwrap().content, "line 5");
+        let expanded_flags: Vec<bool> = (0..after[0].lines.len())
+            .map(|i| after[0].is_line_expanded(i))
+            .collect();
+        assert_eq!(expanded_flags, vec![false, true, true, true, false]);
     }
 
     #[test]
     fn dual_direction_expansion_merges_without_duplicate_lines() {
-        let file = DiffFile {
+        let file = Arc::new(DiffFile {
             path: String::from("src/lib.rs"),
             old_path: None,
             status: FileStatus::Modified,
@@ -623,7 +679,7 @@ mod tests {
                     lines: alloc::vec![sample_line(DiffLineKind::Add, None, Some(28), "line 28")],
                 },
             ],
-        };
+        });
 
         let mut map = ExpandedLinesMap::new();
         map.insert(
@@ -642,7 +698,7 @@ mod tests {
 
         let merged = merge_chunks_for_file(&file, map.get("src/lib.rs"));
         assert_eq!(merged.len(), 1);
-        let contents: Vec<&str> = merged[0].lines.iter().map(|l| l.content.as_str()).collect();
+        let contents: Vec<&str> = merged[0].iter_lines().map(|l| l.content.as_str()).collect();
         let expected: Vec<String> = (2..=28).map(|n| alloc::format!("line {n}")).collect();
         assert_eq!(contents, expected);
     }

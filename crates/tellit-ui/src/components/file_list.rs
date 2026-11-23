@@ -7,9 +7,39 @@ use alloc::vec::Vec;
 use std::collections::HashSet;
 
 use leptos::prelude::*;
-use tellit_types::DiffFile;
+use tellit_types::{DiffFile, FileStatus};
 use wasm_bindgen::JsCast;
 use web_sys::HtmlInputElement;
+
+/// Lightweight file metadata retained by the sidebar file tree without cloning diff chunks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTreeEntry {
+    /// Repository-relative file path.
+    pub path: String,
+    /// Previous path when the file was renamed.
+    pub old_path: Option<String>,
+    /// File change status badge.
+    pub status: FileStatus,
+    /// Total added lines in this file.
+    pub additions: u32,
+    /// Total deleted lines in this file.
+    pub deletions: u32,
+    /// Whether the file was classified as generated.
+    pub is_generated: bool,
+}
+
+impl From<&DiffFile> for FileTreeEntry {
+    fn from(file: &DiffFile) -> Self {
+        Self {
+            path: file.path.clone(),
+            old_path: file.old_path.clone(),
+            status: file.status,
+            additions: file.additions,
+            deletions: file.deletions,
+            is_generated: file.is_generated,
+        }
+    }
+}
 
 /// Node inside the collapsed hierarchical changed-file tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,13 +52,13 @@ pub struct FileTreeNode {
     pub is_directory: bool,
     /// Child nodes when `is_directory` is `true`.
     pub children: Vec<FileTreeNode>,
-    /// Diff metadata when `is_directory` is `false`.
-    pub file: Option<DiffFile>,
+    /// Lightweight diff metadata when `is_directory` is `false`.
+    pub file: Option<FileTreeEntry>,
 }
 
 /// Builds a hierarchical tree from `files`, collapsing single-child directory chains.
 #[must_use]
-pub fn build_file_tree(files: &[DiffFile]) -> FileTreeNode {
+pub fn build_file_tree(files: &[FileTreeEntry]) -> FileTreeNode {
     let mut root = FileTreeNode {
         name: String::new(),
         path: String::new(),
@@ -45,7 +75,7 @@ pub fn build_file_tree(files: &[DiffFile]) -> FileTreeNode {
     collapse_single_child_dirs(root)
 }
 
-fn insert_path_parts(node: &mut FileTreeNode, parts: &[&str], idx: usize, file: &DiffFile) {
+fn insert_path_parts(node: &mut FileTreeNode, parts: &[&str], idx: usize, file: &FileTreeEntry) {
     if idx >= parts.len() {
         return;
     }
@@ -352,7 +382,7 @@ fn render_tree_node(node: FileTreeNode, depth: usize, ctx: &TreeRenderCtx<'_>) -
 /// Hierarchical changed-files sidebar with filter, status badges, `+N -M`, viewed state, and generated collapse.
 #[component]
 pub fn FileList(
-    #[prop(into)] files: Signal<Vec<DiffFile>>,
+    #[prop(into)] files: Signal<Vec<FileTreeEntry>>,
     #[prop(into)] comment_counts: Signal<std::collections::HashMap<String, usize>>,
     #[prop(into)] reviewed_files: Signal<HashSet<String>>,
     #[prop(into)] selected_file_path: Signal<Option<String>>,
@@ -365,38 +395,42 @@ pub fn FileList(
     let expanded_dirs = RwSignal::new(HashSet::<String>::new());
 
     let primary_files = Memo::new(move |_| {
-        files
-            .get()
-            .into_iter()
-            .filter(|f| !f.is_generated)
-            .collect::<Vec<_>>()
+        files.with(|list| {
+            list.iter()
+                .filter(|f| !f.is_generated)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
     });
     let generated_files = Memo::new(move |_| {
-        files
-            .get()
-            .into_iter()
-            .filter(|f| f.is_generated)
-            .collect::<Vec<_>>()
+        files.with(|list| {
+            list.iter()
+                .filter(|f| f.is_generated)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
     });
 
-    let primary_tree = Memo::new(move |_| build_file_tree(&primary_files.get()));
-    let generated_tree = Memo::new(move |_| build_file_tree(&generated_files.get()));
+    let primary_tree = Memo::new(move |_| primary_files.with(|list| build_file_tree(list)));
+    let generated_tree = Memo::new(move |_| generated_files.with(|list| build_file_tree(list)));
 
     Effect::new(move |_| {
-        let mut all_dirs = get_all_directory_paths(&primary_tree.get());
-        all_dirs.extend(get_all_directory_paths(&generated_tree.get()));
+        let mut all_dirs = primary_tree.with(get_all_directory_paths);
+        all_dirs.extend(generated_tree.with(get_all_directory_paths));
         expanded_dirs.set(all_dirs.into_iter().collect());
     });
 
-    let totals = Signal::derive(move || {
-        files.get().iter().fold((0u32, 0u32), |(add, del), f| {
-            (add + f.additions, del + f.deletions)
+    let totals = Memo::new(move |_| {
+        files.with(|list| {
+            list.iter().fold((0u32, 0u32), |(add, del), f| {
+                (add + f.additions, del + f.deletions)
+            })
         })
     });
 
     let toggle_all_dirs = move |_| {
-        let mut all_dirs = get_all_directory_paths(&primary_tree.get_untracked());
-        all_dirs.extend(get_all_directory_paths(&generated_tree.get_untracked()));
+        let mut all_dirs = primary_tree.with_untracked(get_all_directory_paths);
+        all_dirs.extend(generated_tree.with_untracked(get_all_directory_paths));
         let is_all_expanded = !all_dirs.is_empty()
             && expanded_dirs.with_untracked(|cur| all_dirs.iter().all(|d| cur.contains(d)));
         if is_all_expanded {
@@ -411,7 +445,7 @@ pub fn FileList(
             <div class="file-list-header">
                 <div class="file-list-header__top">
                     <h3 class="file-list-title">
-                        {move || alloc::format!("Files changed ({})", files.get().len())}
+                        {move || alloc::format!("Files changed ({})", files.with(Vec::len))}
                     </h3>
                     <div class="file-list-header__actions">
                         <span class="diff-totals">
@@ -455,7 +489,7 @@ pub fn FileList(
                     let counts = comment_counts.get();
                     let selected = selected_file_path.get();
 
-                    let p_tree = filter_file_tree(&primary_tree.get(), &query);
+                    let p_tree = primary_tree.with(|tree| filter_file_tree(tree, &query));
                     let p_reviewed_dirs = get_reviewed_directory_paths(&p_tree, &reviewed);
                     let p_ctx = TreeRenderCtx {
                         expanded_dirs,
@@ -473,8 +507,8 @@ pub fn FileList(
                         .map(|child| render_tree_node(child, 0, &p_ctx))
                         .collect::<Vec<_>>();
 
-                    let g_count = generated_files.get().len();
-                    let g_tree = filter_file_tree(&generated_tree.get(), &query);
+                    let g_count = generated_files.with(Vec::len);
+                    let g_tree = generated_tree.with(|tree| filter_file_tree(tree, &query));
                     let g_reviewed_dirs = get_reviewed_directory_paths(&g_tree, &reviewed);
                     let g_ctx = TreeRenderCtx {
                         expanded_dirs,
@@ -534,16 +568,35 @@ mod tests {
     use alloc::vec;
     use tellit_types::FileStatus;
 
-    fn sample_file(path: &str) -> DiffFile {
-        DiffFile {
+    fn sample_file(path: &str) -> FileTreeEntry {
+        FileTreeEntry {
             path: String::from(path),
             old_path: None,
             status: FileStatus::Modified,
             additions: 1,
             deletions: 0,
             is_generated: false,
-            chunks: Vec::new(),
         }
+    }
+
+    #[test]
+    fn converts_diff_file_into_lightweight_tree_entry() {
+        let diff_file = DiffFile {
+            path: String::from("src/main.rs"),
+            old_path: Some(String::from("src/old.rs")),
+            status: FileStatus::Renamed,
+            additions: 12,
+            deletions: 4,
+            is_generated: true,
+            chunks: Vec::new(),
+        };
+        let entry = FileTreeEntry::from(&diff_file);
+        assert_eq!(entry.path, "src/main.rs");
+        assert_eq!(entry.old_path.as_deref(), Some("src/old.rs"));
+        assert_eq!(entry.status, FileStatus::Renamed);
+        assert_eq!(entry.additions, 12);
+        assert_eq!(entry.deletions, 4);
+        assert!(entry.is_generated);
     }
 
     #[test]

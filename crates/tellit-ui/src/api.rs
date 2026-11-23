@@ -64,7 +64,7 @@ fn encode_uri_path(path: &str) -> String {
         .join("/")
 }
 
-async fn send_text_request(url: &str, init: Option<&RequestInit>) -> Result<String, ApiError> {
+async fn fetch_response(url: &str, init: Option<&RequestInit>) -> Result<Response, ApiError> {
     let window = web_sys::window().ok_or(ApiError::MissingWindow)?;
     let promise = match init {
         Some(opts) => window.fetch_with_str_and_init(url, opts),
@@ -73,10 +73,24 @@ async fn send_text_request(url: &str, init: Option<&RequestInit>) -> Result<Stri
     let resp_value = JsFuture::from(promise)
         .await
         .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
-    let response: Response = resp_value
+    resp_value
         .dyn_into()
-        .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
+        .map_err(|err| ApiError::Transport(format_js_error(&err)))
+}
 
+fn http_status_error(status: u16, status_text: String, parsed_msg: Option<String>) -> ApiError {
+    let message = parsed_msg.unwrap_or_else(|| {
+        if status_text.is_empty() {
+            String::from("request failed")
+        } else {
+            status_text
+        }
+    });
+    ApiError::HttpStatus { status, message }
+}
+
+async fn send_text_request(url: &str, init: Option<&RequestInit>) -> Result<String, ApiError> {
+    let response = fetch_response(url, init).await?;
     let status = response.status();
     let status_text = response.status_text();
 
@@ -93,25 +107,42 @@ async fn send_text_request(url: &str, init: Option<&RequestInit>) -> Result<Stri
             .ok()
             .map(|e| e.error)
             .filter(|s| !s.trim().is_empty());
-        let message = parsed_msg.unwrap_or_else(|| {
-            if status_text.is_empty() {
-                String::from("request failed")
-            } else {
-                status_text
-            }
-        });
-        return Err(ApiError::HttpStatus { status, message });
+        return Err(http_status_error(status, status_text, parsed_msg));
     }
 
     Ok(body)
+}
+
+async fn send_bytes_request(url: &str, init: Option<&RequestInit>) -> Result<Vec<u8>, ApiError> {
+    let response = fetch_response(url, init).await?;
+    let status = response.status();
+    let status_text = response.status_text();
+
+    let buf_promise = response
+        .array_buffer()
+        .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
+    let buf_value = JsFuture::from(buf_promise)
+        .await
+        .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
+    let bytes = js_sys::Uint8Array::new(&buf_value).to_vec();
+
+    if !response.ok() {
+        let parsed_msg = serde_json::from_slice::<ApiErrorResponse>(&bytes)
+            .ok()
+            .map(|e| e.error)
+            .filter(|s| !s.trim().is_empty());
+        return Err(http_status_error(status, status_text, parsed_msg));
+    }
+
+    Ok(bytes)
 }
 
 async fn send_request<T: DeserializeOwned>(
     url: &str,
     init: Option<&RequestInit>,
 ) -> Result<T, ApiError> {
-    let body = send_text_request(url, init).await?;
-    Ok(serde_json::from_str(&body)?)
+    let bytes = send_bytes_request(url, init).await?;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 async fn fetch_json<T: DeserializeOwned>(url: &str) -> Result<T, ApiError> {

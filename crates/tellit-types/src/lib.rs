@@ -713,7 +713,7 @@ pub struct LineRangeSpec {
 }
 
 /// Which side of a comparison a review comment thread anchors to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CommentSide {
     /// Anchored to the base (`From`) revision in an inter-commit comparison.

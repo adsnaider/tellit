@@ -3,6 +3,7 @@
 extern crate alloc;
 
 use alloc::string::String;
+use core::borrow::Borrow;
 use std::collections::HashSet;
 
 use tellit_types::{CommentSide, DiffFile, DiffLineKind};
@@ -12,7 +13,7 @@ use web_sys::{HtmlElement, KeyboardEvent, ScrollIntoViewOptions, ScrollLogicalPo
 use crate::state::{self, DiffViewMode};
 
 /// Focused row coordinates inside the active diff file list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CursorPosition {
     /// Index into `JjDiffResponse::files`.
     pub file_index: usize,
@@ -85,10 +86,13 @@ pub fn scroll_to_element_id(element_id: &str, block: ScrollLogicalPosition) -> b
 
 /// Adjusts `pos.side` when a split-pane row only has content on the opposite side.
 #[must_use]
-pub fn normalize_cursor_side(mut pos: CursorPosition, files: &[DiffFile]) -> CursorPosition {
+pub fn normalize_cursor_side<F: Borrow<DiffFile>>(
+    mut pos: CursorPosition,
+    files: &[F],
+) -> CursorPosition {
     if let Some(line) = files
         .get(pos.file_index)
-        .and_then(|f| f.chunks.get(pos.chunk_index))
+        .and_then(|f| f.borrow().chunks.get(pos.chunk_index))
         .and_then(|c| c.lines.get(pos.line_index))
     {
         match line.kind {
@@ -100,10 +104,10 @@ pub fn normalize_cursor_side(mut pos: CursorPosition, files: &[DiffFile]) -> Cur
     pos
 }
 
-fn has_content_on_side(pos: CursorPosition, files: &[DiffFile]) -> bool {
+fn has_content_on_side<F: Borrow<DiffFile>>(pos: CursorPosition, files: &[F]) -> bool {
     let Some(line) = files
         .get(pos.file_index)
-        .and_then(|f| f.chunks.get(pos.chunk_index))
+        .and_then(|f| f.borrow().chunks.get(pos.chunk_index))
         .and_then(|c| c.lines.get(pos.line_index))
     else {
         return false;
@@ -114,131 +118,192 @@ fn has_content_on_side(pos: CursorPosition, files: &[DiffFile]) -> bool {
     }
 }
 
-fn advance_cursor(
+fn is_file_skipped(
+    file: &DiffFile,
+    reviewed_files: &HashSet<String>,
+    collapsed_files: &HashSet<String>,
+) -> bool {
+    file.chunks.is_empty()
+        || reviewed_files.contains(&file.path)
+        || collapsed_files.contains(&file.path)
+}
+
+fn next_unskipped_file_from<F: Borrow<DiffFile>>(
+    mut file_idx: usize,
+    dir: NavigationDirection,
+    files: &[F],
+    reviewed_files: &HashSet<String>,
+    collapsed_files: &HashSet<String>,
+) -> Option<usize> {
+    let total = files.len();
+    for _ in 0..total {
+        if !is_file_skipped(files[file_idx].borrow(), reviewed_files, collapsed_files) {
+            return Some(file_idx);
+        }
+        file_idx = match dir {
+            NavigationDirection::Next => (file_idx + 1) % total,
+            NavigationDirection::Prev => (file_idx + total - 1) % total,
+        };
+    }
+    None
+}
+
+fn last_line_in_file(file: &DiffFile) -> Option<(usize, usize)> {
+    for (ci, chunk) in file.chunks.iter().enumerate().rev() {
+        if !chunk.lines.is_empty() {
+            return Some((ci, chunk.lines.len() - 1));
+        }
+    }
+    None
+}
+
+fn first_line_in_file(file: &DiffFile) -> Option<(usize, usize)> {
+    for (ci, chunk) in file.chunks.iter().enumerate() {
+        if !chunk.lines.is_empty() {
+            return Some((ci, 0));
+        }
+    }
+    None
+}
+
+/// Steps one line forward or backward while skipping reviewed and collapsed files in `O(1)` per file.
+fn advance_cursor<F: Borrow<DiffFile>>(
     pos: CursorPosition,
     dir: NavigationDirection,
-    files: &[DiffFile],
+    files: &[F],
+    reviewed_files: &HashSet<String>,
+    collapsed_files: &HashSet<String>,
 ) -> Option<CursorPosition> {
     let total_files = files.len();
     if total_files == 0 {
         return None;
     }
-    let mut file_idx = pos.file_index.min(total_files - 1);
-    let mut chunk_idx = pos.chunk_index;
-    let mut line_idx = isize::try_from(pos.line_index).unwrap_or(0);
-    let mut wraps = 0usize;
+
+    let cur_file_idx = pos.file_index.min(total_files - 1);
+    let cur_file = files[cur_file_idx].borrow();
+
+    // If the cursor sits on a skipped file, jump directly to the next open file without
+    // scanning any lines inside skipped files.
+    if is_file_skipped(cur_file, reviewed_files, collapsed_files) {
+        let start_search = match dir {
+            NavigationDirection::Next => (cur_file_idx + 1) % total_files,
+            NavigationDirection::Prev => (cur_file_idx + total_files - 1) % total_files,
+        };
+        let next_file_idx =
+            next_unskipped_file_from(start_search, dir, files, reviewed_files, collapsed_files)?;
+        let target_file = files[next_file_idx].borrow();
+        let (ci, li) = match dir {
+            NavigationDirection::Next => first_line_in_file(target_file)?,
+            NavigationDirection::Prev => last_line_in_file(target_file)?,
+        };
+        return Some(CursorPosition {
+            file_index: next_file_idx,
+            chunk_index: ci,
+            line_index: li,
+            side: pos.side,
+        });
+    }
 
     match dir {
         NavigationDirection::Next => {
-            line_idx += 1;
-            while wraps <= total_files {
-                let valid = files
-                    .get(file_idx)
-                    .and_then(|f| f.chunks.get(chunk_idx))
-                    .and_then(|c| {
-                        usize::try_from(line_idx)
-                            .ok()
-                            .and_then(|li| c.lines.get(li))
-                    })
-                    .is_some();
-                if valid {
+            if let Some(chunk) = cur_file.chunks.get(pos.chunk_index)
+                && pos.line_index + 1 < chunk.lines.len()
+            {
+                return Some(CursorPosition {
+                    file_index: cur_file_idx,
+                    chunk_index: pos.chunk_index,
+                    line_index: pos.line_index + 1,
+                    side: pos.side,
+                });
+            }
+            for ci in (pos.chunk_index + 1)..cur_file.chunks.len() {
+                if !cur_file.chunks[ci].lines.is_empty() {
                     return Some(CursorPosition {
-                        file_index: file_idx,
-                        chunk_index: chunk_idx,
-                        line_index: usize::try_from(line_idx).unwrap_or(0),
+                        file_index: cur_file_idx,
+                        chunk_index: ci,
+                        line_index: 0,
                         side: pos.side,
                     });
                 }
-
-                chunk_idx += 1;
-                line_idx = 0;
-                let has_chunk = files
-                    .get(file_idx)
-                    .and_then(|f| f.chunks.get(chunk_idx))
-                    .is_some();
-                if !has_chunk {
-                    file_idx += 1;
-                    chunk_idx = 0;
-                    line_idx = 0;
-                    if file_idx >= total_files {
-                        file_idx = 0;
-                        wraps += 1;
-                    }
-                }
             }
+            let next_file_idx = next_unskipped_file_from(
+                (cur_file_idx + 1) % total_files,
+                NavigationDirection::Next,
+                files,
+                reviewed_files,
+                collapsed_files,
+            )?;
+            let (ci, li) = first_line_in_file(files[next_file_idx].borrow())?;
+            Some(CursorPosition {
+                file_index: next_file_idx,
+                chunk_index: ci,
+                line_index: li,
+                side: pos.side,
+            })
         }
         NavigationDirection::Prev => {
-            line_idx -= 1;
-            while wraps <= total_files {
-                if line_idx < 0 {
-                    if chunk_idx == 0 {
-                        if file_idx == 0 {
-                            file_idx = total_files - 1;
-                            wraps += 1;
-                        } else {
-                            file_idx -= 1;
-                        }
-                        let file = &files[file_idx];
-                        if file.chunks.is_empty() {
-                            chunk_idx = 0;
-                            line_idx = -1;
-                        } else {
-                            chunk_idx = file.chunks.len() - 1;
-                            line_idx = isize::try_from(file.chunks[chunk_idx].lines.len())
-                                .unwrap_or(0)
-                                - 1;
-                        }
-                    } else {
-                        chunk_idx -= 1;
-                        line_idx = isize::try_from(files[file_idx].chunks[chunk_idx].lines.len())
-                            .unwrap_or(0)
-                            - 1;
-                    }
-                }
-
-                if line_idx >= 0
-                    && let Ok(li) = usize::try_from(line_idx)
-                    && files
-                        .get(file_idx)
-                        .and_then(|f| f.chunks.get(chunk_idx))
-                        .and_then(|c| c.lines.get(li))
-                        .is_some()
-                {
+            if pos.line_index > 0
+                && cur_file
+                    .chunks
+                    .get(pos.chunk_index)
+                    .is_some_and(|c| pos.line_index - 1 < c.lines.len())
+            {
+                return Some(CursorPosition {
+                    file_index: cur_file_idx,
+                    chunk_index: pos.chunk_index,
+                    line_index: pos.line_index - 1,
+                    side: pos.side,
+                });
+            }
+            for ci in (0..pos.chunk_index.min(cur_file.chunks.len())).rev() {
+                if !cur_file.chunks[ci].lines.is_empty() {
                     return Some(CursorPosition {
-                        file_index: file_idx,
-                        chunk_index: chunk_idx,
-                        line_index: li,
+                        file_index: cur_file_idx,
+                        chunk_index: ci,
+                        line_index: cur_file.chunks[ci].lines.len() - 1,
                         side: pos.side,
                     });
                 }
-                line_idx = -1;
             }
+            let prev_file_idx = next_unskipped_file_from(
+                (cur_file_idx + total_files - 1) % total_files,
+                NavigationDirection::Prev,
+                files,
+                reviewed_files,
+                collapsed_files,
+            )?;
+            let (ci, li) = last_line_in_file(files[prev_file_idx].borrow())?;
+            Some(CursorPosition {
+                file_index: prev_file_idx,
+                chunk_index: ci,
+                line_index: li,
+                side: pos.side,
+            })
         }
     }
-
-    None
 }
 
-fn matches_target(
+fn matches_target<F: Borrow<DiffFile>>(
     pos: CursorPosition,
     target: NavigationTarget,
-    files: &[DiffFile],
+    files: &[F],
     mode: DiffViewMode,
     reviewed_files: &HashSet<String>,
+    collapsed_files: &HashSet<String>,
 ) -> bool {
-    let Some(file) = files.get(pos.file_index) else {
+    let Some(file) = files.get(pos.file_index).map(Borrow::borrow) else {
         return false;
     };
     match target {
         NavigationTarget::File => pos.chunk_index == 0 && pos.line_index == 0,
         NavigationTarget::Line => {
-            if reviewed_files.contains(&file.path) {
+            if is_file_skipped(file, reviewed_files, collapsed_files) {
                 return false;
             }
             mode == DiffViewMode::Unified || has_content_on_side(pos, files)
         }
         NavigationTarget::Chunk => {
-            if reviewed_files.contains(&file.path) {
+            if is_file_skipped(file, reviewed_files, collapsed_files) {
                 return false;
             }
             let Some(chunk) = file.chunks.get(pos.chunk_index) else {
@@ -259,15 +324,17 @@ fn matches_target(
     }
 }
 
-/// Computes the next [`CursorPosition`] matching `target` in `dir`, wrapping around cleanly.
+/// Computes the next [`CursorPosition`] matching `target` in `dir`, skipping collapsed and
+/// reviewed files in `O(1)` per file and wrapping around cleanly.
 #[must_use]
-pub fn find_next_position(
+pub fn find_next_position<F: Borrow<DiffFile>>(
     start: Option<CursorPosition>,
     dir: NavigationDirection,
     target: NavigationTarget,
-    files: &[DiffFile],
+    files: &[F],
     mode: DiffViewMode,
     reviewed_files: &HashSet<String>,
+    collapsed_files: &HashSet<String>,
 ) -> Option<CursorPosition> {
     if files.is_empty() {
         return None;
@@ -301,23 +368,50 @@ pub fn find_next_position(
         ));
     }
 
-    let origin = start.unwrap_or(CursorPosition {
-        file_index: 0,
-        chunk_index: 0,
-        line_index: 0,
-        side: CommentSide::New,
-    });
-    let mut current = if start.is_none() {
-        if matches_target(origin, target, files, mode, reviewed_files) {
-            return Some(normalize_cursor_side(origin, files));
+    let origin = match start {
+        Some(pos) => pos,
+        None => {
+            let start_idx = match dir {
+                NavigationDirection::Next => 0,
+                NavigationDirection::Prev => 0,
+            };
+            let first_open =
+                next_unskipped_file_from(start_idx, dir, files, reviewed_files, collapsed_files)?;
+            let first_file = files[first_open].borrow();
+            let (ci, li) = match dir {
+                NavigationDirection::Next => first_line_in_file(first_file)?,
+                NavigationDirection::Prev => {
+                    if first_open == 0 {
+                        first_line_in_file(first_file)?
+                    } else {
+                        last_line_in_file(first_file)?
+                    }
+                }
+            };
+            let candidate = CursorPosition {
+                file_index: first_open,
+                chunk_index: ci,
+                line_index: li,
+                side: CommentSide::New,
+            };
+            if matches_target(
+                candidate,
+                target,
+                files,
+                mode,
+                reviewed_files,
+                collapsed_files,
+            ) {
+                return Some(normalize_cursor_side(candidate, files));
+            }
+            candidate
         }
-        origin
-    } else {
-        origin
     };
 
-    for _ in 0..total_line_budget(files) {
-        let next = advance_cursor(current, dir, files)?;
+    let mut current = origin;
+    let budget = open_line_budget(files, reviewed_files, collapsed_files);
+    for _ in 0..budget {
+        let next = advance_cursor(current, dir, files, reviewed_files, collapsed_files)?;
         if next.file_index == origin.file_index
             && next.chunk_index == origin.chunk_index
             && next.line_index == origin.line_index
@@ -326,7 +420,14 @@ pub fn find_next_position(
             break;
         }
         current = next;
-        if matches_target(current, target, files, mode, reviewed_files) {
+        if matches_target(
+            current,
+            target,
+            files,
+            mode,
+            reviewed_files,
+            collapsed_files,
+        ) {
             return Some(normalize_cursor_side(current, files));
         }
     }
@@ -334,26 +435,31 @@ pub fn find_next_position(
     None
 }
 
-fn total_line_budget(files: &[DiffFile]) -> usize {
+fn open_line_budget<F: Borrow<DiffFile>>(
+    files: &[F],
+    reviewed_files: &HashSet<String>,
+    collapsed_files: &HashSet<String>,
+) -> usize {
     files
         .iter()
+        .map(Borrow::borrow)
+        .filter(|f| !is_file_skipped(f, reviewed_files, collapsed_files))
         .map(|f| f.chunks.iter().map(|c| c.lines.len()).sum::<usize>())
         .sum::<usize>()
-        .saturating_add(files.len())
-        .max(1)
+        .saturating_add(1)
 }
 
 /// Returns the first unviewed file index strictly following `after_index`, wrapping around.
 #[must_use]
-pub fn next_unviewed_file_index(
+pub fn next_unviewed_file_index<F: Borrow<DiffFile>>(
     after_index: usize,
-    files: &[DiffFile],
+    files: &[F],
     reviewed_files: &HashSet<String>,
 ) -> Option<usize> {
     let total = files.len();
     for offset in 1..total {
         let idx = (after_index + offset) % total;
-        if !reviewed_files.contains(&files[idx].path) {
+        if !reviewed_files.contains(&files[idx].borrow().path) {
             return Some(idx);
         }
     }
@@ -362,14 +468,14 @@ pub fn next_unviewed_file_index(
 
 /// Switches `cursor` between `Old` (left) and `New` (right) in split view across paired lines.
 #[must_use]
-pub fn switch_split_side(
+pub fn switch_split_side<F: Borrow<DiffFile>>(
     cursor: CursorPosition,
     side: CommentSide,
-    files: &[DiffFile],
+    files: &[F],
 ) -> CursorPosition {
     let Some(lines) = files
         .get(cursor.file_index)
-        .and_then(|f| f.chunks.get(cursor.chunk_index))
+        .and_then(|f| f.borrow().chunks.get(cursor.chunk_index))
         .map(|c| c.lines.as_slice())
     else {
         return cursor;
@@ -436,12 +542,12 @@ pub fn switch_split_side(
 
 /// Computes the DOM element ID to scroll to for a given [`CursorPosition`].
 #[must_use]
-pub fn cursor_scroll_id(
+pub fn cursor_scroll_id<F: Borrow<DiffFile>>(
     pos: CursorPosition,
-    files: &[DiffFile],
+    files: &[F],
     mode: DiffViewMode,
 ) -> Option<String> {
-    let file = files.get(pos.file_index)?;
+    let file = files.get(pos.file_index)?.borrow();
     let line = file
         .chunks
         .get(pos.chunk_index)
@@ -476,6 +582,26 @@ mod tests {
             new_line_number: new_n,
             syntax_spans: Vec::new(),
             word_diff: Vec::new(),
+        }
+    }
+
+    fn mk_file(path: &str, lines: alloc::vec::Vec<DiffLine>) -> DiffFile {
+        let len = u32::try_from(lines.len()).unwrap_or(u32::MAX);
+        DiffFile {
+            path: String::from(path),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: len,
+            deletions: 0,
+            is_generated: false,
+            chunks: alloc::vec![DiffChunk {
+                old_start: 1,
+                old_lines: len,
+                new_start: 1,
+                new_lines: len,
+                header: String::from("@@ -1,1 +1,1 @@"),
+                lines,
+            }],
         }
     }
 
@@ -521,6 +647,7 @@ mod tests {
         ];
 
         let mut reviewed = HashSet::new();
+        let collapsed = HashSet::new();
         let first = find_next_position(
             None,
             NavigationDirection::Next,
@@ -528,6 +655,7 @@ mod tests {
             &files,
             DiffViewMode::Unified,
             &reviewed,
+            &collapsed,
         )
         .unwrap();
         assert_eq!(first.file_index, 0);
@@ -540,6 +668,7 @@ mod tests {
             &files,
             DiffViewMode::Unified,
             &reviewed,
+            &collapsed,
         )
         .unwrap();
         assert_eq!(chunk.line_index, 1);
@@ -559,9 +688,78 @@ mod tests {
             &files,
             DiffViewMode::Unified,
             &reviewed,
+            &collapsed,
         )
         .unwrap();
         assert_eq!(wrapped.file_index, 0);
         assert_eq!(wrapped.line_index, 0);
+    }
+
+    #[test]
+    fn skips_collapsed_files_in_both_directions_and_returns_none_when_all_collapsed() {
+        let huge_lines: alloc::vec::Vec<DiffLine> = (1..=500)
+            .map(|n| mk_line(DiffLineKind::Add, None, Some(n)))
+            .collect();
+        let files = alloc::vec![
+            mk_file(
+                "a.rs",
+                alloc::vec![mk_line(DiffLineKind::Add, None, Some(1))]
+            ),
+            mk_file("big_collapsed.rs", huge_lines),
+            mk_file(
+                "c.rs",
+                alloc::vec![mk_line(DiffLineKind::Add, None, Some(1))]
+            ),
+        ];
+
+        let reviewed = HashSet::new();
+        let mut collapsed = HashSet::new();
+        collapsed.insert(String::from("big_collapsed.rs"));
+
+        let at_a = CursorPosition {
+            file_index: 0,
+            chunk_index: 0,
+            line_index: 0,
+            side: CommentSide::New,
+        };
+        let next = find_next_position(
+            Some(at_a),
+            NavigationDirection::Next,
+            NavigationTarget::Line,
+            &files,
+            DiffViewMode::Unified,
+            &reviewed,
+            &collapsed,
+        )
+        .unwrap();
+        assert_eq!(next.file_index, 2);
+
+        let prev = find_next_position(
+            Some(next),
+            NavigationDirection::Prev,
+            NavigationTarget::Line,
+            &files,
+            DiffViewMode::Unified,
+            &reviewed,
+            &collapsed,
+        )
+        .unwrap();
+        assert_eq!(prev.file_index, 0);
+
+        // Collapsing every file returns None immediately.
+        collapsed.insert(String::from("a.rs"));
+        collapsed.insert(String::from("c.rs"));
+        assert_eq!(
+            find_next_position(
+                None,
+                NavigationDirection::Next,
+                NavigationTarget::Line,
+                &files,
+                DiffViewMode::Unified,
+                &reviewed,
+                &collapsed,
+            ),
+            None
+        );
     }
 }

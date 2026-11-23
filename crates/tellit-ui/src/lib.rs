@@ -33,14 +33,19 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use tellit_types::{
     AppearanceSettings, CommentSide, CreateCommentRequest, DiffFile, FileStatus, JjChange,
-    JjCommentThread, JjCommit, JjDiffResponse, JjGraphRow, ThemePreference, WatchEvent,
+    JjCommentThread, JjCommit, JjDiffResponse, JjGraphRow, LineRangeSpec, ThemePreference,
+    WatchEvent,
 };
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::JsFuture;
 use web_sys::{KeyboardEvent, MouseEvent, ScrollLogicalPosition};
 
 use components::comments::{CommentReplyEvent, CommentsDrawer, UnresolvedJumpMenu};
-use components::file_list::FileList;
+use components::file_list::{FileList, FileTreeEntry};
 use components::help_modal::HelpModal;
 use components::keyboard::{self, CursorPosition, NavigationDirection, NavigationTarget};
+use components::markdown_diff::MarkdownTab;
 use components::review_dot::ReviewDot;
 use components::revision_selector::{
     JjChangeSelector, JjCommitComparisonSelector, commit_ids_match, pick_initial_change,
@@ -53,10 +58,67 @@ use components::settings_modal::SettingsModal;
 use components::text_diff::expanded::{
     ExpandedLinesMap, record_expand_all_before, record_line_expansion, split_blob_lines,
 };
+use components::text_diff::word_highlight;
 use components::text_diff::{
-    CreateThreadEvent, ExpandLinesEvent, KeyboardCommentTrigger, TextDiffCard,
+    ActiveComposer, CreateThreadEvent, ExpandLinesEvent, LineSelectionDrag, TextDiffCard,
+    extract_snippet_for_file, parse_comment_side,
 };
 pub use state::{ConnectionState, DiffViewMode, RepoStatusState, ResolvedTheme};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadedDiff {
+    commit: String,
+    base_commit: String,
+    is_empty: bool,
+    is_rebase_diff: bool,
+    rebase_ignored: bool,
+    rebase_conflict: bool,
+    files: Vec<Arc<DiffFile>>,
+}
+
+impl From<JjDiffResponse> for LoadedDiff {
+    fn from(diff: JjDiffResponse) -> Self {
+        Self {
+            commit: diff.commit,
+            base_commit: diff.base_commit,
+            is_empty: diff.is_empty,
+            is_rebase_diff: diff.is_rebase_diff,
+            rebase_ignored: diff.rebase_ignored,
+            rebase_conflict: diff.rebase_conflict,
+            files: diff.files.into_iter().map(Arc::new).collect(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FileCardSlot {
+    path: String,
+    file: RwSignal<Arc<DiffFile>>,
+    file_index: RwSignal<usize>,
+    commits: RwSignal<(String, String)>,
+    drag_state: RwSignal<Option<LineSelectionDrag>>,
+    active_composer: RwSignal<Option<ActiveComposer>>,
+    md_tab: RwSignal<MarkdownTab>,
+}
+
+impl FileCardSlot {
+    fn dispose(&self) {
+        self.file.dispose();
+        self.file_index.dispose();
+        self.commits.dispose();
+        self.drag_state.dispose();
+        self.active_composer.dispose();
+        self.md_tab.dispose();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiffPaneState {
+    Loading,
+    Idle,
+    Empty { base: String, target: String },
+    Ready,
+}
 
 #[derive(Clone, Copy)]
 struct AppCtx {
@@ -73,7 +135,9 @@ struct AppCtx {
     target_commit_id: RwSignal<String>,
     base_commit_id: RwSignal<String>,
     ignore_rebase: RwSignal<bool>,
-    diff_data: RwSignal<Option<JjDiffResponse>>,
+    diff_data: RwSignal<Option<Arc<LoadedDiff>>>,
+    ordered_file_slots: RwSignal<Vec<FileCardSlot>>,
+    file_slot_map: StoredValue<HashMap<String, FileCardSlot>, LocalStorage>,
     loading_diff: RwSignal<bool>,
     comments: RwSignal<Vec<JjCommentThread>>,
     error_banner: RwSignal<Option<String>>,
@@ -93,8 +157,8 @@ struct AppCtx {
     help_open: RwSignal<bool>,
     active_cursor: RwSignal<Option<CursorPosition>>,
     hovered_file_index: RwSignal<Option<usize>>,
-    keyboard_comment_trigger: RwSignal<Option<KeyboardCommentTrigger>>,
-    keyboard_comment_seq: StoredValue<u64, LocalStorage>,
+    active_drag_file: StoredValue<Option<String>, LocalStorage>,
+    selection_anchor: StoredValue<Option<(String, CommentSide, u32)>, LocalStorage>,
     unresolved_jump_cursor: StoredValue<usize, LocalStorage>,
     changes_req_id: StoredValue<u64, LocalStorage>,
     commits_req_id: StoredValue<u64, LocalStorage>,
@@ -125,6 +189,8 @@ impl AppCtx {
             base_commit_id: RwSignal::new(String::from("parent")),
             ignore_rebase: RwSignal::new(true),
             diff_data: RwSignal::new(None),
+            ordered_file_slots: RwSignal::new(Vec::new()),
+            file_slot_map: StoredValue::new_local(HashMap::new()),
             loading_diff: RwSignal::new(false),
             comments: RwSignal::new(Vec::new()),
             error_banner: RwSignal::new(None),
@@ -147,8 +213,8 @@ impl AppCtx {
             help_open: RwSignal::new(false),
             active_cursor: RwSignal::new(None),
             hovered_file_index: RwSignal::new(None),
-            keyboard_comment_trigger: RwSignal::new(None),
-            keyboard_comment_seq: StoredValue::new_local(0),
+            active_drag_file: StoredValue::new_local(None),
+            selection_anchor: StoredValue::new_local(None),
             unresolved_jump_cursor: StoredValue::new_local(0),
             changes_req_id: StoredValue::new_local(0),
             commits_req_id: StoredValue::new_local(0),
@@ -162,11 +228,123 @@ impl AppCtx {
     }
 
     fn repo_root_string(&self) -> String {
-        match self.repo_status.get_untracked() {
-            RepoStatusState::Loaded(status) => status.repo_root.unwrap_or_default(),
+        self.repo_status.with_untracked(|s| match s {
+            RepoStatusState::Loaded(status) => status.repo_root.clone().unwrap_or_default(),
             _ => String::new(),
-        }
+        })
     }
+
+    fn current_diff(&self) -> Option<Arc<LoadedDiff>> {
+        self.diff_data
+            .with_untracked(|d| d.as_ref().map(Arc::clone))
+    }
+}
+
+/// Unmounts cards for files absent from `loaded` before `collapsed_files` updates so an outgoing
+/// collapsed file never flashes open prior to unmount.
+fn prune_removed_file_slots(ctx: AppCtx, loaded: &LoadedDiff) {
+    let keep_paths: HashSet<&str> = loaded.files.iter().map(|f| f.path.as_str()).collect();
+    let has_removed = ctx
+        .ordered_file_slots
+        .with_untracked(|cur| cur.iter().any(|s| !keep_paths.contains(s.path.as_str())));
+    if has_removed {
+        ctx.ordered_file_slots.update(|cur| {
+            cur.retain(|s| keep_paths.contains(s.path.as_str()));
+        });
+    }
+}
+
+fn sync_file_slots(ctx: AppCtx, loaded: &LoadedDiff) -> Vec<FileCardSlot> {
+    let mut ordered = Vec::with_capacity(loaded.files.len());
+    let mut keep_paths: HashSet<&str> = HashSet::with_capacity(loaded.files.len());
+    let mut changed_paths: HashSet<&str> = HashSet::new();
+    let mut evicted = Vec::new();
+
+    ctx.file_slot_map.update_value(|map| {
+        for (idx, file_arc) in loaded.files.iter().enumerate() {
+            keep_paths.insert(file_arc.path.as_str());
+            if let Some(slot) = map.get(&file_arc.path).cloned() {
+                let file_changed = slot
+                    .file
+                    .with_untracked(|old| old.as_ref() != file_arc.as_ref());
+                if file_changed {
+                    changed_paths.insert(file_arc.path.as_str());
+                    slot.file.set(Arc::clone(file_arc));
+                    slot.drag_state.set(None);
+                    slot.active_composer.set(None);
+                }
+                if slot.file_index.get_untracked() != idx {
+                    slot.file_index.set(idx);
+                }
+                if slot
+                    .commits
+                    .with_untracked(|c| c.0 != loaded.base_commit || c.1 != loaded.commit)
+                {
+                    slot.commits
+                        .set((loaded.base_commit.clone(), loaded.commit.clone()));
+                }
+                ordered.push(slot);
+            } else {
+                let slot = FileCardSlot {
+                    path: file_arc.path.clone(),
+                    file: RwSignal::new(Arc::clone(file_arc)),
+                    file_index: RwSignal::new(idx),
+                    commits: RwSignal::new((loaded.base_commit.clone(), loaded.commit.clone())),
+                    drag_state: RwSignal::new(None),
+                    active_composer: RwSignal::new(None),
+                    md_tab: RwSignal::new(MarkdownTab::Preview),
+                };
+                map.insert(file_arc.path.clone(), slot.clone());
+                ordered.push(slot);
+            }
+        }
+        let stale_keys: Vec<String> = map
+            .keys()
+            .filter(|path| !keep_paths.contains(path.as_str()))
+            .cloned()
+            .collect();
+        for key in stale_keys {
+            if let Some(slot) = map.remove(&key) {
+                evicted.push(slot);
+            }
+        }
+    });
+
+    ctx.active_drag_file.update_value(|active| {
+        if let Some(ref p) = *active
+            && (!keep_paths.contains(p.as_str()) || changed_paths.contains(p.as_str()))
+        {
+            *active = None;
+        }
+    });
+
+    let order_unchanged = ctx.ordered_file_slots.with_untracked(|cur| {
+        cur.len() == ordered.len()
+            && cur
+                .iter()
+                .zip(ordered.iter())
+                .all(|(a, b)| a.path == b.path)
+    });
+    if !order_unchanged {
+        ctx.ordered_file_slots.set(ordered);
+    }
+
+    evicted
+}
+
+fn clear_all_slot_interactions(ctx: AppCtx) {
+    ctx.active_drag_file.set_value(None);
+    ctx.selection_anchor.set_value(None);
+    ctx.file_slot_map.with_value(|map| {
+        for slot in map.values() {
+            if slot.drag_state.with_untracked(Option::is_some) {
+                slot.drag_state.set(None);
+            }
+            if slot.active_composer.with_untracked(Option::is_some) {
+                slot.active_composer.set(None);
+            }
+        }
+    });
 }
 
 fn next_req_id(slot: StoredValue<u64, LocalStorage>) -> u64 {
@@ -191,6 +369,7 @@ fn load_diff_and_comments(ctx: AppCtx, target: String, base: Option<String>, ign
                 if ctx.diff_req_id.get_value() != diff_id {
                     return;
                 }
+                let loaded = Arc::new(LoadedDiff::from(diff));
                 let _ = next_req_id(ctx.diff_generation);
                 ctx.expanded_lines.set(HashMap::new());
                 ctx.prefetched_line_counts.update_value(HashSet::clear);
@@ -199,10 +378,12 @@ fn load_diff_and_comments(ctx: AppCtx, target: String, base: Option<String>, ign
                 ctx.active_cursor.set(None);
 
                 let repo_root = ctx.repo_root_string();
-                let mut viewed = state::load_viewed_files(&repo_root, &diff.commit);
-                let auto_patterns = ctx.appearance.get_untracked().auto_viewed_patterns;
+                let mut viewed = state::load_viewed_files(&repo_root, &loaded.commit);
+                let auto_patterns = ctx
+                    .appearance
+                    .with_untracked(|a| a.auto_viewed_patterns.clone());
                 if !auto_patterns.is_empty() {
-                    for file in &diff.files {
+                    for file in &loaded.files {
                         if file.path != "Commit Message"
                             && state::matches_auto_viewed_patterns(&file.path, &auto_patterns)
                         {
@@ -211,14 +392,19 @@ fn load_diff_and_comments(ctx: AppCtx, target: String, base: Option<String>, ign
                     }
                 }
                 let mut collapsed: HashSet<String> = viewed.clone();
-                for file in &diff.files {
+                for file in &loaded.files {
                     if file.is_generated {
                         collapsed.insert(file.path.clone());
                     }
                 }
+                prune_removed_file_slots(ctx, &loaded);
                 ctx.reviewed_files.set(viewed);
                 ctx.collapsed_files.set(collapsed);
-                ctx.diff_data.set(Some(diff));
+                let evicted_slots = sync_file_slots(ctx, &loaded);
+                ctx.diff_data.set(Some(loaded));
+                for slot in evicted_slots {
+                    slot.dispose();
+                }
                 ctx.loading_diff.set(false);
                 ctx.error_banner.set(None);
             }
@@ -262,6 +448,7 @@ fn select_change(ctx: AppCtx, change_id: String) {
     if change_id.is_empty() {
         return;
     }
+    clear_all_slot_interactions(ctx);
     ctx.selected_change_id.set(change_id.clone());
     ctx.lookup_error.set(None);
 
@@ -645,7 +832,7 @@ fn prefetch_line_count_for_file(ctx: AppCtx, file: Arc<DiffFile>) {
     {
         return;
     }
-    let Some(diff) = ctx.diff_data.get_untracked() else {
+    let Some(diff) = ctx.current_diff() else {
         return;
     };
     let generation = ctx.diff_generation.get_value();
@@ -685,7 +872,7 @@ fn prefetch_line_count_for_file(ctx: AppCtx, file: Arc<DiffFile>) {
 }
 
 fn expand_lines_for_file(ctx: AppCtx, req: ExpandLinesEvent) {
-    let Some(diff) = ctx.diff_data.get_untracked() else {
+    let Some(diff) = ctx.current_diff() else {
         return;
     };
     let generation = ctx.diff_generation.get_value();
@@ -695,11 +882,15 @@ fn expand_lines_for_file(ctx: AppCtx, req: ExpandLinesEvent) {
         let path = req.file.path.clone();
         let old_path = req.file.old_path.as_deref().unwrap_or(&path).to_owned();
 
-        let existing = ctx.expanded_lines.get_untracked().get(&path).cloned();
-        let need_old = req.file.status != FileStatus::Added
-            && existing.as_ref().is_none_or(|e| e.old_content.is_none());
-        let need_new = req.file.status != FileStatus::Deleted
-            && existing.as_ref().is_none_or(|e| e.new_content.is_none());
+        let (need_old, need_new) = ctx.expanded_lines.with_untracked(|map| {
+            let existing = map.get(&path);
+            (
+                req.file.status != FileStatus::Added
+                    && existing.is_none_or(|e| e.old_content.is_none()),
+                req.file.status != FileStatus::Deleted
+                    && existing.is_none_or(|e| e.new_content.is_none()),
+            )
+        });
 
         let old_lines = if need_old {
             match api::fetch_blob_text(&old_path, &diff.base_commit).await {
@@ -760,6 +951,12 @@ pub fn App() -> impl IntoView {
     )));
     let is_resizing = RwSignal::new(false);
     let drag_origin = RwSignal::new((0i32, 300u32));
+    let pending_sidebar_width = StoredValue::new_local(Option::<u32>::None);
+    let resize_raf_id = StoredValue::new_local(Option::<i32>::None);
+    let resize_raf_cb = StoredValue::new_local(Option::<Closure<dyn FnMut()>>::None);
+    let highlight_sync_pending = StoredValue::new_local(false);
+    let marked_kbd_els = StoredValue::new_local(Vec::<web_sys::Element>::new());
+    let kbd_sync_pending = StoredValue::new_local(false);
 
     Effect::new(move |_| {
         load_jj_status(ctx);
@@ -773,6 +970,101 @@ pub fn App() -> impl IntoView {
                     .set(state::apply_appearance_to_document(&normalized));
                 state::save_appearance_settings(&normalized);
             }
+        });
+    });
+
+    // Apply CSS Custom Highlight API matches on a microtask after Leptos flushes DOM updates,
+    // avoiding per-token DOM spans and ensuring mode/collapse/expansion renders are already mounted.
+    Effect::new(move |_| {
+        if ctx.highlighted_word.with(Option::is_none) {
+            word_highlight::clear_css_word_highlight();
+            return;
+        }
+        // Track layout/content mutations only while an active highlight exists.
+        ctx.diff_data.track();
+        ctx.ordered_file_slots.track();
+        ctx.diff_mode.track();
+        ctx.collapsed_files.track();
+        ctx.expanded_lines.track();
+
+        if highlight_sync_pending.get_value() {
+            return;
+        }
+        highlight_sync_pending.set_value(true);
+        spawn_local(async move {
+            let _ = JsFuture::from(js_sys::Promise::resolve(&JsValue::UNDEFINED)).await;
+            let _ = highlight_sync_pending.try_set_value(false);
+            match ctx.highlighted_word.try_get_untracked().flatten() {
+                Some(word) => word_highlight::apply_css_word_highlight(&word),
+                None => word_highlight::clear_css_word_highlight(),
+            }
+        });
+    });
+
+    // Toggle `diff-row--kbd-active` on the single focused row (or split gutter + code pair)
+    // without creating per-row reactive effects across tens of thousands of diff lines.
+    Effect::new(move |_| {
+        if ctx.active_cursor.with(Option::is_none) {
+            marked_kbd_els.update_value(|els| {
+                for el in els.drain(..) {
+                    let _ = el.class_list().remove_1("diff-row--kbd-active");
+                }
+            });
+            return;
+        }
+        ctx.diff_mode.track();
+        ctx.diff_data.track();
+        ctx.ordered_file_slots.track();
+        ctx.collapsed_files.track();
+        ctx.expanded_lines.track();
+
+        if kbd_sync_pending.get_value() {
+            return;
+        }
+        kbd_sync_pending.set_value(true);
+        spawn_local(async move {
+            let _ = JsFuture::from(js_sys::Promise::resolve(&JsValue::UNDEFINED)).await;
+            let _ = kbd_sync_pending.try_set_value(false);
+
+            let _ = marked_kbd_els.try_update_value(|els| {
+                for el in els.drain(..) {
+                    let _ = el.class_list().remove_1("diff-row--kbd-active");
+                }
+            });
+
+            let Some(cur) = ctx.active_cursor.try_get_untracked().flatten() else {
+                return;
+            };
+            let Some(mode) = ctx.diff_mode.try_get_untracked() else {
+                return;
+            };
+            let Some(diff) = ctx
+                .diff_data
+                .try_with_untracked(|d| d.as_ref().map(Arc::clone))
+                .flatten()
+            else {
+                return;
+            };
+            let Some(element_id) = keyboard::cursor_scroll_id(cur, &diff.files, mode) else {
+                return;
+            };
+            let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+                return;
+            };
+            let Some(el) = doc.get_element_by_id(&element_id) else {
+                return;
+            };
+
+            let mut newly_marked = Vec::with_capacity(2);
+            let _ = el.class_list().add_1("diff-row--kbd-active");
+            if mode == DiffViewMode::Split
+                && let Some(code_cell) = el.next_element_sibling()
+            {
+                let _ = code_cell.class_list().add_1("diff-row--kbd-active");
+                newly_marked.push(code_cell);
+            }
+            newly_marked.push(el);
+            let _ = marked_kbd_els.try_set_value(newly_marked);
         });
     });
 
@@ -795,17 +1087,54 @@ pub fn App() -> impl IntoView {
         let delta = ev.client_x() - start_x;
         let next_w = i64::from(start_w).saturating_add(i64::from(delta)).max(0);
         let clamped = state::clamp_sidebar_width(u32::try_from(next_w).unwrap_or(u32::MAX));
-        sidebar_width.set(clamped);
+        pending_sidebar_width.set_value(Some(clamped));
+
+        if resize_raf_id.get_value().is_none() {
+            if let Some(window) = web_sys::window() {
+                let cb = Closure::<dyn FnMut()>::new(move || {
+                    resize_raf_id.set_value(None);
+                    let mut next = None;
+                    pending_sidebar_width.update_value(|slot| {
+                        next = slot.take();
+                    });
+                    if let Some(w) = next {
+                        sidebar_width.set(w);
+                    }
+                });
+                if let Ok(id) = window.request_animation_frame(cb.as_ref().unchecked_ref()) {
+                    resize_raf_id.set_value(Some(id));
+                    resize_raf_cb.set_value(Some(cb));
+                } else {
+                    sidebar_width.set(clamped);
+                }
+            } else {
+                sidebar_width.set(clamped);
+            }
+        }
     });
 
     let mouseup_handle = window_event_listener(ev::mouseup, move |_ev: MouseEvent| {
         if is_resizing.get_untracked() {
+            if let Some(id) = resize_raf_id.get_value() {
+                resize_raf_id.set_value(None);
+                if let Some(window) = web_sys::window() {
+                    let _ = window.cancel_animation_frame(id);
+                }
+            }
+            let mut final_w = None;
+            pending_sidebar_width.update_value(|slot| {
+                final_w = slot.take();
+            });
+            if let Some(w) = final_w {
+                sidebar_width.set(w);
+            }
             is_resizing.set(false);
             state::save_storage_u32(
                 state::SIDEBAR_WIDTH_STORAGE_KEY,
                 sidebar_width.get_untracked(),
             );
         }
+        finish_active_line_drag(ctx);
     });
 
     let keydown_handle = window_event_listener(ev::keydown, move |ev: KeyboardEvent| {
@@ -813,6 +1142,24 @@ pub fn App() -> impl IntoView {
     });
 
     on_cleanup(move || {
+        if let Some(id) = resize_raf_id.get_value() {
+            resize_raf_id.set_value(None);
+            if let Some(window) = web_sys::window() {
+                let _ = window.cancel_animation_frame(id);
+            }
+        }
+        resize_raf_cb.set_value(None);
+        marked_kbd_els.update_value(|els| {
+            for el in els.drain(..) {
+                let _ = el.class_list().remove_1("diff-row--kbd-active");
+            }
+        });
+        ctx.file_slot_map.update_value(|map| {
+            for (_, slot) in map.drain() {
+                slot.dispose();
+            }
+        });
+        word_highlight::clear_css_word_highlight();
         heartbeat_handle.set_value(None);
         watch_handle.set_value(None);
         mousemove_handle.remove();
@@ -866,7 +1213,7 @@ pub fn App() -> impl IntoView {
     });
 
     let on_toggle_reviewed = Callback::new(move |path: String| {
-        let Some(diff) = ctx.diff_data.get_untracked() else {
+        let Some(diff) = ctx.current_diff() else {
             return;
         };
         toggle_file_viewed_and_collapse(ctx, &diff.commit, &path);
@@ -874,7 +1221,7 @@ pub fn App() -> impl IntoView {
 
     let on_toggle_folder_reviewed =
         Callback::new(move |(folder_path, mark_reviewed): (String, bool)| {
-            let Some(diff) = ctx.diff_data.get_untracked() else {
+            let Some(diff) = ctx.current_diff() else {
                 return;
             };
             let prefix = alloc::format!("{folder_path}/");
@@ -949,16 +1296,16 @@ pub fn App() -> impl IntoView {
     });
 
     let on_create_thread = Callback::new(move |evt: CreateThreadEvent| {
-        let Some(diff) = ctx.diff_data.get_untracked() else {
+        let Some(diff) = ctx.current_diff() else {
             evt.on_done.run(Err(String::from("No active diff loaded")));
             return;
         };
         let base_state = ctx.base_commit_id.get_untracked();
         let is_interdiff = base_state != "parent" && !base_state.is_empty();
         let commit_id = if evt.side == CommentSide::Old && is_interdiff {
-            diff.base_commit
+            diff.base_commit.clone()
         } else {
-            diff.commit
+            diff.commit.clone()
         };
 
         spawn_local(async move {
@@ -1013,51 +1360,73 @@ pub fn App() -> impl IntoView {
         state::save_storage_bool(state::SHOW_RESOLVED_INLINE_STORAGE_KEY, show);
     });
 
-    let comment_counts_by_file = Signal::derive(move || {
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for thread in ctx.comments.get() {
-            *counts.entry(thread.file_path).or_insert(0) += 1;
-        }
-        counts
+    let comment_counts_by_file = Memo::new(move |_| {
+        ctx.comments.with(|list| {
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for thread in list {
+                *counts.entry(thread.file_path.clone()).or_insert(0) += 1;
+            }
+            counts
+        })
     });
 
-    let diff_files = Signal::derive(move || {
-        ctx.diff_data
-            .with(|d| d.as_ref().map(|d| d.files.clone()).unwrap_or_default())
+    let diff_files = Memo::new(move |_| {
+        ctx.diff_data.with(|d| {
+            d.as_ref()
+                .map(|d| {
+                    d.files
+                        .iter()
+                        .map(|f| FileTreeEntry::from(f.as_ref()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
     });
 
-    let is_rebase_diff = Signal::derive(move || {
+    let is_rebase_diff = Memo::new(move |_| {
         ctx.diff_data
             .with(|d| d.as_ref().is_some_and(|d| d.is_rebase_diff))
     });
-    let rebase_ignored = Signal::derive(move || {
+    let rebase_ignored = Memo::new(move |_| {
         ctx.diff_data
             .with(|d| d.as_ref().is_some_and(|d| d.rebase_ignored))
     });
-    let rebase_conflict = Signal::derive(move || {
+    let rebase_conflict = Memo::new(move |_| {
         ctx.diff_data
             .with(|d| d.as_ref().is_some_and(|d| d.rebase_conflict))
     });
 
-    let active_change = Signal::derive(move || {
+    let active_change = Memo::new(move |_| {
         let sel = ctx.selected_change_id.get();
-        ctx.changes.get().into_iter().find(|c| c.change_id == sel)
+        ctx.changes
+            .with(|list| list.iter().find(|c| c.change_id == sel).cloned())
     });
 
-    let active_commit = Signal::derive(move || {
+    let active_commit = Memo::new(move |_| {
         let target = ctx.target_commit_id.get();
-        ctx.commits
-            .get()
-            .into_iter()
-            .enumerate()
-            .find(|(_, c)| commit_ids_match(&c.commit_id, &target))
+        ctx.commits.with(|list| {
+            list.iter()
+                .enumerate()
+                .find(|(_, c)| commit_ids_match(&c.commit_id, &target))
+                .map(|(i, c)| (i, c.clone()))
+        })
     });
 
-    let is_jj_workspace = Signal::derive(move || {
-        matches!(
-            ctx.repo_status.get(),
-            RepoStatusState::Loaded(ref status) if status.is_jj
-        )
+    let is_jj_workspace = Memo::new(move |_| {
+        ctx.repo_status
+            .with(|s| matches!(s, RepoStatusState::Loaded(status) if status.is_jj))
+    });
+
+    let diff_pane_state = Memo::new(move |_| {
+        ctx.diff_data.with(|opt| match opt.as_ref() {
+            None if ctx.loading_diff.get() => DiffPaneState::Loading,
+            None => DiffPaneState::Idle,
+            Some(d) if d.is_empty && d.files.len() <= 1 => DiffPaneState::Empty {
+                base: d.base_commit.clone(),
+                target: d.commit.clone(),
+            },
+            Some(_) => DiffPaneState::Ready,
+        })
     });
 
     view! {
@@ -1174,7 +1543,7 @@ pub fn App() -> impl IntoView {
                     })}
                     {move || {
                         let total = ctx.diff_data.with(|d| d.as_ref().map_or(0, |d| d.files.len()));
-                        let viewed = ctx.reviewed_files.get().len().min(total);
+                        let viewed = ctx.reviewed_files.with(HashSet::len).min(total);
                         (total > 0).then(|| {
                             let pct = (viewed * 100) / total;
                             view! {
@@ -1340,7 +1709,19 @@ pub fn App() -> impl IntoView {
                     </>
                 })}
 
-                <main class="diff-main">
+                <main
+                    class="diff-main"
+                    on:mousedown=move |ev: MouseEvent| handle_diff_main_mousedown(ctx, &ev)
+                    on:mouseover=move |ev: MouseEvent| handle_diff_main_mouseover(ctx, &ev)
+                    on:mouseleave=move |_| {
+                        if ctx.hovered_file_index.get_untracked().is_some() {
+                            ctx.hovered_file_index.set(None);
+                        }
+                    }
+                    on:click=move |ev: MouseEvent| {
+                        handle_diff_main_click(&ev, on_open_in_editor, on_toggle_word);
+                    }
+                >
                     {move || match ctx.repo_status.get() {
                         RepoStatusState::Loading => view! {
                             <section class="status-card" aria-busy="true">
@@ -1440,84 +1821,61 @@ pub fn App() -> impl IntoView {
                                         })
                                     }}
 
-                                    {move || {
-                                        let diff_meta = ctx.diff_data.with(|opt| {
-                                            opt.as_ref().map(|d| {
-                                                (
-                                                    d.is_empty && d.files.len() <= 1,
-                                                    d.base_commit.clone(),
-                                                    d.commit.clone(),
-                                                )
-                                            })
-                                        });
-                                        match diff_meta {
-                                            None if ctx.loading_diff.get() => view! {
-                                                <div class="center-message">"Loading diff..."</div>
-                                            }.into_any(),
-                                            None => view! {
-                                                <div class="center-message">"Select a revision to inspect its diff."</div>
-                                            }.into_any(),
-                                            Some((true, base_c, target_c)) => view! {
-                                                <div class="empty-diff-card">
-                                                    <h2>"No changes in this revision"</h2>
-                                                    <p>
-                                                        {alloc::format!(
-                                                            "Commit {} has no modified files against {}.",
-                                                            target_c.chars().take(8).collect::<String>(),
-                                                            base_c.chars().take(8).collect::<String>(),
-                                                        )}
-                                                    </p>
-                                                </div>
-                                            }.into_any(),
-                                            Some((false, diff_base, diff_target)) => {
-                                                let generation = ctx.diff_generation.get_value();
-                                                view! {
-                                                    <div class="diff-file-list">
-                                                        <For
-                                                            each=move || {
-                                                                ctx.diff_data
-                                                                    .with(|opt| {
-                                                                        opt.as_ref()
-                                                                            .map(|d| d.files.iter().cloned().enumerate().collect::<Vec<_>>())
-                                                                            .unwrap_or_default()
-                                                                    })
-                                                            }
-                                                            key=move |(idx, file)| alloc::format!("{generation}:{idx}:{}", file.path)
-                                                            children=move |(idx, file)| {
-                                                                view! {
-                                                                    <TextDiffCard
-                                                                        file=file
-                                                                        file_index=idx
-                                                                        base_commit=diff_base.clone()
-                                                                        target_commit=diff_target.clone()
-                                                                        all_threads=ctx.comments
-                                                                        reviewed_files=ctx.reviewed_files
-                                                                        collapsed_files=ctx.collapsed_files
-                                                                        diff_mode=ctx.diff_mode
-                                                                        show_resolved_inline=ctx.show_resolved_inline
-                                                                        highlighted_word=ctx.highlighted_word
-                                                                        expanded_lines=ctx.expanded_lines
-                                                                        expand_loading=ctx.expand_loading
-                                                                        active_cursor=ctx.active_cursor
-                                                                        keyboard_comment_trigger=ctx.keyboard_comment_trigger
-                                                                        on_hover_file=Callback::new(move |hovered| ctx.hovered_file_index.set(hovered))
-                                                                        on_toggle_word=on_toggle_word
-                                                                        on_toggle_viewed=on_toggle_reviewed
-                                                                        on_toggle_collapse=on_toggle_collapse
-                                                                        on_open_in_editor=on_open_in_editor
-                                                                        on_prefetch_line_count=on_prefetch_line_count
-                                                                        on_expand_lines=on_expand_lines
-                                                                        on_create_thread=on_create_thread
-                                                                        on_reply=on_reply
-                                                                        on_toggle_resolve=on_toggle_resolve
-                                                                    />
-                                                                }
-                                                            }
-                                                        />
-                                                    </div>
-                                                }.into_any()
-                                            }
-                                        }
+                                    {move || match diff_pane_state.get() {
+                                        DiffPaneState::Loading => view! {
+                                            <div class="center-message">"Loading diff..."</div>
+                                        }.into_any(),
+                                        DiffPaneState::Idle => view! {
+                                            <div class="center-message">"Select a revision to inspect its diff."</div>
+                                        }.into_any(),
+                                        DiffPaneState::Empty { base, target } => view! {
+                                            <div class="empty-diff-card">
+                                                <h2>"No changes in this revision"</h2>
+                                                <p>
+                                                    {alloc::format!(
+                                                        "Commit {} has no modified files against {}.",
+                                                        target.chars().take(8).collect::<String>(),
+                                                        base.chars().take(8).collect::<String>(),
+                                                    )}
+                                                </p>
+                                            </div>
+                                        }.into_any(),
+                                        DiffPaneState::Ready => view! {
+                                            <div class="diff-file-list">
+                                                <For
+                                                    each=move || ctx.ordered_file_slots.get()
+                                                    key=|slot| slot.path.clone()
+                                                    children=move |slot| {
+                                                        view! {
+                                                            <TextDiffCard
+                                                                path=slot.path
+                                                                file=slot.file
+                                                                file_index=slot.file_index
+                                                                commits=slot.commits
+                                                                drag_state=slot.drag_state
+                                                                active_composer=slot.active_composer
+                                                                md_tab=slot.md_tab
+                                                                all_threads=ctx.comments
+                                                                reviewed_files=ctx.reviewed_files
+                                                                collapsed_files=ctx.collapsed_files
+                                                                diff_mode=ctx.diff_mode
+                                                                show_resolved_inline=ctx.show_resolved_inline
+                                                                expanded_lines=ctx.expanded_lines
+                                                                expand_loading=ctx.expand_loading
+                                                                on_toggle_viewed=on_toggle_reviewed
+                                                                on_toggle_collapse=on_toggle_collapse
+                                                                on_open_in_editor=on_open_in_editor
+                                                                on_prefetch_line_count=on_prefetch_line_count
+                                                                on_expand_lines=on_expand_lines
+                                                                on_create_thread=on_create_thread
+                                                                on_reply=on_reply
+                                                                on_toggle_resolve=on_toggle_resolve
+                                                            />
+                                                        }
+                                                    }
+                                                />
+                                            </div>
+                                        }.into_any(),
                                     }}
                                 </div>
                             }.into_any()
@@ -1552,6 +1910,226 @@ pub fn App() -> impl IntoView {
                 on_close=Callback::new(move |()| ctx.help_open.set(false))
             />
         </div>
+    }
+}
+
+fn event_target_element(ev: &MouseEvent) -> Option<web_sys::Element> {
+    let target = ev.target()?;
+    if let Ok(el) = target.clone().dyn_into::<web_sys::Element>() {
+        return Some(el);
+    }
+    target
+        .dyn_into::<web_sys::Node>()
+        .ok()
+        .and_then(|n| n.parent_element())
+}
+
+fn handle_diff_main_mousedown(ctx: AppCtx, ev: &MouseEvent) {
+    if ev.button() != 0 {
+        return;
+    }
+    let Some(target) = event_target_element(ev) else {
+        return;
+    };
+    // Do not start a gutter selection drag when clicking the open-in-editor action button.
+    if target
+        .closest("[data-line-action='open-editor']")
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return;
+    }
+    let Some(gutter_el) = target
+        .closest("[data-gutter-side][data-gutter-line]")
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let Some(card_el) = gutter_el.closest("[data-file]").ok().flatten() else {
+        return;
+    };
+    let Some(file_path) = card_el.get_attribute("data-file") else {
+        return;
+    };
+    let Some(side) = gutter_el
+        .get_attribute("data-gutter-side")
+        .as_deref()
+        .and_then(parse_comment_side)
+    else {
+        return;
+    };
+    let Some(line_num) = gutter_el
+        .get_attribute("data-gutter-line")
+        .and_then(|s| s.parse::<u32>().ok())
+    else {
+        return;
+    };
+
+    let Some(slot) = ctx
+        .file_slot_map
+        .with_value(|map| map.get(&file_path).cloned())
+    else {
+        return;
+    };
+
+    ev.prevent_default();
+
+    if ev.shift_key() {
+        let (start, end) = ctx.selection_anchor.with_value(|anchor| match anchor {
+            Some((prev_file, prev_side, prev_line))
+                if *prev_file == file_path && *prev_side == side =>
+            {
+                ((*prev_line).min(line_num), (*prev_line).max(line_num))
+            }
+            _ => (line_num, line_num),
+        });
+        ctx.selection_anchor
+            .set_value(Some((file_path.clone(), side, line_num)));
+        let range = LineRangeSpec { start, end };
+        let file_arc = slot.file.get_untracked();
+        let snippet = ctx.expanded_lines.with_untracked(|map| {
+            extract_snippet_for_file(&file_arc, map.get(&file_path), side, range)
+        });
+        slot.active_composer.set(Some(ActiveComposer {
+            side,
+            range,
+            code_snippet: snippet,
+        }));
+        return;
+    }
+
+    ctx.selection_anchor
+        .set_value(Some((file_path.clone(), side, line_num)));
+    ctx.active_drag_file.set_value(Some(file_path));
+    slot.drag_state.set(Some(LineSelectionDrag {
+        side,
+        anchor_line: line_num,
+        current_line: line_num,
+    }));
+}
+
+fn handle_diff_main_mouseover(ctx: AppCtx, ev: &MouseEvent) {
+    let Some(target) = event_target_element(ev) else {
+        return;
+    };
+
+    let hovered_idx = target
+        .closest("[data-file-idx]")
+        .ok()
+        .flatten()
+        .and_then(|el| el.get_attribute("data-file-idx"))
+        .and_then(|s| s.parse::<usize>().ok());
+    if ctx.hovered_file_index.get_untracked() != hovered_idx {
+        ctx.hovered_file_index.set(hovered_idx);
+    }
+
+    let Some(drag_file) = ctx.active_drag_file.with_value(Clone::clone) else {
+        return;
+    };
+    let Some(row_el) = target
+        .closest("tr[data-old-line], tr[data-new-line]")
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let Some(card_el) = row_el.closest("[data-file]").ok().flatten() else {
+        return;
+    };
+    if card_el.get_attribute("data-file").as_deref() != Some(drag_file.as_str()) {
+        return;
+    }
+    let Some(slot) = ctx
+        .file_slot_map
+        .with_value(|map| map.get(&drag_file).cloned())
+    else {
+        return;
+    };
+    let Some(drag) = slot.drag_state.get_untracked() else {
+        return;
+    };
+    let attr = match drag.side {
+        CommentSide::Old => "data-old-line",
+        CommentSide::New => "data-new-line",
+    };
+    if let Some(ln) = row_el
+        .get_attribute(attr)
+        .and_then(|s| s.parse::<u32>().ok())
+        && ln != drag.current_line
+    {
+        slot.drag_state.set(Some(LineSelectionDrag {
+            current_line: ln,
+            ..drag
+        }));
+    }
+}
+
+fn finish_active_line_drag(ctx: AppCtx) {
+    let mut drag_file = None;
+    ctx.active_drag_file.update_value(|slot| {
+        drag_file = slot.take();
+    });
+    let Some(file_path) = drag_file else {
+        return;
+    };
+    let Some(slot) = ctx
+        .file_slot_map
+        .with_value(|map| map.get(&file_path).cloned())
+    else {
+        return;
+    };
+    let Some(drag) = slot.drag_state.get_untracked() else {
+        return;
+    };
+    slot.drag_state.set(None);
+
+    let range = LineRangeSpec {
+        start: drag.anchor_line.min(drag.current_line),
+        end: drag.anchor_line.max(drag.current_line),
+    };
+    let file_arc = slot.file.get_untracked();
+    let snippet = ctx.expanded_lines.with_untracked(|map| {
+        extract_snippet_for_file(&file_arc, map.get(&file_path), drag.side, range)
+    });
+    slot.active_composer.set(Some(ActiveComposer {
+        side: drag.side,
+        range,
+        code_snippet: snippet,
+    }));
+}
+
+fn handle_diff_main_click(
+    ev: &MouseEvent,
+    on_open_in_editor: Callback<(String, usize)>,
+    on_toggle_word: Callback<String>,
+) {
+    let Some(target) = event_target_element(ev) else {
+        return;
+    };
+    if let Some(btn_el) = target
+        .closest("[data-line-action='open-editor']")
+        .ok()
+        .flatten()
+    {
+        if let Some(card_el) = btn_el.closest("[data-file]").ok().flatten()
+            && let Some(file_path) = card_el.get_attribute("data-file")
+            && let Some(line_n) = btn_el
+                .get_attribute("data-action-line")
+                .and_then(|s| s.parse::<usize>().ok())
+        {
+            ev.stop_propagation();
+            on_open_in_editor.run((file_path, line_n));
+        }
+        return;
+    }
+
+    if let Some(code_el) = target.closest(".diff-code-text").ok().flatten()
+        && let Some(word) =
+            word_highlight::extract_word_at_click_point(&code_el, ev.client_x(), ev.client_y())
+    {
+        on_toggle_word.run(word);
     }
 }
 
@@ -1594,12 +2172,11 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
         return;
     }
 
-    let Some(diff) = ctx.diff_data.get_untracked() else {
+    let Some(diff) = ctx.current_diff() else {
         return;
     };
     let files = &diff.files;
     let mode = ctx.diff_mode.get_untracked();
-    let reviewed = ctx.reviewed_files.get_untracked();
 
     match key.as_str() {
         "j" | "ArrowDown" => {
@@ -1610,7 +2187,6 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
                 NavigationTarget::Line,
                 files,
                 mode,
-                &reviewed,
             );
         }
         "k" | "ArrowUp" => {
@@ -1621,7 +2197,6 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
                 NavigationTarget::Line,
                 files,
                 mode,
-                &reviewed,
             );
         }
         "n" => {
@@ -1632,7 +2207,6 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
                 NavigationTarget::Chunk,
                 files,
                 mode,
-                &reviewed,
             );
         }
         "p" => {
@@ -1643,7 +2217,6 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
                 NavigationTarget::Chunk,
                 files,
                 mode,
-                &reviewed,
             );
         }
         "]" => {
@@ -1654,7 +2227,6 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
                 NavigationTarget::File,
                 files,
                 mode,
-                &reviewed,
             );
         }
         "[" => {
@@ -1665,7 +2237,6 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
                 NavigationTarget::File,
                 files,
                 mode,
-                &reviewed,
             );
         }
         "{" if !files.is_empty() => {
@@ -1716,10 +2287,7 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
             ev.prevent_default();
             let unresolved: Vec<JjCommentThread> = ctx
                 .comments
-                .get_untracked()
-                .into_iter()
-                .filter(|t| !t.resolved)
-                .collect();
+                .with_untracked(|list| list.iter().filter(|t| !t.resolved).cloned().collect());
             if unresolved.is_empty() {
                 return;
             }
@@ -1770,13 +2338,16 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
                 && let Some(file) = files.get(idx)
             {
                 ev.prevent_default();
-                if !reviewed.contains(&file.path) {
+                let already_reviewed = ctx
+                    .reviewed_files
+                    .with_untracked(|set| set.contains(&file.path));
+                if !already_reviewed {
                     toggle_file_viewed_and_collapse(ctx, &diff.commit, &file.path);
                 }
-                let updated_reviewed = ctx.reviewed_files.get_untracked();
-                if let Some(next_idx) =
-                    keyboard::next_unviewed_file_index(idx, files, &updated_reviewed)
-                {
+                let next_idx = ctx.reviewed_files.with_untracked(|updated_reviewed| {
+                    keyboard::next_unviewed_file_index(idx, files, updated_reviewed)
+                });
+                if let Some(next_idx) = next_idx {
                     let pos = keyboard::normalize_cursor_side(
                         CursorPosition {
                             file_index: next_idx,
@@ -1803,19 +2374,27 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
                     CommentSide::Old => line.old_line_number.or(line.new_line_number),
                     CommentSide::New => line.new_line_number.or(line.old_line_number),
                 };
-                if let Some(ln) = line_num {
+                if let Some(ln) = line_num
+                    && let Some(slot) = ctx
+                        .file_slot_map
+                        .with_value(|map| map.get(&file.path).cloned())
+                {
                     ev.prevent_default();
-                    let seq = next_req_id(ctx.keyboard_comment_seq);
                     ctx.collapsed_files.update(|set| {
                         set.remove(&file.path);
                     });
-                    ctx.keyboard_comment_trigger
-                        .set(Some(KeyboardCommentTrigger {
-                            seq,
-                            file_path: file.path.clone(),
-                            side: cur.side,
-                            line_num: ln,
-                        }));
+                    if file.path != "Commit Message" && state::is_markdown_file(&file.path) {
+                        slot.md_tab.set(MarkdownTab::Code);
+                    }
+                    let range = LineRangeSpec { start: ln, end: ln };
+                    let snippet = ctx.expanded_lines.with_untracked(|map| {
+                        extract_snippet_for_file(file, map.get(&file.path), cur.side, range)
+                    });
+                    slot.active_composer.set(Some(ActiveComposer {
+                        side: cur.side,
+                        range,
+                        code_snippet: snippet,
+                    }));
                 }
             }
         }
@@ -1825,11 +2404,13 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
         }
         "C" => {
             ev.prevent_default();
-            let prompt = state::format_all_comments_prompt(
-                &ctx.comments.get_untracked(),
-                &ctx.target_commit_id.get_untracked(),
-                &ctx.base_commit_id.get_untracked(),
-            );
+            let prompt = ctx.comments.with_untracked(|comments| {
+                state::format_all_comments_prompt(
+                    comments,
+                    &ctx.target_commit_id.get_untracked(),
+                    &ctx.base_commit_id.get_untracked(),
+                )
+            });
             if !prompt.is_empty() {
                 spawn_local(async move {
                     let _ = api::copy_to_clipboard(&prompt).await;
@@ -1848,18 +2429,23 @@ fn step_keyboard_cursor(
     ctx: AppCtx,
     dir: NavigationDirection,
     target: NavigationTarget,
-    files: &[DiffFile],
+    files: &[Arc<DiffFile>],
     mode: DiffViewMode,
-    reviewed: &HashSet<String>,
 ) {
-    if let Some(next) = keyboard::find_next_position(
-        ctx.active_cursor.get_untracked(),
-        dir,
-        target,
-        files,
-        mode,
-        reviewed,
-    ) {
+    let next = ctx.reviewed_files.with_untracked(|reviewed| {
+        ctx.collapsed_files.with_untracked(|collapsed| {
+            keyboard::find_next_position(
+                ctx.active_cursor.get_untracked(),
+                dir,
+                target,
+                files,
+                mode,
+                reviewed,
+                collapsed,
+            )
+        })
+    });
+    if let Some(next) = next {
         ctx.active_cursor.set(Some(next));
         let block = if target == NavigationTarget::File {
             ScrollLogicalPosition::Start
@@ -1873,7 +2459,7 @@ fn step_keyboard_cursor(
 fn scroll_cursor(
     ctx: AppCtx,
     pos: CursorPosition,
-    files: &[DiffFile],
+    files: &[Arc<DiffFile>],
     block: ScrollLogicalPosition,
 ) {
     let mode = ctx.diff_mode.get_untracked();

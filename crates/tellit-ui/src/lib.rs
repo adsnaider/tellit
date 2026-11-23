@@ -1708,6 +1708,7 @@ fn expand_lines_for_file(ctx: AppCtx, req: ExpandLinesEvent) {
 #[component]
 pub fn App() -> impl IntoView {
     let ctx = AppCtx::new();
+    provide_context::<Signal<ResolvedTheme>>(ctx.resolved_theme.into());
     let heartbeat_handle = StoredValue::new_local(None::<api::SseSubscription>);
     let watch_handle = StoredValue::new_local(None::<api::SseSubscription>);
     let viewport_observer = StoredValue::new_local(create_viewport_observer(ctx));

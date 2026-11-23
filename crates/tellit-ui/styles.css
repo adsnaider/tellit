@@ -2083,6 +2083,124 @@ tr:hover .diff-gutter--actions .diff-line-actions,
   background-color: var(--diff-add-bg);
 }
 
+.md-mermaid {
+  margin: 10px 0;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background-color: var(--color-bg-secondary);
+  overflow: hidden;
+}
+
+.md-mermaid.md-diff-block {
+  margin: 0;
+  padding: 0;
+  border-radius: 6px;
+}
+
+.md-mermaid.md-diff-block--add {
+  border-left: 4px solid var(--diff-add-border);
+}
+
+.md-mermaid.md-diff-block--del {
+  border-left: 4px solid var(--diff-del-border);
+}
+
+.md-mermaid__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--color-border);
+  background-color: var(--color-bg-tertiary);
+}
+
+.md-mermaid__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.md-mermaid__badge {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-secondary);
+}
+
+.md-mermaid__body {
+  background-color: var(--color-bg-primary);
+}
+
+.md-mermaid__canvas {
+  padding: 14px;
+  overflow-x: auto;
+  text-align: center;
+}
+
+.md-mermaid__canvas svg {
+  display: inline-block;
+  max-width: none;
+  height: auto;
+  vertical-align: middle;
+}
+
+.md-mermaid__diff-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
+  gap: 12px;
+  padding: 12px;
+}
+
+.md-mermaid__diff-pane {
+  min-width: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background-color: var(--color-bg-secondary);
+  overflow: hidden;
+}
+
+.md-mermaid__diff-pane--before {
+  border-top: 3px solid var(--diff-del-border);
+}
+
+.md-mermaid__diff-pane--after {
+  border-top: 3px solid var(--diff-add-border);
+}
+
+.md-mermaid__pane-label {
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--color-border);
+  background-color: var(--color-bg-tertiary);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-secondary);
+}
+
+.md-mermaid__notice {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--color-border);
+  background-color: rgba(210, 153, 34, 0.12);
+  color: var(--color-warning-bright);
+  font-size: 12px;
+}
+
+.md-mermaid__source {
+  margin: 0;
+  border: none;
+  border-radius: 0;
+}
+
+.md-mermaid__source-diff {
+  border: none;
+  border-radius: 0;
+}
+
 .md-diff-code-line--del {
   border-left-color: var(--diff-del-border);
   background-color: var(--diff-del-bg);

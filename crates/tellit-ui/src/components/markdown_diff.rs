@@ -1,6 +1,7 @@
 //! Pure-Rust GFM Markdown diff viewer using `pulldown-cmark` and YAML frontmatter diffing.
 
 pub mod frontmatter;
+pub mod mermaid;
 pub mod scroll_anchor;
 pub mod syntax;
 
@@ -19,6 +20,10 @@ use tellit_types::{DiffFile, DiffLineKind, FileStatus, LineRangeSpec};
 use self::frontmatter::{
     FrontmatterDiffStatus, FrontmatterDiffTable, FrontmatterEntries, FrontmatterSnapshotTable,
     compute_frontmatter_diff, extract_frontmatter,
+};
+use self::mermaid::{
+    MermaidDiagramBlock, MermaidDiffBlock, MermaidDiffLine, MermaidDiffLineKind, MermaidDiffStatus,
+    is_mermaid_lang, reconstruct_mermaid_diff_sources,
 };
 use self::syntax::{render_tokens_view, tokenize_code_block, tokenize_code_line};
 use crate::api;
@@ -801,6 +806,15 @@ fn render_single_node(node: MdNode) -> AnyView {
             line_range,
         } => {
             let normalized = code.strip_suffix('\n').unwrap_or(&code);
+            if is_mermaid_lang(lang.as_deref()) {
+                return view! {
+                    <MermaidDiagramBlock
+                        source=normalized.to_owned()
+                        line_range=line_range
+                    />
+                }
+                .into_any();
+            }
             let lines = tokenize_code_block(normalized, lang.as_deref());
             let (ls, le) = line_range_attrs(line_range);
             view! {
@@ -1591,6 +1605,67 @@ pub fn MarkdownPreviewBody(
                         {fm.table}
                         {render_blocks.into_iter().map(|block| match block {
                             PreviewRenderBlock::FencedCode { lang, lines, line_range } => {
+                                if is_mermaid_lang(lang.as_deref()) {
+                                    let diff_lines: Vec<MermaidDiffLine> = lines
+                                        .iter()
+                                        .map(|l| MermaidDiffLine {
+                                            kind: match l.kind {
+                                                PreviewBlockKind::Context => {
+                                                    MermaidDiffLineKind::Context
+                                                }
+                                                PreviewBlockKind::Add
+                                                | PreviewBlockKind::Change => {
+                                                    MermaidDiffLineKind::Add
+                                                }
+                                                PreviewBlockKind::Delete => {
+                                                    MermaidDiffLineKind::Delete
+                                                }
+                                            },
+                                            content: l.content.clone(),
+                                            display_line: l.display_line(),
+                                        })
+                                        .collect();
+                                    let sources = reconstruct_mermaid_diff_sources(&diff_lines);
+                                    match (sources.is_modified, sources.old_source, sources.new_source) {
+                                        (true, Some(old_src), Some(new_src)) => {
+                                            return view! {
+                                                <MermaidDiffBlock
+                                                    old_source=old_src
+                                                    new_source=new_src
+                                                    diff_lines=diff_lines
+                                                    line_range=line_range
+                                                />
+                                            }
+                                            .into_any();
+                                        }
+                                        (_, _, Some(new_src)) => {
+                                            let status = diff_lines
+                                                .iter()
+                                                .any(|l| l.kind == MermaidDiffLineKind::Add)
+                                                .then_some(MermaidDiffStatus::Added);
+                                            return view! {
+                                                <MermaidDiagramBlock
+                                                    source=new_src
+                                                    diff_status=status
+                                                    line_range=line_range
+                                                />
+                                            }
+                                            .into_any();
+                                        }
+                                        (_, Some(old_src), None) => {
+                                            return view! {
+                                                <MermaidDiagramBlock
+                                                    source=old_src
+                                                    diff_status=Some(MermaidDiffStatus::Deleted)
+                                                    line_range=line_range
+                                                />
+                                            }
+                                            .into_any();
+                                        }
+                                        (_, None, None) => {}
+                                    }
+                                }
+
                                 let (block_ls, block_le) = line_range_attrs(line_range);
                                 let mut in_block_comment = false;
                                 let rendered_lines = lines

@@ -604,6 +604,19 @@ struct DiffQuery {
     base: Option<String>,
     #[serde(rename = "ignoreRebase")]
     ignore_rebase: Option<bool>,
+    eager: Option<bool>,
+    #[serde(rename = "summaryThreshold")]
+    summary_threshold: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct DiffFileQuery {
+    target: Option<String>,
+    commit: Option<String>,
+    base: Option<String>,
+    #[serde(rename = "ignoreRebase")]
+    ignore_rebase: Option<bool>,
+    path: String,
 }
 
 #[derive(Deserialize)]
@@ -658,19 +671,31 @@ fn is_immutable_commit_oid(rev: &str) -> bool {
 }
 
 /// Returns `true` when a diff request addresses full 40-character commit IDs and matches the
-/// resolved commit IDs in `diff`.
-fn is_immutable_diff_query(target: &str, base: Option<&str>, diff: &JjDiffResponse) -> bool {
+/// resolved `commit` and `base_commit` IDs.
+fn is_immutable_diff_commits(
+    target: &str,
+    base: Option<&str>,
+    resolved_commit: &str,
+    resolved_base_commit: &str,
+) -> bool {
     let trimmed_target = target.trim();
-    if !is_immutable_commit_oid(trimmed_target) || !diff.commit.eq_ignore_ascii_case(trimmed_target)
+    if !is_immutable_commit_oid(trimmed_target)
+        || !resolved_commit.eq_ignore_ascii_case(trimmed_target)
     {
         return false;
     }
     match base.map(str::trim).filter(|s| !s.is_empty()) {
-        None => is_immutable_commit_oid(&diff.base_commit),
+        None => is_immutable_commit_oid(resolved_base_commit),
         Some(base_rev) => {
-            is_immutable_commit_oid(base_rev) && diff.base_commit.eq_ignore_ascii_case(base_rev)
+            is_immutable_commit_oid(base_rev) && resolved_base_commit.eq_ignore_ascii_case(base_rev)
         }
     }
+}
+
+/// Returns `true` when a diff request addresses full 40-character commit IDs and matches the
+/// resolved commit IDs in `diff`.
+fn is_immutable_diff_query(target: &str, base: Option<&str>, diff: &JjDiffResponse) -> bool {
+    is_immutable_diff_commits(target, base, &diff.commit, &diff.base_commit)
 }
 
 /// Returns `true` when a line-count query specifies at least one revision and every provided
@@ -690,9 +715,16 @@ async fn get_jj_diff(
 ) -> Result<Response, ApiError> {
     let target = query.target.or(query.commit).unwrap_or_default();
     let ignore_rebase = query.ignore_rebase.unwrap_or(true);
+    let eager = query.eager.unwrap_or(false);
     let outcome = state
         .jj
-        .get_diff(&target, query.base.as_deref(), ignore_rebase)
+        .get_diff(
+            &target,
+            query.base.as_deref(),
+            ignore_rebase,
+            eager,
+            query.summary_threshold,
+        )
         .await?;
     if outcome.is_working_copy_parent_diff {
         let rel_paths = outcome
@@ -707,12 +739,13 @@ async fn get_jj_diff(
             .collect();
         state.watch.update_working_copy_files(rel_paths);
     }
-    let cache_control =
-        if is_immutable_diff_query(&target, query.base.as_deref(), &outcome.response) {
-            IMMUTABLE_PRIVATE_CACHE
-        } else {
-            API_NO_STORE_CACHE
-        };
+    let cache_control = if outcome.cacheable
+        && is_immutable_diff_query(&target, query.base.as_deref(), &outcome.response)
+    {
+        IMMUTABLE_PRIVATE_CACHE
+    } else {
+        API_NO_STORE_CACHE
+    };
     let response_arc = outcome.response;
     let body = if response_arc.files.len() > 4 {
         tokio::task::spawn_blocking(move || serde_json::to_vec(response_arc.as_ref()))
@@ -721,6 +754,51 @@ async fn get_jj_diff(
             .map_err(|err| JujutsuError::Io(io::Error::other(err)))?
     } else {
         serde_json::to_vec(response_arc.as_ref())
+            .map_err(|err| JujutsuError::Io(io::Error::other(err)))?
+    };
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
+    );
+    Ok(response)
+}
+
+async fn get_jj_diff_file(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DiffFileQuery>,
+) -> Result<Response, ApiError> {
+    let target = query.target.or(query.commit).unwrap_or_default();
+    let ignore_rebase = query.ignore_rebase.unwrap_or(true);
+    let outcome = state
+        .jj
+        .get_diff_file(&target, query.base.as_deref(), ignore_rebase, &query.path)
+        .await?;
+    let cache_control = if outcome.cacheable
+        && is_immutable_diff_commits(
+            &target,
+            query.base.as_deref(),
+            &outcome.commit,
+            &outcome.base_commit,
+        ) {
+        IMMUTABLE_PRIVATE_CACHE
+    } else {
+        API_NO_STORE_CACHE
+    };
+    let file_arc = outcome.file;
+    let body = if file_arc.chunks.len() > 2 {
+        tokio::task::spawn_blocking(move || serde_json::to_vec(file_arc.as_ref()))
+            .await
+            .map_err(|err| JujutsuError::Io(io::Error::other(err)))?
+            .map_err(|err| JujutsuError::Io(io::Error::other(err)))?
+    } else {
+        serde_json::to_vec(file_arc.as_ref())
             .map_err(|err| JujutsuError::Io(io::Error::other(err)))?
     };
     let mut response = Response::new(Body::from(body));
@@ -804,6 +882,7 @@ async fn get_blob(
         .jj
         .get_blob_content(&path, query.rev.as_deref())
         .await?;
+    let content_len = blob.bytes.len();
     let mut response = Response::new(Body::from(blob.bytes));
     *response.status_mut() = StatusCode::OK;
     let headers = response.headers_mut();
@@ -811,6 +890,7 @@ async fn get_blob(
         header::CONTENT_TYPE,
         HeaderValue::from_static(blob.content_type),
     );
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(content_len));
     let cache_control = if query.rev.as_deref().is_some_and(is_immutable_commit_oid) {
         IMMUTABLE_PRIVATE_CACHE
     } else {
@@ -1027,6 +1107,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             get(get_jj_change_commits),
         )
         .route("/api/jj/diff", get(get_jj_diff))
+        .route("/api/jj/diff/file", get(get_jj_diff_file))
         .route(
             "/api/jj/comments",
             get(get_jj_comments).post(post_jj_comment),

@@ -1832,3 +1832,289 @@ async fn watch_targets_only_diffed_files_handles_atomic_saves_store_and_jj_op_re
     server.shutdown();
     server.wait().await.unwrap();
 }
+
+#[tokio::test]
+async fn two_phase_diff_summary_per_file_endpoint_and_blob_head_content_length() {
+    let repo = setup_jj_test_repo();
+    let root = repo.path();
+
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/mod_a.rs"),
+        "pub fn alpha() -> i32 {\n    1\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/old_name.rs"),
+        "pub fn moved() -> &'static str {\n    \"old\"\n}\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/removed.rs"), "pub fn bye() {}\n").unwrap();
+    run_jj_test(root, &["describe", "-m", "base commit"]);
+    let base_oid = run_jj_test(root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+
+    run_jj_test(root, &["new", "-m", "feature commit with multi-file diff"]);
+    fs::write(
+        root.join("src/mod_a.rs"),
+        "pub fn alpha() -> i32 {\n    1\n}\npub fn beta() -> i32 {\n    2\n}\npub fn gamma() -> i32 {\n    3\n}\n",
+    )
+    .unwrap();
+    fs::remove_file(root.join("src/old_name.rs")).unwrap();
+    fs::write(
+        root.join("src/new_name.rs"),
+        "pub fn moved() -> &'static str {\n    \"new\"\n}\n",
+    )
+    .unwrap();
+    fs::remove_file(root.join("src/removed.rs")).unwrap();
+    let target_oid = run_jj_test(root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    assert_eq!(base_oid.len(), 40);
+    assert_eq!(target_oid.len(), 40);
+
+    let server = start_server(
+        ServerConfig::new(root.to_path_buf())
+            .with_port(Some(0))
+            .with_keep_alive(true)
+            .with_quiet(true),
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+
+    // 1. Summary mode triggers when total diff lines exceed `summaryThreshold`.
+    let summary_http = client
+        .get(format!(
+            "{}/api/jj/diff?target={target_oid}&summaryThreshold=3",
+            server.url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(summary_http.status(), StatusCode::OK);
+    assert_eq!(
+        summary_http.headers()["cache-control"],
+        "private, max-age=31536000, immutable"
+    );
+    let summary: tellit_types::JjDiffResponse = summary_http.json().await.unwrap();
+    assert_eq!(summary.files[0].path, "Commit Message");
+    assert!(summary.files[0].chunks_loaded);
+    assert!(!summary.files[0].chunks.is_empty());
+
+    let mod_summary = summary
+        .files
+        .iter()
+        .find(|f| f.path == "src/mod_a.rs")
+        .unwrap();
+    assert!(!mod_summary.chunks_loaded);
+    assert!(mod_summary.chunks.is_empty());
+    assert!(mod_summary.additions >= 6);
+
+    let renamed_summary = summary
+        .files
+        .iter()
+        .find(|f| f.path == "src/new_name.rs")
+        .unwrap();
+    assert!(!renamed_summary.chunks_loaded);
+    assert_eq!(renamed_summary.status, tellit_types::FileStatus::Renamed);
+    assert_eq!(renamed_summary.old_path.as_deref(), Some("src/old_name.rs"));
+
+    let deleted_summary = summary
+        .files
+        .iter()
+        .find(|f| f.path == "src/removed.rs")
+        .unwrap();
+    assert!(!deleted_summary.chunks_loaded);
+    assert_eq!(deleted_summary.status, tellit_types::FileStatus::Deleted);
+    assert_eq!(deleted_summary.deletions, 1);
+
+    // 2. Per-file endpoint hydrates from raw cache (normal, renamed, deleted, Commit Message)
+    //    with immutable OID caching, mutable ref no-store, 404 on missing, and 400 on traversal.
+    let mod_http = client
+        .get(format!(
+            "{}/api/jj/diff/file?target={target_oid}&path=src/mod_a.rs",
+            server.url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mod_http.status(), StatusCode::OK);
+    assert_eq!(
+        mod_http.headers()["cache-control"],
+        "private, max-age=31536000, immutable"
+    );
+    let mod_file: tellit_types::DiffFile = mod_http.json().await.unwrap();
+    assert!(mod_file.chunks_loaded);
+    assert!(!mod_file.chunks.is_empty());
+    assert_eq!(mod_file.additions, mod_summary.additions);
+
+    let renamed_file: tellit_types::DiffFile = client
+        .get(format!(
+            "{}/api/jj/diff/file?target={target_oid}&path=src/new_name.rs",
+            server.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(renamed_file.chunks_loaded);
+    assert_eq!(renamed_file.status, tellit_types::FileStatus::Renamed);
+    assert_eq!(renamed_file.old_path.as_deref(), Some("src/old_name.rs"));
+
+    let deleted_file: tellit_types::DiffFile = client
+        .get(format!(
+            "{}/api/jj/diff/file?target={target_oid}&path=src/removed.rs",
+            server.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(deleted_file.chunks_loaded);
+    assert_eq!(deleted_file.status, tellit_types::FileStatus::Deleted);
+    assert!(!deleted_file.chunks.is_empty());
+
+    let msg_file: tellit_types::DiffFile = client
+        .get(format!(
+            "{}/api/jj/diff/file?target={target_oid}&path=Commit%20Message",
+            server.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(msg_file.path, "Commit Message");
+    assert!(msg_file.chunks_loaded);
+    assert!(!msg_file.chunks.is_empty());
+
+    // Mutable ref `@` must never receive immutable Cache-Control.
+    let mutable_file_http = client
+        .get(format!(
+            "{}/api/jj/diff/file?target=@&path=src/mod_a.rs",
+            server.url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mutable_file_http.status(), StatusCode::OK);
+    assert_eq!(
+        mutable_file_http.headers()["cache-control"],
+        "no-cache, no-store"
+    );
+
+    let missing_resp = client
+        .get(format!(
+            "{}/api/jj/diff/file?target={target_oid}&path=src/does_not_exist.rs",
+            server.url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_resp.status(), StatusCode::NOT_FOUND);
+
+    let traversal_resp = client
+        .get(format!(
+            "{}/api/jj/diff/file?target={target_oid}&path=../outside.rs",
+            server.url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(traversal_resp.status(), StatusCode::BAD_REQUEST);
+
+    // 3. `eager=true` promotes cached raw diff to full parsed diff with `chunks_loaded: true`.
+    let eager_diff: tellit_types::JjDiffResponse = client
+        .get(format!(
+            "{}/api/jj/diff?target={target_oid}&eager=true",
+            server.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(eager_diff.files.iter().all(|f| f.chunks_loaded));
+    assert!(
+        eager_diff
+            .files
+            .iter()
+            .find(|f| f.path == "src/mod_a.rs")
+            .is_some_and(|f| !f.chunks.is_empty())
+    );
+
+    // 4. `HEAD /api/blob/{*path}` returns exact Content-Length without a response body.
+    let expected_bytes = fs::read(root.join("src/mod_a.rs")).unwrap();
+    let head_blob = client
+        .head(format!(
+            "{}/api/blob/src/mod_a.rs?ref={target_oid}",
+            server.url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head_blob.status(), StatusCode::OK);
+    assert_eq!(
+        head_blob.headers()["content-length"],
+        expected_bytes.len().to_string()
+    );
+    assert!(head_blob.bytes().await.unwrap().is_empty());
+
+    server.shutdown();
+    server.wait().await.unwrap();
+
+    // 5. Cold per-file fallback (fresh server with empty caches) works directly via `jj diff --git -- <path>`.
+    let cold_server = start_server(
+        ServerConfig::new(root.to_path_buf())
+            .with_port(Some(0))
+            .with_keep_alive(true)
+            .with_quiet(true),
+    )
+    .await
+    .unwrap();
+
+    let cold_mod: tellit_types::DiffFile = client
+        .get(format!(
+            "{}/api/jj/diff/file?target={target_oid}&path=src/mod_a.rs",
+            cold_server.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(cold_mod.chunks_loaded);
+    assert!(!cold_mod.chunks.is_empty());
+
+    let cold_msg: tellit_types::DiffFile = client
+        .get(format!(
+            "{}/api/jj/diff/file?target={target_oid}&path=Commit%20Message",
+            cold_server.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cold_msg.path, "Commit Message");
+    assert!(cold_msg.chunks_loaded);
+
+    let cold_missing = client
+        .get(format!(
+            "{}/api/jj/diff/file?target={target_oid}&path=src/never_existed.rs",
+            cold_server.url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cold_missing.status(), StatusCode::NOT_FOUND);
+
+    cold_server.shutdown();
+    cold_server.wait().await.unwrap();
+}

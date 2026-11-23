@@ -25,16 +25,73 @@ use crate::components::comments::{
 use crate::components::file_list::status_badge_class;
 use crate::components::image_diff::ImageDiffBody;
 use crate::components::markdown_diff::{MarkdownPreviewBody, MarkdownTab};
-use crate::state::{self, DiffViewMode};
+use crate::state::{self, AutoCollapseReason, DiffViewMode};
 
 use expanded::{
     DEFAULT_EXPAND_COUNT, ExpandDirection, ExpandedLinesMap, FileExpandedState, MergedChunk,
     merge_chunks_for_file,
 };
-use split::pair_side_by_side_rows;
+use split::{SideBySideRow, pair_side_by_side_rows};
 use word_highlight::render_code_line;
 
 const COMMIT_MESSAGE_PATH: &str = "Commit Message";
+
+/// Total merged line count above which an expanded file renders progressively in chunks.
+pub const LARGE_FILE_WINDOW_THRESHOLD: usize = 500;
+/// Initial line budget and incremental step size when progressively rendering a large file.
+pub const CHUNK_WINDOW_STEP_LINES: usize = 150;
+
+/// Progressive rendering budget across merged chunks of a large file diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkWindowPlan {
+    /// Maximum number of rows/lines to render from each merged chunk (`0` skips the chunk).
+    pub chunk_limits: Vec<usize>,
+    /// Total renderable rows/lines across all chunks in the file.
+    pub total_lines: usize,
+    /// Number of rows/lines rendered in the current window.
+    pub shown_lines: usize,
+    /// Remaining unrendered rows/lines deferred behind `"Show more"` / `"Show all"`.
+    pub remaining_lines: usize,
+}
+
+/// Computes per-chunk render limits for `chunk_row_counts` under `visible_limit`, gating
+/// progressive windowing on `total_merged_lines > LARGE_FILE_WINDOW_THRESHOLD`.
+///
+/// Split view pairs delete and add runs into fewer rows than source lines, so gating on
+/// `total_merged_lines` avoids bypassing progressive rendering on large replacement hunks.
+#[must_use]
+pub fn compute_chunk_window(
+    chunk_row_counts: &[usize],
+    total_merged_lines: usize,
+    visible_limit: usize,
+) -> ChunkWindowPlan {
+    let total_rows: usize = chunk_row_counts.iter().copied().sum();
+    if total_merged_lines <= LARGE_FILE_WINDOW_THRESHOLD || visible_limit >= total_rows {
+        return ChunkWindowPlan {
+            chunk_limits: chunk_row_counts.to_vec(),
+            total_lines: total_rows,
+            shown_lines: total_rows,
+            remaining_lines: 0,
+        };
+    }
+
+    let mut budget = visible_limit;
+    let mut chunk_limits = Vec::with_capacity(chunk_row_counts.len());
+    let mut shown_lines = 0usize;
+    for &count in chunk_row_counts {
+        let take = count.min(budget);
+        chunk_limits.push(take);
+        budget = budget.saturating_sub(take);
+        shown_lines = shown_lines.saturating_add(take);
+    }
+
+    ChunkWindowPlan {
+        chunk_limits,
+        total_lines: total_rows,
+        shown_lines,
+        remaining_lines: total_rows.saturating_sub(shown_lines),
+    }
+}
 
 /// Event emitted when the user submits a new inline or file-level review comment.
 #[derive(Clone)]
@@ -210,6 +267,10 @@ pub fn TextDiffCard(
     drag_state: RwSignal<Option<LineSelectionDrag>>,
     active_composer: RwSignal<Option<ActiveComposer>>,
     md_tab: RwSignal<MarkdownTab>,
+    #[prop(into)] is_near_viewport: Signal<bool>,
+    #[prop(into)] loading_chunks: Signal<bool>,
+    #[prop(into)] load_error: Signal<Option<String>>,
+    visible_line_limit: RwSignal<usize>,
     #[prop(into)] all_threads: Signal<Vec<JjCommentThread>>,
     #[prop(into)] reviewed_files: Signal<HashSet<String>>,
     #[prop(into)] collapsed_files: Signal<HashSet<String>>,
@@ -217,6 +278,10 @@ pub fn TextDiffCard(
     #[prop(into)] show_resolved_inline: Signal<bool>,
     #[prop(into)] expanded_lines: Signal<ExpandedLinesMap>,
     #[prop(into)] expand_loading: Signal<bool>,
+    on_register_card: Callback<(String, web_sys::Element)>,
+    on_unregister_card: Callback<web_sys::Element>,
+    on_request_file_diff: Callback<String>,
+    on_window_expanded: Callback<()>,
     on_toggle_viewed: Callback<String>,
     on_toggle_collapse: Callback<String>,
     on_open_in_editor: Callback<(String, usize)>,
@@ -240,6 +305,9 @@ pub fn TextDiffCard(
     let path_for_edit = path.clone();
     let path_for_exp = path.clone();
     let path_for_body = path.clone();
+    let path_for_observe = path.clone();
+    let path_for_lazy = path.clone();
+    let path_for_retry = path.clone();
 
     let is_viewed_sig =
         Memo::new(move |_| reviewed_files.with(|set| set.contains(&path_for_viewed)));
@@ -248,8 +316,39 @@ pub fn TextDiffCard(
 
     let whole_file_composing = RwSignal::new(false);
     let card_ref = NodeRef::<leptos::html::Article>::new();
+    let observed_el = StoredValue::new_local(Option::<web_sys::Element>::None);
     let marked_selection_els = StoredValue::new_local(Vec::<web_sys::Element>::new());
     let selection_sync_pending = StoredValue::new_local(false);
+
+    Effect::new(move |_| {
+        if let Some(article) = card_ref.get()
+            && observed_el.with_value(Option::is_none)
+        {
+            let el: web_sys::Element = article.into();
+            observed_el.set_value(Some(el.clone()));
+            on_register_card.run((path_for_observe.clone(), el));
+        }
+    });
+    on_cleanup(move || {
+        let mut prev = None;
+        let _ = observed_el.try_update_value(|slot| {
+            prev = slot.take();
+        });
+        if let Some(el) = prev {
+            on_unregister_card.run(el);
+        }
+    });
+
+    // Hydrate summary-only files lazily once the card is both uncollapsed and near the viewport.
+    Effect::new(move |_| {
+        if is_collapsed_sig.get() || !is_near_viewport.get() {
+            return;
+        }
+        let needs_load = file.with(|f| !f.chunks_loaded);
+        if needs_load && !loading_chunks.get() && load_error.with(Option::is_none) {
+            on_request_file_diff.run(path_for_lazy.clone());
+        }
+    });
 
     let visible_threads = Memo::new(move |_| {
         let show_resolved = show_resolved_inline.get();
@@ -272,10 +371,15 @@ pub fn TextDiffCard(
         active_composer.with(|c| c.as_ref().map(|c| (c.side, c.range.end)))
     }));
 
+    // Defer `/api/line-count` until the card is uncollapsed, near the viewport, and hydrated.
     Effect::new(move |_| {
+        if is_collapsed_sig.get() || !is_near_viewport.get() {
+            return;
+        }
         let can_expand = file.with(|f| {
             !is_commit_msg
                 && !is_img
+                && f.chunks_loaded
                 && f.status != FileStatus::Added
                 && f.status != FileStatus::Deleted
                 && !f.chunks.is_empty()
@@ -284,7 +388,7 @@ pub fn TextDiffCard(
             exp.as_ref()
                 .is_some_and(|e| e.old_total_lines.is_some() || e.new_total_lines.is_some())
         });
-        if can_expand && !is_collapsed_sig.get() && !has_line_counts {
+        if can_expand && !has_line_counts {
             on_prefetch_line_count.run(file.get_untracked());
         }
     });
@@ -317,6 +421,7 @@ pub fn TextDiffCard(
         }
         diff_mode.track();
         merged_chunks_memo.track();
+        visible_line_limit.track();
 
         if selection_sync_pending.get_value() {
             return;
@@ -403,8 +508,13 @@ pub fn TextDiffCard(
                             None => path_for_title.clone(),
                         })}
                     </span>
-                    {move || file.with(|f| f.is_generated).then(|| view! {
-                        <span class="pill-tag">"generated"</span>
+                    {move || file.with(|f| state::auto_collapse_reason(f)).map(|reason| {
+                        let cls = if reason == AutoCollapseReason::Deleted {
+                            "pill-tag pill-tag--del"
+                        } else {
+                            "pill-tag"
+                        };
+                        view! { <span class=cls>{reason.badge_label()}</span> }
                     })}
                     {move || {
                         let count = total_thread_count.get();
@@ -487,19 +597,29 @@ pub fn TextDiffCard(
             </header>
 
             {move || if is_collapsed_sig.get() {
-                let (hunks_count, is_generated) = file.with(|f| (f.chunks.len(), f.is_generated));
-                (hunks_count > 0).then(|| view! {
-                    <div class="diff-card__collapsed-note">
-                        {if is_generated {
-                            alloc::format!("Generated file collapsed ({hunks_count} hunks)")
-                        } else {
-                            alloc::format!("Collapsed ({hunks_count} hunks)")
-                        }}
-                    </div>
+                let (hunks_count, chunks_loaded, additions, deletions, reason) = file.with(|f| {
+                    (
+                        f.chunks.len(),
+                        f.chunks_loaded,
+                        f.additions,
+                        f.deletions,
+                        state::auto_collapse_reason(f),
+                    )
+                });
+                let has_summary = hunks_count > 0 || !chunks_loaded || additions > 0 || deletions > 0;
+                has_summary.then(|| {
+                    let prefix = reason.map_or("Collapsed", AutoCollapseReason::collapsed_prefix);
+                    let detail = if chunks_loaded && hunks_count > 0 {
+                        alloc::format!("{prefix} ({hunks_count} hunks)")
+                    } else {
+                        alloc::format!("{prefix} (+{additions} -{deletions}). Click to expand.")
+                    };
+                    view! { <div class="diff-card__collapsed-note">{detail}</div> }
                 }).into_any()
             } else {
                 let path_for_whole_submit = path_for_body.clone();
                 let path_for_line_submit = path_for_body.clone();
+                let path_for_code_retry = path_for_retry.clone();
 
                 view! {
                     <div class="diff-card__body diff-card__body--flush">
@@ -541,6 +661,11 @@ pub fn TextDiffCard(
                                 <>
                                     {move || render_file_threads_section(visible_threads.get(), on_reply, on_toggle_resolve)}
                                     {move || {
+                                        if !is_near_viewport.get() {
+                                            return view! {
+                                                <div class="diff-card__summary">"Loading image diff..."</div>
+                                            }.into_any();
+                                        }
                                         let file_arc = file.get();
                                         let (base_c, target_c) = commits.get();
                                         view! {
@@ -549,7 +674,7 @@ pub fn TextDiffCard(
                                                 base_commit=base_c
                                                 target_commit=target_c
                                             />
-                                        }
+                                        }.into_any()
                                     }}
                                 </>
                             }.into_any()
@@ -561,6 +686,11 @@ pub fn TextDiffCard(
                                             render_file_threads_section(visible_threads.get(), on_reply, on_toggle_resolve)
                                         })}
                                         {move || {
+                                            if !is_near_viewport.get() {
+                                                return view! {
+                                                    <div class="diff-card__summary">"Loading Markdown preview..."</div>
+                                                }.into_any();
+                                            }
                                             let md_file = file.get();
                                             let (md_base, md_target) = commits.get();
                                             view! {
@@ -571,7 +701,7 @@ pub fn TextDiffCard(
                                                     target_commit=md_target
                                                     active_tab=md_tab
                                                 />
-                                            }
+                                            }.into_any()
                                         }}
                                     </div>
                                 }
@@ -586,11 +716,68 @@ pub fn TextDiffCard(
                                             return ().into_any();
                                         }
 
+                                        let chunks_loaded = file.with(|f| f.chunks_loaded);
+                                        if !chunks_loaded {
+                                            composer_selector.with_value(Selector::clear);
+                                            if let Some(err_msg) = load_error.get() {
+                                                let retry_path = path_for_code_retry.clone();
+                                                return view! {
+                                                    <div class="diff-load-error">
+                                                        <span>{alloc::format!("Failed to load diff: {err_msg}")}</span>
+                                                        <button
+                                                            type="button"
+                                                            class="btn btn--ghost btn--xs"
+                                                            on:click=move |_| on_request_file_diff.run(retry_path.clone())
+                                                        >
+                                                            "Retry"
+                                                        </button>
+                                                    </div>
+                                                }.into_any();
+                                            }
+                                            return view! {
+                                                <div class="diff-card__summary">"Loading diff..."</div>
+                                            }.into_any();
+                                        }
+
                                         let merged_chunks = merged_chunks_memo.get();
                                         let mode = diff_mode.get();
                                         let file_snapshot = file.get_untracked();
                                         // Evict stale subscriber entries from prior mode or chunk renders.
                                         composer_selector.with_value(Selector::clear);
+
+                                        let total_merged_lines: usize =
+                                            merged_chunks.iter().map(|mc| mc.lines.len()).sum();
+                                        let limit = if total_merged_lines > LARGE_FILE_WINDOW_THRESHOLD {
+                                            visible_line_limit.get()
+                                        } else {
+                                            usize::MAX
+                                        };
+                                        // In split mode, pair full Delete/Add runs before slicing
+                                        // to the window budget so side-by-side alignment stays
+                                        // intact when the user reveals additional rows.
+                                        let split_chunks: Vec<Vec<SideBySideRow>> =
+                                            if mode == DiffViewMode::Split {
+                                                merged_chunks
+                                                    .iter()
+                                                    .map(pair_side_by_side_rows)
+                                                    .collect()
+                                            } else {
+                                                Vec::new()
+                                            };
+                                        let chunk_counts: Vec<usize> =
+                                            if mode == DiffViewMode::Split {
+                                                split_chunks.iter().map(Vec::len).collect()
+                                            } else {
+                                                merged_chunks
+                                                    .iter()
+                                                    .map(|mc| mc.lines.len())
+                                                    .collect()
+                                            };
+                                        let window_plan = compute_chunk_window(
+                                            &chunk_counts,
+                                            total_merged_lines,
+                                            limit,
+                                        );
 
                                         let (thread_index, unplaced) = visible_threads.with(|active_threads| {
                                             let idx = ThreadIndex::from_threads(active_threads);
@@ -599,8 +786,33 @@ pub fn TextDiffCard(
                                             }
                                             let mut placed_ids = HashSet::new();
                                             if !idx.is_empty() {
-                                                for mc in merged_chunks.iter() {
-                                                    collect_placed_thread_ids(mc, &idx, mode, &mut placed_ids);
+                                                for (merged_idx, (mc, &chunk_limit)) in merged_chunks
+                                                    .iter()
+                                                    .zip(window_plan.chunk_limits.iter())
+                                                    .enumerate()
+                                                {
+                                                    if chunk_limit == 0 {
+                                                        continue;
+                                                    }
+                                                    if mode == DiffViewMode::Split {
+                                                        let visible_rows = &split_chunks[merged_idx]
+                                                            [..chunk_limit.min(
+                                                                split_chunks[merged_idx].len(),
+                                                            )];
+                                                        collect_placed_split_thread_ids(
+                                                            mc,
+                                                            visible_rows,
+                                                            &idx,
+                                                            &mut placed_ids,
+                                                        );
+                                                    } else {
+                                                        collect_placed_unified_thread_ids(
+                                                            mc,
+                                                            chunk_limit,
+                                                            &idx,
+                                                            &mut placed_ids,
+                                                        );
+                                                    }
                                                 }
                                             }
                                             let unplaced = active_threads
@@ -613,6 +825,9 @@ pub fn TextDiffCard(
 
                                         let chunk_count = merged_chunks.len();
                                         let path_clone = file_snapshot.path.clone();
+                                        let remaining_lines = window_plan.remaining_lines;
+                                        let shown_lines = window_plan.shown_lines;
+                                        let total_lines = window_plan.total_lines;
 
                                         view! {
                                             <>
@@ -628,18 +843,27 @@ pub fn TextDiffCard(
                                                     merged_chunks
                                                         .iter()
                                                         .enumerate()
-                                                        .map(|(merged_idx, mc)| {
+                                                        .filter_map(|(merged_idx, mc)| {
+                                                            let chunk_limit = window_plan
+                                                                .chunk_limits
+                                                                .get(merged_idx)
+                                                                .copied()
+                                                                .unwrap_or(0);
+                                                            if chunk_limit == 0 {
+                                                                return None;
+                                                            }
                                                             let first_orig = *mc.original_indices.first().unwrap_or(&0);
                                                             let last_orig = *mc.original_indices.last().unwrap_or(&0);
                                                             let is_first = merged_idx == 0;
-                                                            let is_last = merged_idx + 1 == chunk_count;
+                                                            let is_last = merged_idx + 1 == chunk_count
+                                                                && remaining_lines == 0;
                                                             let hidden_before = mc.hidden_lines_before;
                                                             let hidden_after = mc.hidden_lines_after.unwrap_or(0);
                                                             let file_top = Arc::clone(&file_snapshot);
                                                             let file_mid = Arc::clone(&file_snapshot);
                                                             let file_bot = Arc::clone(&file_snapshot);
 
-                                                            view! {
+                                                            Some(view! {
                                                                 <div class="diff-chunk-wrapper">
                                                                     {(is_first && hidden_before > 0).then(|| view! {
                                                                         <ExpandBar
@@ -706,8 +930,13 @@ pub fn TextDiffCard(
                                                                     <div class="diff-chunk-header">{mc.header.clone()}</div>
 
                                                                     {if mode == DiffViewMode::Split {
+                                                                        let visible_rows = &split_chunks[merged_idx]
+                                                                            [..chunk_limit.min(
+                                                                                split_chunks[merged_idx].len(),
+                                                                            )];
                                                                         render_split_chunk(
                                                                             mc,
+                                                                            visible_rows,
                                                                             &path_clone,
                                                                             &thread_index,
                                                                             &path_for_line_submit,
@@ -716,6 +945,7 @@ pub fn TextDiffCard(
                                                                     } else {
                                                                         render_unified_chunk(
                                                                             mc,
+                                                                            chunk_limit,
                                                                             &path_clone,
                                                                             &thread_index,
                                                                             &path_for_line_submit,
@@ -750,11 +980,46 @@ pub fn TextDiffCard(
                                                                         />
                                                                     })}
                                                                 </div>
-                                                            }
+                                                            })
                                                         })
                                                         .collect_view()
                                                         .into_any()
                                                 }}
+
+                                                {(remaining_lines > 0).then(|| {
+                                                    let next_step = remaining_lines.min(CHUNK_WINDOW_STEP_LINES);
+                                                    view! {
+                                                        <div class="diff-window-bar">
+                                                            <span class="diff-window-bar__label">
+                                                                {alloc::format!("Showing {shown_lines} of {total_lines} lines")}
+                                                            </span>
+                                                            <div class="diff-window-bar__actions">
+                                                                <button
+                                                                    type="button"
+                                                                    class="btn btn--ghost btn--xs"
+                                                                    on:click=move |_| {
+                                                                        visible_line_limit.update(|n| {
+                                                                            *n = n.saturating_add(CHUNK_WINDOW_STEP_LINES);
+                                                                        });
+                                                                        on_window_expanded.run(());
+                                                                    }
+                                                                >
+                                                                    {alloc::format!("Show next {next_step} lines")}
+                                                                </button>
+                                                                <button
+                                                                    type="button"
+                                                                    class="btn btn--ghost btn--xs"
+                                                                    on:click=move |_| {
+                                                                        visible_line_limit.set(usize::MAX);
+                                                                        on_window_expanded.run(());
+                                                                    }
+                                                                >
+                                                                    {alloc::format!("Show all ({remaining_lines} remaining)")}
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                    }
+                                                })}
                                             </>
                                         }.into_any()
                                     }}
@@ -1018,11 +1283,13 @@ fn render_line_actions(
 
 fn render_unified_chunk(
     mc: &MergedChunk,
+    line_limit: usize,
     file_path: &str,
     thread_index: &ThreadIndex,
     submit_file_path: &str,
     ctx: ChunkRenderCtx,
 ) -> impl IntoView {
+    let limit = mc.lines.len().min(line_limit);
     view! {
         <table class="diff-table diff-table--unified">
             <colgroup>
@@ -1031,7 +1298,7 @@ fn render_unified_chunk(
                 <col class="col-code" />
             </colgroup>
             <tbody>
-                {(0..mc.lines.len()).filter_map(|idx| {
+                {(0..limit).filter_map(|idx| {
                     let line = mc.line(idx)?;
                     let is_expanded = mc.is_line_expanded(idx);
                     let row_class_base = unified_row_class(line.kind, is_expanded);
@@ -1196,13 +1463,12 @@ fn render_unified_chunk(
 
 fn render_split_chunk(
     mc: &MergedChunk,
+    rows: &[SideBySideRow],
     file_path: &str,
     thread_index: &ThreadIndex,
     submit_file_path: &str,
     ctx: ChunkRenderCtx,
 ) -> impl IntoView {
-    let rows = pair_side_by_side_rows(mc);
-
     view! {
         <table class="diff-table diff-table--split">
             <colgroup>
@@ -1212,7 +1478,7 @@ fn render_split_chunk(
                 <col class="col-code" />
             </colgroup>
             <tbody>
-                {rows.into_iter().map(|row| {
+                {rows.iter().copied().map(|row| {
                     let old_line = row.old_line_idx.and_then(|i| mc.line(i));
                     let new_line = row.new_line_idx.and_then(|i| mc.line(i));
                     let old_is_expanded = row.old_line_idx.is_some_and(|i| mc.is_line_expanded(i));
@@ -1456,26 +1722,45 @@ fn render_split_composer_row(
     }
 }
 
-fn collect_placed_thread_ids<'a>(
+fn collect_placed_unified_thread_ids<'a>(
     mc: &MergedChunk,
+    line_limit: usize,
     thread_index: &'a ThreadIndex,
-    mode: DiffViewMode,
     placed: &mut HashSet<&'a str>,
 ) {
-    for line in mc.iter_lines() {
-        if mode == DiffViewMode::Split {
-            if let Some(old_n) = line.old_line_number {
-                for t in thread_index.at(CommentSide::Old, old_n) {
-                    placed.insert(t.id.as_str());
-                }
+    let limit = mc.lines.len().min(line_limit);
+    for idx in 0..limit {
+        let Some(line) = mc.line(idx) else {
+            continue;
+        };
+        for t in thread_index.unified_line_threads(line) {
+            placed.insert(t.id.as_str());
+        }
+    }
+}
+
+fn collect_placed_split_thread_ids<'a>(
+    mc: &MergedChunk,
+    visible_rows: &[SideBySideRow],
+    thread_index: &'a ThreadIndex,
+    placed: &mut HashSet<&'a str>,
+) {
+    for row in visible_rows {
+        if let Some(old_n) = row
+            .old_line_idx
+            .and_then(|i| mc.line(i))
+            .and_then(|l| l.old_line_number)
+        {
+            for t in thread_index.at(CommentSide::Old, old_n) {
+                placed.insert(t.id.as_str());
             }
-            if let Some(new_n) = line.new_line_number {
-                for t in thread_index.at(CommentSide::New, new_n) {
-                    placed.insert(t.id.as_str());
-                }
-            }
-        } else {
-            for t in thread_index.unified_line_threads(line) {
+        }
+        if let Some(new_n) = row
+            .new_line_idx
+            .and_then(|i| mc.line(i))
+            .and_then(|l| l.new_line_number)
+        {
+            for t in thread_index.at(CommentSide::New, new_n) {
                 placed.insert(t.id.as_str());
             }
         }
@@ -1639,6 +1924,7 @@ mod tests {
                     mk_line(DiffLineKind::Add, None, Some(3), "new 3"),
                 ],
             }],
+            chunks_loaded: true,
         });
 
         assert_eq!(
@@ -1690,5 +1976,41 @@ mod tests {
         assert_eq!(idx.at(CommentSide::Old, 2).len(), 1);
         assert_eq!(idx.at(CommentSide::New, 2).len(), 1);
         assert!(idx.at(CommentSide::New, 99).is_empty());
+    }
+
+    #[test]
+    fn chunk_window_renders_small_files_in_full_and_slices_large_files_progressively() {
+        // Under the 500-line threshold, every chunk renders in full regardless of visible_limit.
+        let small = compute_chunk_window(&[120, 200, 180], 500, CHUNK_WINDOW_STEP_LINES);
+        assert_eq!(small.total_lines, 500);
+        assert_eq!(small.shown_lines, 500);
+        assert_eq!(small.remaining_lines, 0);
+        assert_eq!(small.chunk_limits, alloc::vec![120, 200, 180]);
+
+        // Over 500 lines, slices chunks sequentially up to visible_limit.
+        let step1 = compute_chunk_window(&[100, 400, 300], 800, CHUNK_WINDOW_STEP_LINES);
+        assert_eq!(step1.total_lines, 800);
+        assert_eq!(step1.shown_lines, 150);
+        assert_eq!(step1.remaining_lines, 650);
+        assert_eq!(step1.chunk_limits, alloc::vec![100, 50, 0]);
+
+        // Expanding the budget reveals more lines and eventually all chunks.
+        let step2 = compute_chunk_window(&[100, 400, 300], 800, CHUNK_WINDOW_STEP_LINES * 4);
+        assert_eq!(step2.shown_lines, 600);
+        assert_eq!(step2.remaining_lines, 200);
+        assert_eq!(step2.chunk_limits, alloc::vec![100, 400, 100]);
+
+        let all = compute_chunk_window(&[100, 400, 300], 800, usize::MAX);
+        assert_eq!(all.shown_lines, 800);
+        assert_eq!(all.remaining_lines, 0);
+        assert_eq!(all.chunk_limits, alloc::vec![100, 400, 300]);
+
+        // Split mode: 300 paired rows from 600 merged lines (300 Delete + 300 Add) still windows
+        // because progressive gating uses total_merged_lines (> 500), not paired row count.
+        let split_window = compute_chunk_window(&[300], 600, CHUNK_WINDOW_STEP_LINES);
+        assert_eq!(split_window.total_lines, 300);
+        assert_eq!(split_window.shown_lines, 150);
+        assert_eq!(split_window.remaining_lines, 150);
+        assert_eq!(split_window.chunk_limits, alloc::vec![150]);
     }
 }

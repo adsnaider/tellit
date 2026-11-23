@@ -1366,6 +1366,7 @@ mod tests {
                     },
                 ],
             }],
+            chunks_loaded: true,
         });
         let chunks = crate::components::text_diff::expanded::merge_chunks_for_file(&file, None);
 

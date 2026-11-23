@@ -118,12 +118,19 @@ fn has_content_on_side<F: Borrow<DiffFile>>(pos: CursorPosition, files: &[F]) ->
     }
 }
 
+fn is_unhydrated_navigable_file(file: &DiffFile) -> bool {
+    !file.chunks_loaded
+        && (file.additions > 0 || file.deletions > 0)
+        && !state::is_image_file(&file.path)
+}
+
 fn is_file_skipped(
     file: &DiffFile,
     reviewed_files: &HashSet<String>,
     collapsed_files: &HashSet<String>,
 ) -> bool {
-    file.chunks.is_empty()
+    let has_navigable_lines = !file.chunks.is_empty() || is_unhydrated_navigable_file(file);
+    !has_navigable_lines
         || reviewed_files.contains(&file.path)
         || collapsed_files.contains(&file.path)
 }
@@ -149,6 +156,9 @@ fn next_unskipped_file_from<F: Borrow<DiffFile>>(
 }
 
 fn last_line_in_file(file: &DiffFile) -> Option<(usize, usize)> {
+    if is_unhydrated_navigable_file(file) {
+        return Some((0, 0));
+    }
     for (ci, chunk) in file.chunks.iter().enumerate().rev() {
         if !chunk.lines.is_empty() {
             return Some((ci, chunk.lines.len() - 1));
@@ -158,6 +168,9 @@ fn last_line_in_file(file: &DiffFile) -> Option<(usize, usize)> {
 }
 
 fn first_line_in_file(file: &DiffFile) -> Option<(usize, usize)> {
+    if is_unhydrated_navigable_file(file) {
+        return Some((0, 0));
+    }
     for (ci, chunk) in file.chunks.iter().enumerate() {
         if !chunk.lines.is_empty() {
             return Some((ci, 0));
@@ -300,11 +313,17 @@ fn matches_target<F: Borrow<DiffFile>>(
             if is_file_skipped(file, reviewed_files, collapsed_files) {
                 return false;
             }
+            if is_unhydrated_navigable_file(file) {
+                return pos.chunk_index == 0 && pos.line_index == 0;
+            }
             mode == DiffViewMode::Unified || has_content_on_side(pos, files)
         }
         NavigationTarget::Chunk => {
             if is_file_skipped(file, reviewed_files, collapsed_files) {
                 return false;
+            }
+            if is_unhydrated_navigable_file(file) {
+                return pos.chunk_index == 0 && pos.line_index == 0;
             }
             let Some(chunk) = file.chunks.get(pos.chunk_index) else {
                 return false;
@@ -444,7 +463,13 @@ fn open_line_budget<F: Borrow<DiffFile>>(
         .iter()
         .map(Borrow::borrow)
         .filter(|f| !is_file_skipped(f, reviewed_files, collapsed_files))
-        .map(|f| f.chunks.iter().map(|c| c.lines.len()).sum::<usize>())
+        .map(|f| {
+            if is_unhydrated_navigable_file(f) {
+                1
+            } else {
+                f.chunks.iter().map(|c| c.lines.len()).sum::<usize>()
+            }
+        })
         .sum::<usize>()
         .saturating_add(1)
 }
@@ -602,6 +627,7 @@ mod tests {
                 header: String::from("@@ -1,1 +1,1 @@"),
                 lines,
             }],
+            chunks_loaded: true,
         }
     }
 
@@ -627,6 +653,7 @@ mod tests {
                         mk_line(DiffLineKind::Add, None, Some(2)),
                     ],
                 }],
+                chunks_loaded: true,
             },
             DiffFile {
                 path: String::from("b.rs"),
@@ -643,6 +670,7 @@ mod tests {
                     header: String::from("@@ -0,0 +1,1 @@"),
                     lines: alloc::vec![mk_line(DiffLineKind::Add, None, Some(1))],
                 }],
+                chunks_loaded: true,
             },
         ];
 
@@ -761,5 +789,83 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn advances_onto_uncollapsed_unhydrated_text_files_instead_of_wrapping() {
+        let mk_summary = |path: &str, additions: u32, deletions: u32| DiffFile {
+            path: String::from(path),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions,
+            deletions,
+            is_generated: false,
+            chunks: Vec::new(),
+            chunks_loaded: false,
+        };
+
+        let files = alloc::vec![
+            mk_file(
+                "Commit Message",
+                alloc::vec![mk_line(DiffLineKind::Add, None, Some(1))],
+            ),
+            mk_summary("logo.png", 1, 0),
+            mk_summary("src/lazy_collapsed.rs", 10, 2),
+            mk_summary("src/lazy_open.rs", 5, 0),
+        ];
+
+        let reviewed = HashSet::new();
+        let mut collapsed = HashSet::new();
+        collapsed.insert(String::from("src/lazy_collapsed.rs"));
+
+        let at_commit_msg = CursorPosition {
+            file_index: 0,
+            chunk_index: 0,
+            line_index: 0,
+            side: CommentSide::New,
+        };
+
+        // `j` (Line) skips image + collapsed summary and lands on virtual (0, 0) of `src/lazy_open.rs`.
+        let next_line = find_next_position(
+            Some(at_commit_msg),
+            NavigationDirection::Next,
+            NavigationTarget::Line,
+            &files,
+            DiffViewMode::Split,
+            &reviewed,
+            &collapsed,
+        )
+        .unwrap();
+        assert_eq!(next_line.file_index, 3);
+        assert_eq!(next_line.chunk_index, 0);
+        assert_eq!(next_line.line_index, 0);
+
+        // `n` (Chunk) also lands on `src/lazy_open.rs` instead of wrapping to file 0.
+        let next_chunk = find_next_position(
+            Some(at_commit_msg),
+            NavigationDirection::Next,
+            NavigationTarget::Chunk,
+            &files,
+            DiffViewMode::Unified,
+            &reviewed,
+            &collapsed,
+        )
+        .unwrap();
+        assert_eq!(next_chunk.file_index, 3);
+        assert_eq!(next_chunk.chunk_index, 0);
+        assert_eq!(next_chunk.line_index, 0);
+
+        // Pressing `j` again from the unhydrated file wraps cleanly back to file 0.
+        let wrapped = find_next_position(
+            Some(next_line),
+            NavigationDirection::Next,
+            NavigationTarget::Line,
+            &files,
+            DiffViewMode::Split,
+            &reviewed,
+            &collapsed,
+        )
+        .unwrap();
+        assert_eq!(wrapped.file_index, 0);
     }
 }

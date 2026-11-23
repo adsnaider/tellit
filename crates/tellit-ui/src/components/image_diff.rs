@@ -111,6 +111,7 @@ fn SingleImageCard(
                             src=src.clone()
                             alt=alt.clone()
                             class="img-preview"
+                            loading="lazy"
                             on:load=attach_load_metadata(src.clone(), meta)
                             on:error=move |_| {
                                 let _ = meta.try_update(|m| m.failed = true);
@@ -232,12 +233,14 @@ pub fn ImageDiffBody(
                                     src=old_url.clone()
                                     alt=old_alt.clone()
                                     class="img-stage__base"
+                                    loading="lazy"
                                     on:load=load_old
                                 />
                                 <img
                                     src=new_url.clone()
                                     alt=new_alt.clone()
                                     class="img-stage__overlay"
+                                    loading="lazy"
                                     style=move || alloc::format!("clip-path: inset(0 {}% 0 0);", 100u32.saturating_sub(swipe_pct.get()))
                                     on:load=load_new
                                 />
@@ -280,12 +283,14 @@ pub fn ImageDiffBody(
                                     src=old_url.clone()
                                     alt=old_alt.clone()
                                     class="img-stage__base"
+                                    loading="lazy"
                                     on:load=load_old
                                 />
                                 <img
                                     src=new_url.clone()
                                     alt=new_alt.clone()
                                     class="img-stage__overlay"
+                                    loading="lazy"
                                     style=move || alloc::format!("opacity: {:.2};", f64::from(opacity_pct.get()) / 100.0)
                                     on:load=load_new
                                 />

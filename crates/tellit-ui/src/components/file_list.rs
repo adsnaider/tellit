@@ -589,6 +589,7 @@ mod tests {
             deletions: 4,
             is_generated: true,
             chunks: Vec::new(),
+            chunks_loaded: true,
         };
         let entry = FileTreeEntry::from(&diff_file);
         assert_eq!(entry.path, "src/main.rs");

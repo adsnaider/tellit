@@ -6,6 +6,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::size_of;
+use core::ops::Range;
 use core::time::Duration;
 use std::collections::HashMap;
 use std::io;
@@ -32,6 +33,14 @@ const MAX_ETXTBSY_RETRIES: u32 = 10;
 const MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
 const DIFF_CACHE_MAX_ENTRIES: usize = 16;
 const DIFF_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const RAW_DIFF_CACHE_MAX_ENTRIES: usize = 16;
+const RAW_DIFF_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const FILE_DIFF_CACHE_MAX_ENTRIES: usize = 256;
+const FILE_DIFF_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// Default total diff-line threshold above which `GET /api/jj/diff` returns a summary response
+/// and clients fetch individual file hunks lazily via `GET /api/jj/diff/file`.
+pub const DEFAULT_DIFF_SUMMARY_THRESHOLD: usize = 2_000;
 
 const JJ_CHANGE_FIELDS_EXPR: &str = r#"change_id ++ "\t" ++ change_id.shortest() ++ "\t" ++ commit_id ++ "\t" ++ if(current_working_copy, "1", "0") ++ "\t" ++ if(empty, "1", "0") ++ "\t" ++ if(immutable, "1", "0") ++ "\t" ++ if(conflict, "1", "0") ++ "\t" ++ if(root, "1", "0") ++ "\t" ++ bookmarks.map(|b| b.name()).join(",") ++ "\t" ++ parents.map(|p| p.commit_id()).join(",") ++ "\t" ++ if(author.name(), author.name(), author.email()) ++ "\t" ++ committer.timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ description.first_line()"#;
 
@@ -109,6 +118,21 @@ pub struct DiffOutcome {
     pub response: Arc<JjDiffResponse>,
     /// `true` when this diff represents the current working-copy commit (`@`) against its parent.
     pub is_working_copy_parent_diff: bool,
+    /// `true` when commit metadata resolved cleanly to immutable 40-char commit OIDs.
+    pub cacheable: bool,
+}
+
+/// Result of computing a single file diff for `GET /api/jj/diff/file` with resolved commit IDs.
+#[derive(Debug, Clone)]
+pub struct DiffFileOutcome {
+    /// Parsed and highlighted single-file diff entry (`chunks_loaded: true`).
+    pub file: Arc<DiffFile>,
+    /// Resolved target commit ID.
+    pub commit: String,
+    /// Effective base commit ID (parent OID or explicit interdiff base OID).
+    pub base_commit: String,
+    /// `true` when commit metadata resolved cleanly to immutable 40-char commit OIDs.
+    pub cacheable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -118,30 +142,45 @@ struct DiffCacheKey {
     ignore_rebase: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FileDiffCacheKey {
+    diff_key: DiffCacheKey,
+    path: String,
+}
+
+#[derive(Debug, Clone)]
+struct CachedDiffFile {
+    file: Arc<DiffFile>,
+    commit: String,
+    base_commit: String,
+}
+
 #[derive(Debug)]
-struct DiffCacheEntry {
-    key: DiffCacheKey,
-    value: Arc<JjDiffResponse>,
+struct CachedRawDiff {
+    raw_diff: Arc<String>,
+    block_ranges: HashMap<String, Range<usize>>,
+    summary: Arc<JjDiffResponse>,
+    total_diff_lines: usize,
+}
+
+#[derive(Debug)]
+struct LruEntry<K, V> {
+    key: K,
+    value: V,
     approx_bytes: usize,
 }
 
-/// Bounded in-memory LRU cache of immutable OID-keyed diff responses.
+/// Bounded in-memory LRU cache keyed by `K` with both entry-count and approximate-byte limits.
 #[derive(Debug)]
-struct DiffLruCache {
+struct BoundedLruCache<K, V> {
     /// Ordered from least-recently used (front) to most-recently used (back).
-    entries: Vec<DiffCacheEntry>,
+    entries: Vec<LruEntry<K, V>>,
     total_bytes: usize,
     max_entries: usize,
     max_bytes: usize,
 }
 
-impl Default for DiffLruCache {
-    fn default() -> Self {
-        Self::with_limits(DIFF_CACHE_MAX_ENTRIES, DIFF_CACHE_MAX_BYTES)
-    }
-}
-
-impl DiffLruCache {
+impl<K: PartialEq, V: Clone> BoundedLruCache<K, V> {
     fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
         Self {
             entries: Vec::new(),
@@ -151,16 +190,15 @@ impl DiffLruCache {
         }
     }
 
-    fn get(&mut self, key: &DiffCacheKey) -> Option<Arc<JjDiffResponse>> {
+    fn get(&mut self, key: &K) -> Option<V> {
         let idx = self.entries.iter().position(|entry| &entry.key == key)?;
         let entry = self.entries.remove(idx);
-        let value = Arc::clone(&entry.value);
+        let value = entry.value.clone();
         self.entries.push(entry);
         Some(value)
     }
 
-    fn insert(&mut self, key: DiffCacheKey, value: Arc<JjDiffResponse>) {
-        let approx_bytes = estimate_diff_bytes(&value);
+    fn insert(&mut self, key: K, value: V, approx_bytes: usize) {
         if self.max_entries == 0 || approx_bytes > self.max_bytes {
             return;
         }
@@ -178,7 +216,7 @@ impl DiffLruCache {
             self.total_bytes = self.total_bytes.saturating_sub(evicted.approx_bytes);
         }
         self.total_bytes = self.total_bytes.saturating_add(approx_bytes);
-        self.entries.push(DiffCacheEntry {
+        self.entries.push(LruEntry {
             key,
             value,
             approx_bytes,
@@ -186,27 +224,50 @@ impl DiffLruCache {
     }
 }
 
-fn estimate_diff_bytes(diff: &JjDiffResponse) -> usize {
-    let mut total = size_of::<JjDiffResponse>() + diff.commit.len() + diff.base_commit.len();
-    for file in &diff.files {
+fn estimate_diff_file_bytes(file: &DiffFile) -> usize {
+    let mut total = size_of::<DiffFile>()
+        .saturating_add(file.path.len())
+        .saturating_add(file.old_path.as_ref().map_or(0, String::len));
+    for chunk in &file.chunks {
         total = total
-            .saturating_add(size_of::<DiffFile>())
-            .saturating_add(file.path.len())
-            .saturating_add(file.old_path.as_ref().map_or(0, String::len));
-        for chunk in &file.chunks {
+            .saturating_add(size_of::<DiffChunk>())
+            .saturating_add(chunk.header.len());
+        for line in &chunk.lines {
             total = total
-                .saturating_add(size_of::<DiffChunk>())
-                .saturating_add(chunk.header.len());
-            for line in &chunk.lines {
-                total = total
-                    .saturating_add(size_of::<DiffLine>())
-                    .saturating_add(line.content.len())
-                    .saturating_add(line.syntax_spans.len() * size_of::<SyntaxSpan>())
-                    .saturating_add(line.word_diff.len() * size_of::<WordDiffSegment>());
-            }
+                .saturating_add(size_of::<DiffLine>())
+                .saturating_add(line.content.len())
+                .saturating_add(line.syntax_spans.len() * size_of::<SyntaxSpan>())
+                .saturating_add(line.word_diff.len() * size_of::<WordDiffSegment>());
         }
     }
     total
+}
+
+fn estimate_cached_diff_file_bytes(cached: &CachedDiffFile) -> usize {
+    size_of::<CachedDiffFile>()
+        .saturating_add(cached.commit.len())
+        .saturating_add(cached.base_commit.len())
+        .saturating_add(estimate_diff_file_bytes(&cached.file))
+}
+
+fn estimate_diff_bytes(diff: &JjDiffResponse) -> usize {
+    let mut total = size_of::<JjDiffResponse>() + diff.commit.len() + diff.base_commit.len();
+    for file in &diff.files {
+        total = total.saturating_add(estimate_diff_file_bytes(file));
+    }
+    total
+}
+
+fn estimate_raw_diff_bytes(raw: &CachedRawDiff) -> usize {
+    let index_bytes: usize = raw
+        .block_ranges
+        .keys()
+        .map(|k| k.len() + size_of::<String>() + size_of::<Range<usize>>())
+        .sum();
+    size_of::<CachedRawDiff>()
+        .saturating_add(raw.raw_diff.len())
+        .saturating_add(index_bytes)
+        .saturating_add(estimate_diff_bytes(&raw.summary))
 }
 
 fn is_strict_40_hex_oid(raw: &str) -> bool {
@@ -255,6 +316,30 @@ struct CommitMeta {
     description: String,
 }
 
+struct ResolvedDiffTargets {
+    target_meta: Option<CommitMeta>,
+    base_meta: Option<CommitMeta>,
+    resolved_target: String,
+    normalized_base: Option<String>,
+    effective_base: String,
+    is_inter_diff: bool,
+    is_working_copy_parent_diff: bool,
+    cache_key: Option<DiffCacheKey>,
+}
+
+fn jj_exact_file_fileset(posix_path: &str) -> String {
+    let mut escaped = String::with_capacity(posix_path.len() + 12);
+    escaped.push_str("root-file:\"");
+    for ch in posix_path.chars() {
+        if ch == '\\' || ch == '"' {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped.push('"');
+    escaped
+}
+
 struct ParsedChangeRow {
     change: JjChange,
     is_root: bool,
@@ -274,7 +359,9 @@ struct RawEvologEntry {
 pub struct JujutsuService {
     repo_path: PathBuf,
     store_override: Option<PathBuf>,
-    diff_cache: Arc<Mutex<DiffLruCache>>,
+    diff_cache: Arc<Mutex<BoundedLruCache<DiffCacheKey, Arc<JjDiffResponse>>>>,
+    raw_diff_cache: Arc<Mutex<BoundedLruCache<DiffCacheKey, Arc<CachedRawDiff>>>>,
+    file_diff_cache: Arc<Mutex<BoundedLruCache<FileDiffCacheKey, CachedDiffFile>>>,
 }
 
 impl JujutsuService {
@@ -284,7 +371,18 @@ impl JujutsuService {
         Self {
             repo_path,
             store_override,
-            diff_cache: Arc::new(Mutex::new(DiffLruCache::default())),
+            diff_cache: Arc::new(Mutex::new(BoundedLruCache::with_limits(
+                DIFF_CACHE_MAX_ENTRIES,
+                DIFF_CACHE_MAX_BYTES,
+            ))),
+            raw_diff_cache: Arc::new(Mutex::new(BoundedLruCache::with_limits(
+                RAW_DIFF_CACHE_MAX_ENTRIES,
+                RAW_DIFF_CACHE_MAX_BYTES,
+            ))),
+            file_diff_cache: Arc::new(Mutex::new(BoundedLruCache::with_limits(
+                FILE_DIFF_CACHE_MAX_ENTRIES,
+                FILE_DIFF_CACHE_MAX_BYTES,
+            ))),
         }
     }
 
@@ -547,17 +645,12 @@ impl JujutsuService {
         Ok(commits)
     }
 
-    /// Computes a structured diff for `target` (optionally compared from `base`), isolating upstream rebases.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`JujutsuError`] if `target` is empty or `jj diff` fails.
-    pub async fn get_diff(
+    async fn resolve_diff_targets(
         &self,
         target: &str,
         base: Option<&str>,
         ignore_rebase: bool,
-    ) -> Result<DiffOutcome, JujutsuError> {
+    ) -> Result<ResolvedDiffTargets, JujutsuError> {
         let trimmed_target = target.trim();
         if trimmed_target.is_empty() {
             return Err(JujutsuError::InvalidInput(String::from(
@@ -582,8 +675,9 @@ impl JujutsuService {
             .as_ref()
             .map_or_else(|| String::from(trimmed_target), |m| m.commit_id.clone());
 
-        let normalized_base = normalize_interdiff_base(base, trimmed_target, &resolved_target);
-        let base_meta = match normalized_base {
+        let normalized_base =
+            normalize_interdiff_base(base, trimmed_target, &resolved_target).map(String::from);
+        let base_meta = match normalized_base.as_deref() {
             Some(base_ref) if eager_base_ref == Some(base_ref) => eager_base_meta,
             Some(base_ref) => self.fetch_commit_meta(base_ref).await,
             None => None,
@@ -595,18 +689,147 @@ impl JujutsuService {
         let cache_key = build_diff_cache_key(
             target_meta.as_ref(),
             base_meta.as_ref(),
-            normalized_base,
+            normalized_base.as_deref(),
             ignore_rebase,
         );
+        let effective_base = match normalized_base.as_deref() {
+            Some(base_ref) => base_meta
+                .as_ref()
+                .map_or_else(|| String::from(base_ref), |m| m.commit_id.clone()),
+            None => target_meta
+                .as_ref()
+                .and_then(|m| m.parents.first().cloned())
+                .unwrap_or_else(|| alloc::format!("{resolved_target}-")),
+        };
 
-        if let Some(ref key) = cache_key
-            && let Ok(mut guard) = self.diff_cache.lock()
-            && let Some(cached) = guard.get(key)
-        {
-            return Ok(DiffOutcome {
-                response: cached,
-                is_working_copy_parent_diff,
-            });
+        Ok(ResolvedDiffTargets {
+            target_meta,
+            base_meta,
+            resolved_target,
+            normalized_base,
+            effective_base,
+            is_inter_diff,
+            is_working_copy_parent_diff,
+            cache_key,
+        })
+    }
+
+    async fn resolve_commit_descriptions(
+        &self,
+        resolved: &ResolvedDiffTargets,
+    ) -> (String, String) {
+        tokio::join!(
+            async {
+                match resolved.target_meta {
+                    Some(ref meta) => meta.description.clone(),
+                    None => self.get_commit_description(&resolved.resolved_target).await,
+                }
+            },
+            async {
+                if resolved.is_inter_diff {
+                    match resolved.base_meta {
+                        Some(ref meta) => meta.description.clone(),
+                        None => {
+                            self.get_commit_description(
+                                resolved.normalized_base.as_deref().unwrap_or_default(),
+                            )
+                            .await
+                        }
+                    }
+                } else {
+                    String::new()
+                }
+            }
+        )
+    }
+
+    /// Computes a structured diff for `target` (optionally compared from `base`), isolating upstream rebases.
+    ///
+    /// Diffs with total hunk lines at or below `summary_threshold` (default `2_000`, or bypassed
+    /// when `eager` is `true`) are parsed and highlighted eagerly; larger diffs return a fast
+    /// summary (`chunks: []`, `chunks_loaded: false`) while caching raw diff slices for O(1)
+    /// per-file hydration via [`Self::get_diff_file`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JujutsuError`] if `target` is empty or `jj diff` fails.
+    pub async fn get_diff(
+        &self,
+        target: &str,
+        base: Option<&str>,
+        ignore_rebase: bool,
+        eager: bool,
+        summary_threshold: Option<usize>,
+    ) -> Result<DiffOutcome, JujutsuError> {
+        let resolved = self
+            .resolve_diff_targets(target, base, ignore_rebase)
+            .await?;
+        let threshold = if eager {
+            usize::MAX
+        } else {
+            summary_threshold.unwrap_or(DEFAULT_DIFF_SUMMARY_THRESHOLD)
+        };
+
+        if let Some(ref key) = resolved.cache_key {
+            let cached_full = self
+                .diff_cache
+                .lock()
+                .ok()
+                .and_then(|mut guard| guard.get(key));
+            if let Some(cached) = cached_full {
+                return Ok(DiffOutcome {
+                    response: cached,
+                    is_working_copy_parent_diff: resolved.is_working_copy_parent_diff,
+                    cacheable: true,
+                });
+            }
+
+            let cached_raw = self
+                .raw_diff_cache
+                .lock()
+                .ok()
+                .and_then(|mut guard| guard.get(key));
+            if let Some(cached_raw) = cached_raw {
+                if cached_raw.total_diff_lines > threshold {
+                    return Ok(DiffOutcome {
+                        response: Arc::clone(&cached_raw.summary),
+                        is_working_copy_parent_diff: resolved.is_working_copy_parent_diff,
+                        cacheable: true,
+                    });
+                }
+
+                // Caller requested eager/full mode for a diff whose raw text is already cached.
+                let raw_arc = Arc::clone(&cached_raw.raw_diff);
+                let commit_msg = cached_raw.summary.files.first().cloned();
+                let files = tokio::task::spawn_blocking(move || {
+                    let mut parsed = diff_parser::parse_unified_git_diff(&raw_arc);
+                    if let Some(msg) = commit_msg {
+                        parsed.insert(0, msg);
+                    }
+                    parsed
+                })
+                .await
+                .map_err(|err| JujutsuError::Io(io::Error::other(err)))?;
+
+                let response = Arc::new(JjDiffResponse {
+                    commit: cached_raw.summary.commit.clone(),
+                    base_commit: cached_raw.summary.base_commit.clone(),
+                    files,
+                    is_empty: cached_raw.summary.is_empty,
+                    is_rebase_diff: cached_raw.summary.is_rebase_diff,
+                    rebase_ignored: cached_raw.summary.rebase_ignored,
+                    rebase_conflict: cached_raw.summary.rebase_conflict,
+                });
+                if let Ok(mut diff_guard) = self.diff_cache.lock() {
+                    let bytes = estimate_diff_bytes(&response);
+                    diff_guard.insert(key.clone(), Arc::clone(&response), bytes);
+                }
+                return Ok(DiffOutcome {
+                    response,
+                    is_working_copy_parent_diff: resolved.is_working_copy_parent_diff,
+                    cacheable: true,
+                });
+            }
         }
 
         let mut is_rebase_diff = false;
@@ -614,9 +837,11 @@ impl JujutsuService {
         let mut rebase_conflict = false;
         let mut raw_diff: Option<String> = None;
 
-        if let (Some(_), Some(b_meta), Some(t_meta)) =
-            (normalized_base, base_meta.as_ref(), target_meta.as_ref())
-            && b_meta.change_id == t_meta.change_id
+        if let (Some(_), Some(b_meta), Some(t_meta)) = (
+            resolved.normalized_base.as_deref(),
+            resolved.base_meta.as_ref(),
+            resolved.target_meta.as_ref(),
+        ) && b_meta.change_id == t_meta.change_id
             && b_meta.parents.len() == 1
             && t_meta.parents.len() == 1
             && b_meta.parents[0] != t_meta.parents[0]
@@ -642,86 +867,424 @@ impl JujutsuService {
 
         let raw_diff = match raw_diff {
             Some(diff) => diff,
-            None => match normalized_base {
+            None => match resolved.normalized_base.as_deref() {
                 Some(base_ref) => {
-                    let from_commit = base_meta
+                    let from_commit = resolved
+                        .base_meta
                         .as_ref()
                         .map_or(base_ref, |m| m.commit_id.as_str());
                     let from_arg = alloc::format!("--from={from_commit}");
-                    let to_arg = alloc::format!("--to={resolved_target}");
+                    let to_arg = alloc::format!("--to={}", resolved.resolved_target);
                     self.run_jj_raw(&["diff", &from_arg, &to_arg, "--git"])
                         .await?
                 }
                 None => {
-                    let rev_arg = alloc::format!("--revision={resolved_target}");
+                    let rev_arg = alloc::format!("--revision={}", resolved.resolved_target);
                     self.run_jj_raw(&["diff", &rev_arg, "--git"]).await?
                 }
             },
         };
 
-        let (target_desc, base_desc) = tokio::join!(
-            async {
-                match target_meta {
-                    Some(ref meta) => meta.description.clone(),
-                    None => self.get_commit_description(&resolved_target).await,
-                }
-            },
-            async {
-                if is_inter_diff {
-                    match base_meta {
-                        Some(ref meta) => meta.description.clone(),
-                        None => {
-                            self.get_commit_description(normalized_base.unwrap_or_default())
-                                .await
-                        }
-                    }
-                } else {
-                    String::new()
-                }
-            }
-        );
+        let (target_desc, base_desc) = self.resolve_commit_descriptions(&resolved).await;
+        let is_inter_diff = resolved.is_inter_diff;
 
-        let files = tokio::task::spawn_blocking(move || {
-            let mut files = diff_parser::parse_unified_git_diff(&raw_diff);
+        enum ParsedDiffKind {
+            Full(Vec<DiffFile>),
+            Summary {
+                files: Vec<DiffFile>,
+                raw_diff: String,
+                block_ranges: HashMap<String, Range<usize>>,
+                total_diff_lines: usize,
+            },
+        }
+
+        let parsed = tokio::task::spawn_blocking(move || {
             let commit_msg_file =
                 diff_parser::build_commit_message_file(&base_desc, &target_desc, is_inter_diff);
-            files.insert(0, commit_msg_file);
-            files
+            let mut summary = diff_parser::summarize_unified_git_diff(&raw_diff);
+            if summary.total_diff_lines <= threshold {
+                let mut files = diff_parser::parse_unified_git_diff(&raw_diff);
+                files.insert(0, commit_msg_file);
+                ParsedDiffKind::Full(files)
+            } else {
+                summary.files.insert(0, commit_msg_file);
+                ParsedDiffKind::Summary {
+                    files: summary.files,
+                    raw_diff,
+                    block_ranges: summary.block_ranges,
+                    total_diff_lines: summary.total_diff_lines,
+                }
+            }
         })
         .await
         .map_err(|err| JujutsuError::Io(io::Error::other(err)))?;
 
-        let is_empty = files
-            .iter()
-            .all(|f| f.path == COMMIT_MESSAGE_PATH && f.additions == 0 && f.deletions == 0);
+        match parsed {
+            ParsedDiffKind::Full(files) => {
+                let is_empty = files
+                    .iter()
+                    .all(|f| f.path == COMMIT_MESSAGE_PATH && f.additions == 0 && f.deletions == 0);
+                let response = Arc::new(JjDiffResponse {
+                    commit: resolved.resolved_target,
+                    base_commit: resolved.effective_base,
+                    files,
+                    is_empty,
+                    is_rebase_diff,
+                    rebase_ignored,
+                    rebase_conflict,
+                });
+                let cacheable = resolved.cache_key.is_some();
+                if let Some(key) = resolved.cache_key
+                    && let Ok(mut guard) = self.diff_cache.lock()
+                {
+                    let bytes = estimate_diff_bytes(&response);
+                    guard.insert(key, Arc::clone(&response), bytes);
+                }
+                Ok(DiffOutcome {
+                    response,
+                    is_working_copy_parent_diff: resolved.is_working_copy_parent_diff,
+                    cacheable,
+                })
+            }
+            ParsedDiffKind::Summary {
+                files,
+                raw_diff,
+                block_ranges,
+                total_diff_lines,
+            } => {
+                let is_empty = files
+                    .iter()
+                    .all(|f| f.path == COMMIT_MESSAGE_PATH && f.additions == 0 && f.deletions == 0);
+                let response = Arc::new(JjDiffResponse {
+                    commit: resolved.resolved_target,
+                    base_commit: resolved.effective_base,
+                    files,
+                    is_empty,
+                    is_rebase_diff,
+                    rebase_ignored,
+                    rebase_conflict,
+                });
+                let cacheable = resolved.cache_key.is_some();
+                if let Some(key) = resolved.cache_key
+                    && let Ok(mut guard) = self.raw_diff_cache.lock()
+                {
+                    let cached = Arc::new(CachedRawDiff {
+                        raw_diff: Arc::new(raw_diff),
+                        block_ranges,
+                        summary: Arc::clone(&response),
+                        total_diff_lines,
+                    });
+                    let bytes = estimate_raw_diff_bytes(&cached);
+                    guard.insert(key, cached, bytes);
+                }
+                Ok(DiffOutcome {
+                    response,
+                    is_working_copy_parent_diff: resolved.is_working_copy_parent_diff,
+                    cacheable,
+                })
+            }
+        }
+    }
 
-        let effective_base = match normalized_base {
-            Some(base_ref) => base_meta.map_or_else(|| String::from(base_ref), |m| m.commit_id),
-            None => target_meta
-                .as_ref()
-                .and_then(|m| m.parents.first().cloned())
-                .unwrap_or_else(|| alloc::format!("{resolved_target}-")),
-        };
-
-        let response = Arc::new(JjDiffResponse {
-            commit: resolved_target,
-            base_commit: effective_base,
-            files,
-            is_empty,
-            is_rebase_diff,
-            rebase_ignored,
-            rebase_conflict,
-        });
-
-        if let Some(key) = cache_key
-            && let Ok(mut guard) = self.diff_cache.lock()
-        {
-            guard.insert(key, Arc::clone(&response));
+    async fn try_get_diff_file_from_caches(
+        &self,
+        key: &DiffCacheKey,
+        clean_path: &str,
+        is_commit_msg: bool,
+    ) -> Result<Option<DiffFileOutcome>, JujutsuError> {
+        // 1. Check full parsed diff cache first.
+        let cached_full = self
+            .diff_cache
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.get(key));
+        if let Some(full) = cached_full {
+            let Some(found) = full.files.iter().find(|f| f.path == clean_path) else {
+                return Err(JujutsuError::NotFound(alloc::format!(
+                    "file '{clean_path}' not found in diff"
+                )));
+            };
+            return Ok(Some(DiffFileOutcome {
+                file: Arc::new(found.clone()),
+                commit: full.commit.clone(),
+                base_commit: full.base_commit.clone(),
+                cacheable: true,
+            }));
         }
 
-        Ok(DiffOutcome {
-            response,
-            is_working_copy_parent_diff,
+        // 2. Check per-file parsed diff cache.
+        let file_key = FileDiffCacheKey {
+            diff_key: key.clone(),
+            path: String::from(clean_path),
+        };
+        let cached_file = self
+            .file_diff_cache
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.get(&file_key));
+        if let Some(cached_file) = cached_file {
+            return Ok(Some(DiffFileOutcome {
+                file: cached_file.file,
+                commit: cached_file.commit,
+                base_commit: cached_file.base_commit,
+                cacheable: true,
+            }));
+        }
+
+        // 3. Check raw diff cache for O(1) single-file slice extraction.
+        let cached_raw = self
+            .raw_diff_cache
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.get(key));
+        if let Some(cached_raw) = cached_raw {
+            if is_commit_msg {
+                if let Some(msg) = cached_raw
+                    .summary
+                    .files
+                    .iter()
+                    .find(|f| f.path == COMMIT_MESSAGE_PATH)
+                {
+                    return Ok(Some(DiffFileOutcome {
+                        file: Arc::new(msg.clone()),
+                        commit: cached_raw.summary.commit.clone(),
+                        base_commit: cached_raw.summary.base_commit.clone(),
+                        cacheable: true,
+                    }));
+                }
+            } else {
+                let Some(range) = cached_raw.block_ranges.get(clean_path).cloned() else {
+                    return Err(JujutsuError::NotFound(alloc::format!(
+                        "file '{clean_path}' not found in diff"
+                    )));
+                };
+                let raw_arc = Arc::clone(&cached_raw.raw_diff);
+                let parsed = tokio::task::spawn_blocking(move || {
+                    diff_parser::parse_single_file_block(&raw_arc[range])
+                })
+                .await
+                .map_err(|err| JujutsuError::Io(io::Error::other(err)))?;
+                let Some(file) = parsed else {
+                    return Err(JujutsuError::NotFound(alloc::format!(
+                        "file '{clean_path}' not found in diff"
+                    )));
+                };
+                let file_arc = Arc::new(file);
+                let commit = cached_raw.summary.commit.clone();
+                let base_commit = cached_raw.summary.base_commit.clone();
+                if let Ok(mut file_guard) = self.file_diff_cache.lock() {
+                    let entry = CachedDiffFile {
+                        file: Arc::clone(&file_arc),
+                        commit: commit.clone(),
+                        base_commit: base_commit.clone(),
+                    };
+                    let bytes = estimate_cached_diff_file_bytes(&entry);
+                    file_guard.insert(file_key, entry, bytes);
+                }
+                return Ok(Some(DiffFileOutcome {
+                    file: file_arc,
+                    commit,
+                    base_commit,
+                    cacheable: true,
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Parses and returns a single [`DiffFile`] (including `"Commit Message"`) for `GET /api/jj/diff/file`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JujutsuError::InvalidInput`] for invalid paths/targets, [`JujutsuError::NotFound`]
+    /// when `raw_path` is not part of the diff, or command/I/O errors.
+    pub async fn get_diff_file(
+        &self,
+        target: &str,
+        base: Option<&str>,
+        ignore_rebase: bool,
+        raw_path: &str,
+    ) -> Result<DiffFileOutcome, JujutsuError> {
+        let trimmed_target = target.trim();
+        if trimmed_target.is_empty() {
+            return Err(JujutsuError::InvalidInput(String::from(
+                "target commit or revision is required",
+            )));
+        }
+
+        let trimmed_path = raw_path.trim();
+        if trimmed_path.is_empty() {
+            return Err(JujutsuError::InvalidInput(String::from("path is required")));
+        }
+
+        let is_commit_msg = trimmed_path == COMMIT_MESSAGE_PATH;
+        let clean_path = if is_commit_msg {
+            String::from(COMMIT_MESSAGE_PATH)
+        } else {
+            validate_repo_relative_path(trimmed_path)?
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+
+        // Fast path: when target (and optional interdiff base) are already full 40-char commit
+        // OIDs, probe the in-memory caches directly without spawning `jj log` subprocesses.
+        let fast_key = if is_strict_40_hex_oid(trimmed_target) {
+            match normalize_interdiff_base(base, trimmed_target, trimmed_target) {
+                None => Some(DiffCacheKey {
+                    commit: trimmed_target.to_ascii_lowercase(),
+                    explicit_base: None,
+                    ignore_rebase,
+                }),
+                Some(base_ref) if is_strict_40_hex_oid(base_ref) => Some(DiffCacheKey {
+                    commit: trimmed_target.to_ascii_lowercase(),
+                    explicit_base: Some(base_ref.to_ascii_lowercase()),
+                    ignore_rebase,
+                }),
+                Some(_) => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(ref key) = fast_key
+            && let Some(hit) = self
+                .try_get_diff_file_from_caches(key, &clean_path, is_commit_msg)
+                .await?
+        {
+            return Ok(hit);
+        }
+
+        let resolved = self
+            .resolve_diff_targets(target, base, ignore_rebase)
+            .await?;
+
+        if let Some(ref key) = resolved.cache_key
+            && fast_key.as_ref() != Some(key)
+            && let Some(hit) = self
+                .try_get_diff_file_from_caches(key, &clean_path, is_commit_msg)
+                .await?
+        {
+            return Ok(hit);
+        }
+
+        // 4. Cold fallback: build commit message or fetch single-file diff directly.
+        if is_commit_msg {
+            let (target_desc, base_desc) = self.resolve_commit_descriptions(&resolved).await;
+            let file_arc = Arc::new(diff_parser::build_commit_message_file(
+                &base_desc,
+                &target_desc,
+                resolved.is_inter_diff,
+            ));
+            let cacheable = resolved.cache_key.is_some();
+            if let Some(key) = resolved.cache_key
+                && let Ok(mut guard) = self.file_diff_cache.lock()
+            {
+                let entry = CachedDiffFile {
+                    file: Arc::clone(&file_arc),
+                    commit: resolved.resolved_target.clone(),
+                    base_commit: resolved.effective_base.clone(),
+                };
+                let bytes = estimate_cached_diff_file_bytes(&entry);
+                guard.insert(
+                    FileDiffCacheKey {
+                        diff_key: key,
+                        path: clean_path,
+                    },
+                    entry,
+                    bytes,
+                );
+            }
+            return Ok(DiffFileOutcome {
+                file: file_arc,
+                commit: resolved.resolved_target,
+                base_commit: resolved.effective_base,
+                cacheable,
+            });
+        }
+
+        let mut isolated_raw: Option<String> = None;
+        if let (Some(_), Some(b_meta), Some(t_meta)) = (
+            resolved.normalized_base.as_deref(),
+            resolved.base_meta.as_ref(),
+            resolved.target_meta.as_ref(),
+        ) && b_meta.change_id == t_meta.change_id
+            && b_meta.parents.len() == 1
+            && t_meta.parents.len() == 1
+            && b_meta.parents[0] != t_meta.parents[0]
+            && ignore_rebase
+        {
+            isolated_raw = self
+                .compute_rebase_isolated_diff(
+                    &b_meta.parents[0],
+                    &t_meta.parents[0],
+                    &b_meta.commit_id,
+                    &t_meta.commit_id,
+                )
+                .await;
+        }
+
+        let target_path_for_parse = clean_path.clone();
+        let raw_single = match isolated_raw {
+            Some(raw) => raw,
+            None => {
+                let fileset = jj_exact_file_fileset(&clean_path);
+                match resolved.normalized_base.as_deref() {
+                    Some(base_ref) => {
+                        let from_commit = resolved
+                            .base_meta
+                            .as_ref()
+                            .map_or(base_ref, |m| m.commit_id.as_str());
+                        let from_arg = alloc::format!("--from={from_commit}");
+                        let to_arg = alloc::format!("--to={}", resolved.resolved_target);
+                        self.run_jj_raw(&["diff", &from_arg, &to_arg, "--git", "--", &fileset])
+                            .await?
+                    }
+                    None => {
+                        let rev_arg = alloc::format!("--revision={}", resolved.resolved_target);
+                        self.run_jj_raw(&["diff", &rev_arg, "--git", "--", &fileset])
+                            .await?
+                    }
+                }
+            }
+        };
+
+        let parsed = tokio::task::spawn_blocking(move || {
+            let block =
+                diff_parser::extract_file_block_by_path(&raw_single, &target_path_for_parse)?;
+            diff_parser::parse_single_file_block(block)
+        })
+        .await
+        .map_err(|err| JujutsuError::Io(io::Error::other(err)))?;
+
+        let Some(file) = parsed else {
+            return Err(JujutsuError::NotFound(alloc::format!(
+                "file '{clean_path}' not found in diff"
+            )));
+        };
+        let file_arc = Arc::new(file);
+        let cacheable = resolved.cache_key.is_some();
+        if let Some(key) = resolved.cache_key
+            && let Ok(mut guard) = self.file_diff_cache.lock()
+        {
+            let file_key = FileDiffCacheKey {
+                diff_key: key,
+                path: clean_path,
+            };
+            let entry = CachedDiffFile {
+                file: Arc::clone(&file_arc),
+                commit: resolved.resolved_target.clone(),
+                base_commit: resolved.effective_base.clone(),
+            };
+            let bytes = estimate_cached_diff_file_bytes(&entry);
+            guard.insert(file_key, entry, bytes);
+        }
+
+        Ok(DiffFileOutcome {
+            file: file_arc,
+            commit: resolved.resolved_target,
+            base_commit: resolved.effective_base,
+            cacheable,
         })
     }
 
@@ -2444,6 +3007,7 @@ mod tests {
                         word_diff: Vec::new(),
                     }],
                 }],
+                chunks_loaded: true,
             }],
             is_empty: false,
             is_rebase_diff: false,
@@ -2481,25 +3045,26 @@ mod tests {
         let single_size = estimate_diff_bytes(&d_a);
 
         // Max 2 entries: promote A via get(), then insert C -> B is evicted, A and C remain.
-        let mut cache = DiffLruCache::with_limits(2, single_size * 10);
-        cache.insert(key_a.clone(), Arc::clone(&d_a));
-        cache.insert(key_b.clone(), Arc::clone(&d_b));
+        let mut cache = BoundedLruCache::with_limits(2, single_size * 10);
+        cache.insert(key_a.clone(), Arc::clone(&d_a), estimate_diff_bytes(&d_a));
+        cache.insert(key_b.clone(), Arc::clone(&d_b), estimate_diff_bytes(&d_b));
         assert!(cache.get(&key_a).is_some());
-        cache.insert(key_c.clone(), Arc::clone(&d_c));
+        cache.insert(key_c.clone(), Arc::clone(&d_c), estimate_diff_bytes(&d_c));
         assert!(cache.get(&key_a).is_some());
         assert!(cache.get(&key_b).is_none());
         assert!(cache.get(&key_c).is_some());
 
         // Byte budget smaller than 2 entries evicts LRU when inserting a second entry.
-        let mut budget_cache = DiffLruCache::with_limits(8, single_size + 16);
-        budget_cache.insert(key_a.clone(), Arc::clone(&d_a));
-        budget_cache.insert(key_b.clone(), Arc::clone(&d_b));
+        let mut budget_cache = BoundedLruCache::with_limits(8, single_size + 16);
+        budget_cache.insert(key_a.clone(), Arc::clone(&d_a), estimate_diff_bytes(&d_a));
+        budget_cache.insert(key_b.clone(), Arc::clone(&d_b), estimate_diff_bytes(&d_b));
         assert!(budget_cache.get(&key_a).is_none());
         assert!(budget_cache.get(&key_b).is_some());
 
         // Oversized single entry exceeding total budget is not cached and does not wipe existing.
         let huge = sample_diff(oid_c, base, 8192);
-        budget_cache.insert(key_c.clone(), huge);
+        let huge_bytes = estimate_diff_bytes(&huge);
+        budget_cache.insert(key_c.clone(), huge, huge_bytes);
         assert!(budget_cache.get(&key_c).is_none());
         assert!(budget_cache.get(&key_b).is_some());
     }
@@ -2572,5 +3137,76 @@ mod tests {
             ..valid_target
         };
         assert!(build_diff_cache_key(Some(&short_target), None, None, true).is_none());
+    }
+
+    #[tokio::test]
+    async fn get_diff_file_oid_fast_path_serves_caches_without_spawning_jj() {
+        let oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let oid_upper = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let base = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let raw = concat!(
+            "diff --git a/src/a.rs b/src/a.rs\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/src/a.rs\n",
+            "+++ b/src/a.rs\n",
+            "@@ -1,1 +1,2 @@\n",
+            " fn main() {}\n",
+            "+fn added() {}\n",
+        );
+        let summary = diff_parser::summarize_unified_git_diff(raw);
+        let key = DiffCacheKey {
+            commit: String::from(oid),
+            explicit_base: None,
+            ignore_rebase: true,
+        };
+        let summary_resp = Arc::new(JjDiffResponse {
+            commit: String::from(oid),
+            base_commit: String::from(base),
+            files: summary.files,
+            is_empty: false,
+            is_rebase_diff: false,
+            rebase_ignored: false,
+            rebase_conflict: false,
+        });
+        let cached_raw = Arc::new(CachedRawDiff {
+            raw_diff: Arc::new(String::from(raw)),
+            block_ranges: summary.block_ranges,
+            summary: summary_resp,
+            total_diff_lines: summary.total_diff_lines,
+        });
+
+        // Nonexistent repo directory guarantees any `jj` subprocess spawn would fail.
+        let svc = JujutsuService::new(PathBuf::from("/nonexistent-tellit-fastpath-test"), None);
+        {
+            let mut guard = svc.raw_diff_cache.lock().expect("raw_diff_cache lock");
+            let bytes = estimate_raw_diff_bytes(&cached_raw);
+            guard.insert(key.clone(), cached_raw, bytes);
+        }
+
+        // First call extracts from `raw_diff_cache` without spawning `jj` and populates `file_diff_cache`.
+        let from_raw = svc
+            .get_diff_file(oid, Some("parent"), true, "src/a.rs")
+            .await
+            .expect("raw_diff_cache fast path should succeed");
+        assert!(from_raw.cacheable);
+        assert_eq!(from_raw.commit, oid);
+        assert_eq!(from_raw.base_commit, base);
+        assert!(from_raw.file.chunks_loaded);
+        assert_eq!(from_raw.file.chunks.len(), 1);
+
+        // Clear `raw_diff_cache` and verify `file_diff_cache` fast path (including uppercase OID).
+        {
+            let mut guard = svc.raw_diff_cache.lock().expect("raw_diff_cache lock");
+            guard.entries.clear();
+            guard.total_bytes = 0;
+        }
+        let from_file_cache = svc
+            .get_diff_file(oid_upper, None, true, "src/a.rs")
+            .await
+            .expect("file_diff_cache fast path should succeed");
+        assert!(from_file_cache.cacheable);
+        assert_eq!(from_file_cache.commit, oid);
+        assert_eq!(from_file_cache.base_commit, base);
+        assert_eq!(from_file_cache.file.path, "src/a.rs");
     }
 }

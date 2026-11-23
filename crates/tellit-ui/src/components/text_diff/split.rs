@@ -17,7 +17,8 @@ pub struct SideBySideRow {
     pub new_line_idx: Option<usize>,
 }
 
-/// Pairs contiguous delete and add runs row-for-row while keeping context lines aligned across both panes.
+/// Pairs contiguous delete and add runs row-for-row across `chunk`, keeping context lines aligned
+/// across both panes.
 #[must_use]
 pub fn pair_side_by_side_rows(chunk: &MergedChunk) -> Vec<SideBySideRow> {
     let total = chunk.lines.len();
@@ -122,6 +123,7 @@ mod tests {
                     mk(DiffLineKind::Context, Some(3), Some(4)),
                 ],
             }],
+            chunks_loaded: true,
         });
         let chunk = MergedChunk {
             file,
@@ -155,5 +157,55 @@ mod tests {
                 .new_line_number,
             Some(4)
         );
+    }
+
+    #[test]
+    fn windowed_pairing_preserves_large_delete_add_alignment() {
+        let mut lines = Vec::with_capacity(400);
+        for n in 1..=200u32 {
+            lines.push(mk(DiffLineKind::Delete, Some(n), None));
+        }
+        for n in 1..=200u32 {
+            lines.push(mk(DiffLineKind::Add, None, Some(n)));
+        }
+        let line_refs: Vec<ChunkLineRef> = (0..400).map(|i| ChunkLineRef::Original(0, i)).collect();
+        let file = Arc::new(DiffFile {
+            path: String::from("src/big.rs"),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 200,
+            deletions: 200,
+            is_generated: false,
+            chunks: alloc::vec![DiffChunk {
+                old_start: 1,
+                old_lines: 200,
+                new_start: 1,
+                new_lines: 200,
+                header: String::from("@@ -1,200 +1,200 @@"),
+                lines,
+            }],
+            chunks_loaded: true,
+        });
+        let chunk = MergedChunk {
+            file,
+            old_start: 1,
+            old_lines: 200,
+            new_start: 1,
+            new_lines: 200,
+            header: String::from("@@ -1,200 +1,200 @@"),
+            lines: line_refs,
+            original_indices: alloc::vec![0],
+            hidden_lines_before: 0,
+            hidden_lines_after: Some(0),
+        };
+
+        let all_paired = pair_side_by_side_rows(&chunk);
+        assert_eq!(all_paired.len(), 200);
+        let windowed = &all_paired[..150];
+        assert_eq!(windowed.len(), 150);
+        for (i, row) in windowed.iter().enumerate() {
+            assert_eq!(row.old_line_idx, Some(i));
+            assert_eq!(row.new_line_idx, Some(200 + i));
+        }
     }
 }

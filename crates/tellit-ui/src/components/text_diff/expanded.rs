@@ -615,6 +615,7 @@ mod tests {
                     lines: alloc::vec![sample_line(DiffLineKind::Add, None, Some(6), "line 6")],
                 },
             ],
+            chunks_loaded: true,
         });
 
         let mut map = ExpandedLinesMap::new();
@@ -679,6 +680,7 @@ mod tests {
                     lines: alloc::vec![sample_line(DiffLineKind::Add, None, Some(28), "line 28")],
                 },
             ],
+            chunks_loaded: true,
         });
 
         let mut map = ExpandedLinesMap::new();

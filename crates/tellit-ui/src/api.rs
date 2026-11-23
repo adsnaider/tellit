@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tellit_types::{
     ApiErrorResponse, AppearanceSettings, ApproveCommitRequest, ApproveCommitResponse,
-    CreateCommentRequest, CreateCommentResponse, EditorSpecRequest, HeartbeatEvent,
+    CreateCommentRequest, CreateCommentResponse, DiffFile, EditorSpecRequest, HeartbeatEvent,
     JjChangesResponse, JjCommentsResponse, JjCommitsResponse, JjDiffResponse, JjStatusResponse,
     LineCountResponse, OpenInEditorRequest, OpenInEditorResponse, ReplyCommentRequest,
     ReplyCommentResponse, ResolveCommentRequest, ResolveCommentResponse, WatchEvent,
@@ -19,7 +19,7 @@ use thiserror::Error;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Blob, Event, EventSource, Headers, MessageEvent, RequestInit, Response};
+use web_sys::{Event, EventSource, Headers, MessageEvent, RequestInit, Response};
 
 /// Errors produced when communicating with the local `tellit` HTTP server.
 #[derive(Debug, Error)]
@@ -239,6 +239,29 @@ pub async fn fetch_jj_diff(
     fetch_json(&url).await
 }
 
+/// Fetches a single parsed [`DiffFile`] from `GET /api/jj/diff/file` for lazy hydration.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if the HTTP request fails, the file is missing (404), or JSON is invalid.
+pub async fn fetch_jj_diff_file(
+    target: &str,
+    base: Option<&str>,
+    ignore_rebase: bool,
+    path: &str,
+) -> Result<DiffFile, ApiError> {
+    let mut params: Vec<String> = alloc::vec![
+        alloc::format!("target={}", encode_uri_component(target)),
+        alloc::format!("ignoreRebase={ignore_rebase}"),
+        alloc::format!("path={}", encode_uri_component(path)),
+    ];
+    if let Some(base_ref) = normalize_interdiff_base(base, target) {
+        params.push(alloc::format!("base={}", encode_uri_component(base_ref)));
+    }
+    let url = alloc::format!("/api/jj/diff/file?{}", params.join("&"));
+    fetch_json(&url).await
+}
+
 /// Fetches `GET /api/jj/comments` for `target` and optional `base` commit.
 ///
 /// # Errors
@@ -339,40 +362,29 @@ pub async fn fetch_blob_text(file_path: &str, rev: &str) -> Result<String, ApiEr
     send_text_request(&url, None).await
 }
 
-/// Fetches a blob resource and returns its byte length without retaining the payload.
+/// Fetches a blob resource's byte length via `HEAD` and `Content-Length` without downloading the body.
 ///
 /// # Errors
 ///
 /// Returns [`ApiError`] if the browser request fails or returns a non-success HTTP status.
 pub async fn fetch_blob_byte_size(url: &str) -> Result<u64, ApiError> {
-    let window = web_sys::window().ok_or(ApiError::MissingWindow)?;
-    let resp_value = JsFuture::from(window.fetch_with_str(url))
-        .await
-        .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
-    let response: Response = resp_value
-        .dyn_into()
-        .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
+    let init = RequestInit::new();
+    init.set_method("HEAD");
+    let response = fetch_response(url, Some(&init)).await?;
     if !response.ok() {
         return Err(ApiError::HttpStatus {
             status: response.status(),
             message: response.status_text(),
         });
     }
-    let blob_promise = response
-        .blob()
-        .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
-    let blob_val = JsFuture::from(blob_promise)
-        .await
-        .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
-    let blob: Blob = blob_val
-        .dyn_into()
-        .map_err(|err| ApiError::Transport(format_js_error(&err)))?;
-    let size = blob.size();
-    Ok(if size.is_finite() && size >= 0.0 {
-        size as u64
-    } else {
-        0
-    })
+    let len = response
+        .headers()
+        .get("content-length")
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    Ok(len)
 }
 
 /// Fetches line counts for `file_path` at `old_ref` (`old_path` if renamed) and/or `new_ref`.

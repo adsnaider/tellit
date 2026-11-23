@@ -23,6 +23,7 @@ mod api;
 mod components;
 mod state;
 
+use alloc::collections::VecDeque;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -60,10 +61,13 @@ use components::text_diff::expanded::{
 };
 use components::text_diff::word_highlight;
 use components::text_diff::{
-    ActiveComposer, CreateThreadEvent, ExpandLinesEvent, LineSelectionDrag, TextDiffCard,
-    extract_snippet_for_file, parse_comment_side,
+    ActiveComposer, CHUNK_WINDOW_STEP_LINES, CreateThreadEvent, ExpandLinesEvent,
+    LineSelectionDrag, TextDiffCard, extract_snippet_for_file, parse_comment_side,
 };
 pub use state::{ConnectionState, DiffViewMode, RepoStatusState, ResolvedTheme};
+
+const MAX_CONCURRENT_FILE_FETCHES: usize = 4;
+const VIEWPORT_OBSERVER_ROOT_MARGIN: &str = "1500px 0px";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LoadedDiff {
@@ -99,6 +103,10 @@ struct FileCardSlot {
     drag_state: RwSignal<Option<LineSelectionDrag>>,
     active_composer: RwSignal<Option<ActiveComposer>>,
     md_tab: RwSignal<MarkdownTab>,
+    is_near_viewport: RwSignal<bool>,
+    loading_chunks: RwSignal<bool>,
+    load_error: RwSignal<Option<String>>,
+    visible_line_limit: RwSignal<usize>,
 }
 
 impl FileCardSlot {
@@ -109,7 +117,63 @@ impl FileCardSlot {
         self.drag_state.dispose();
         self.active_composer.dispose();
         self.md_tab.dispose();
+        self.is_near_viewport.dispose();
+        self.loading_chunks.dispose();
+        self.load_error.dispose();
+        self.visible_line_limit.dispose();
     }
+}
+
+#[derive(Default)]
+struct FileFetchQueue {
+    active_generation: u64,
+    in_flight: HashSet<String>,
+    pending: VecDeque<String>,
+    pending_set: HashSet<String>,
+}
+
+impl FileFetchQueue {
+    fn reset(&mut self, generation: u64) {
+        self.active_generation = generation;
+        self.in_flight.clear();
+        self.pending.clear();
+        self.pending_set.clear();
+    }
+}
+
+struct ViewportObserverHandle {
+    observer: web_sys::IntersectionObserver,
+    _callback: Closure<dyn FnMut(js_sys::Array)>,
+}
+
+impl Drop for ViewportObserverHandle {
+    fn drop(&mut self) {
+        self.observer.disconnect();
+    }
+}
+
+fn create_viewport_observer(ctx: AppCtx) -> Option<ViewportObserverHandle> {
+    let cb = Closure::<dyn FnMut(js_sys::Array)>::new(move |entries: js_sys::Array| {
+        for entry_val in entries.iter() {
+            let Ok(entry) = entry_val.dyn_into::<web_sys::IntersectionObserverEntry>() else {
+                continue;
+            };
+            if !entry.is_intersecting() {
+                continue;
+            }
+            if let Some(path) = entry.target().get_attribute("data-file") {
+                mark_file_near_viewport(ctx, &path);
+            }
+        }
+    });
+    let init = web_sys::IntersectionObserverInit::new();
+    init.set_root_margin(VIEWPORT_OBSERVER_ROOT_MARGIN);
+    let observer =
+        web_sys::IntersectionObserver::new_with_options(cb.as_ref().unchecked_ref(), &init).ok()?;
+    Some(ViewportObserverHandle {
+        observer,
+        _callback: cb,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +201,7 @@ struct AppCtx {
     ignore_rebase: RwSignal<bool>,
     diff_data: RwSignal<Option<Arc<LoadedDiff>>>,
     ordered_file_slots: RwSignal<Vec<FileCardSlot>>,
+    hydrated_files_rev: RwSignal<u64>,
     file_slot_map: StoredValue<HashMap<String, FileCardSlot>, LocalStorage>,
     loading_diff: RwSignal<bool>,
     comments: RwSignal<Vec<JjCommentThread>>,
@@ -165,6 +230,9 @@ struct AppCtx {
     diff_req_id: StoredValue<u64, LocalStorage>,
     comments_req_id: StoredValue<u64, LocalStorage>,
     diff_generation: StoredValue<u64, LocalStorage>,
+    file_fetch_queue: StoredValue<FileFetchQueue, LocalStorage>,
+    pending_thread_scroll: StoredValue<Option<(u64, String, String)>, LocalStorage>,
+    pending_cursor_scroll_block: StoredValue<Option<ScrollLogicalPosition>, LocalStorage>,
     prefetched_line_counts: StoredValue<HashSet<String>, LocalStorage>,
     pending_initial_target: StoredValue<Option<String>, LocalStorage>,
     pending_initial_base: StoredValue<Option<String>, LocalStorage>,
@@ -190,6 +258,7 @@ impl AppCtx {
             ignore_rebase: RwSignal::new(true),
             diff_data: RwSignal::new(None),
             ordered_file_slots: RwSignal::new(Vec::new()),
+            hydrated_files_rev: RwSignal::new(0),
             file_slot_map: StoredValue::new_local(HashMap::new()),
             loading_diff: RwSignal::new(false),
             comments: RwSignal::new(Vec::new()),
@@ -221,6 +290,9 @@ impl AppCtx {
             diff_req_id: StoredValue::new_local(0),
             comments_req_id: StoredValue::new_local(0),
             diff_generation: StoredValue::new_local(0),
+            file_fetch_queue: StoredValue::new_local(FileFetchQueue::default()),
+            pending_thread_scroll: StoredValue::new_local(None),
+            pending_cursor_scroll_block: StoredValue::new_local(None),
             prefetched_line_counts: StoredValue::new_local(HashSet::new()),
             pending_initial_target: StoredValue::new_local(None),
             pending_initial_base: StoredValue::new_local(None),
@@ -254,32 +326,272 @@ fn prune_removed_file_slots(ctx: AppCtx, loaded: &LoadedDiff) {
     }
 }
 
-fn sync_file_slots(ctx: AppCtx, loaded: &LoadedDiff) -> Vec<FileCardSlot> {
+fn mark_file_near_viewport(ctx: AppCtx, path: &str) {
+    let slot = ctx
+        .file_slot_map
+        .try_with_value(|map| map.get(path).cloned())
+        .flatten();
+    if let Some(slot) = slot
+        && !slot.is_near_viewport.try_get_untracked().unwrap_or(true)
+    {
+        let _ = slot.is_near_viewport.try_set(true);
+    }
+}
+
+fn is_strict_40_hex_oid(raw: &str) -> bool {
+    raw.len() == 40 && raw.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn enqueue_file_diff_fetch(ctx: AppCtx, path: String) {
+    enqueue_file_diff_fetch_with_priority(ctx, path, false);
+}
+
+fn enqueue_file_diff_fetch_priority(ctx: AppCtx, path: String) {
+    enqueue_file_diff_fetch_with_priority(ctx, path, true);
+}
+
+fn enqueue_file_diff_fetch_with_priority(ctx: AppCtx, path: String, prioritize: bool) {
+    let slot = ctx
+        .file_slot_map
+        .try_with_value(|map| map.get(&path).cloned())
+        .flatten();
+    let Some(slot) = slot else {
+        return;
+    };
+    if slot
+        .file
+        .try_with_untracked(|f| f.chunks_loaded)
+        .unwrap_or(true)
+    {
+        return;
+    }
+
+    let mut queued = false;
+    let _ = ctx.file_fetch_queue.try_update_value(|q| {
+        if q.in_flight.contains(&path) {
+            return;
+        }
+        if q.pending_set.contains(&path) {
+            if prioritize && let Some(pos) = q.pending.iter().position(|p| p == &path) {
+                q.pending.remove(pos);
+                q.pending.push_front(path.clone());
+            }
+            return;
+        }
+        q.pending_set.insert(path.clone());
+        if prioritize {
+            q.pending.push_front(path.clone());
+        } else {
+            q.pending.push_back(path.clone());
+        }
+        queued = true;
+    });
+    if !queued {
+        return;
+    }
+
+    let _ = slot.load_error.try_set(None);
+    let _ = slot.loading_chunks.try_set(true);
+    pump_file_fetch_queue(ctx);
+}
+
+fn pump_file_fetch_queue(ctx: AppCtx) {
+    let Some(diff) = ctx.current_diff() else {
+        return;
+    };
+    let generation = ctx.diff_generation.get_value();
+    let target = diff.commit.clone();
+    let base_raw = ctx.base_commit_id.get_untracked();
+    let base_opt = (base_raw != "parent" && !base_raw.is_empty()).then_some(base_raw);
+    let ignore_rebase = ctx.ignore_rebase.get_untracked();
+
+    let mut batch = Vec::new();
+    let _ = ctx.file_fetch_queue.try_update_value(|q| {
+        if q.active_generation != generation {
+            return;
+        }
+        while q.in_flight.len() < MAX_CONCURRENT_FILE_FETCHES {
+            let Some(next_path) = q.pending.pop_front() else {
+                break;
+            };
+            q.pending_set.remove(&next_path);
+            q.in_flight.insert(next_path.clone());
+            batch.push(next_path);
+        }
+    });
+
+    for path in batch {
+        let target_c = target.clone();
+        let base_c = base_opt.clone();
+        spawn_local(async move {
+            let res =
+                api::fetch_jj_diff_file(&target_c, base_c.as_deref(), ignore_rebase, &path).await;
+            let mut is_current = false;
+            let _ = ctx.file_fetch_queue.try_update_value(|q| {
+                if q.active_generation == generation {
+                    q.in_flight.remove(&path);
+                    is_current = true;
+                }
+            });
+            if is_current && ctx.diff_generation.try_get_value() == Some(generation) {
+                let slot = ctx
+                    .file_slot_map
+                    .try_with_value(|map| map.get(&path).cloned())
+                    .flatten();
+                if let Some(slot) = slot {
+                    match res {
+                        Ok(loaded_file) => {
+                            let _ = slot.file.try_set(Arc::new(loaded_file));
+                            let _ = slot.loading_chunks.try_set(false);
+                            let _ = slot.load_error.try_set(None);
+
+                            // Re-normalize cursor side and scroll to the row if the keyboard
+                            // cursor landed on this file while it was still summary-only.
+                            let hydrated_idx = slot.file_index.try_get_untracked();
+                            if let Some(cur) = ctx.active_cursor.try_get_untracked().flatten()
+                                && hydrated_idx == Some(cur.file_index)
+                            {
+                                let files_now: Vec<Arc<DiffFile>> = ctx
+                                    .ordered_file_slots
+                                    .try_with_untracked(|slots| {
+                                        slots
+                                            .iter()
+                                            .filter_map(|s| s.file.try_get_untracked())
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                let normalized = keyboard::normalize_cursor_side(cur, &files_now);
+                                if normalized != cur {
+                                    let _ = ctx.active_cursor.try_set(Some(normalized));
+                                }
+                                let mode = ctx
+                                    .diff_mode
+                                    .try_get_untracked()
+                                    .unwrap_or(DiffViewMode::Unified);
+                                if let Some(row_id) =
+                                    keyboard::cursor_scroll_id(normalized, &files_now, mode)
+                                {
+                                    let block = ctx
+                                        .pending_cursor_scroll_block
+                                        .try_update_value(Option::take)
+                                        .flatten()
+                                        .unwrap_or(ScrollLogicalPosition::Center);
+                                    spawn_local(async move {
+                                        let _ = JsFuture::from(js_sys::Promise::resolve(
+                                            &JsValue::UNDEFINED,
+                                        ))
+                                        .await;
+                                        if ctx.diff_generation.try_get_value() == Some(generation)
+                                            && ctx.active_cursor.try_get_untracked().flatten()
+                                                == Some(normalized)
+                                        {
+                                            let _ = keyboard::scroll_to_element_id(&row_id, block);
+                                        }
+                                    });
+                                }
+                            }
+
+                            // Complete any pending `jump_to_thread` scroll targeting this file.
+                            let pending_thread_dom = ctx
+                                .pending_thread_scroll
+                                .try_update_value(|pending| {
+                                    if let Some((gen_id, ref pending_path, _)) = *pending
+                                        && gen_id == generation
+                                        && *pending_path == path
+                                    {
+                                        pending.take().map(|(_, _, dom_id)| dom_id)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .flatten();
+                            if let Some(thread_dom) = pending_thread_dom {
+                                spawn_local(async move {
+                                    let _ = JsFuture::from(js_sys::Promise::resolve(
+                                        &JsValue::UNDEFINED,
+                                    ))
+                                    .await;
+                                    if ctx.diff_generation.try_get_value() == Some(generation) {
+                                        let _ = keyboard::scroll_to_element_id(
+                                            &thread_dom,
+                                            ScrollLogicalPosition::Center,
+                                        );
+                                    }
+                                });
+                            }
+
+                            let _ = ctx.hydrated_files_rev.try_update(|rev| *rev += 1);
+                        }
+                        Err(err) => {
+                            let _ = slot.loading_chunks.try_set(false);
+                            let _ = slot.load_error.try_set(Some(err.to_string()));
+                            let _ = ctx.pending_thread_scroll.try_update_value(|pending| {
+                                if let Some((gen_id, ref pending_path, _)) = *pending
+                                    && gen_id == generation
+                                    && *pending_path == path
+                                {
+                                    *pending = None;
+                                }
+                            });
+                        }
+                    }
+                }
+                pump_file_fetch_queue(ctx);
+            }
+        });
+    }
+}
+
+fn sync_file_slots(
+    ctx: AppCtx,
+    loaded: &LoadedDiff,
+    prev_rebase_ignored: Option<bool>,
+) -> Vec<FileCardSlot> {
     let mut ordered = Vec::with_capacity(loaded.files.len());
     let mut keep_paths: HashSet<&str> = HashSet::with_capacity(loaded.files.len());
     let mut changed_paths: HashSet<&str> = HashSet::new();
     let mut evicted = Vec::new();
+    let commits_are_immutable_oids =
+        is_strict_40_hex_oid(&loaded.commit) && is_strict_40_hex_oid(&loaded.base_commit);
+    let same_rebase_mode = prev_rebase_ignored == Some(loaded.rebase_ignored);
 
     ctx.file_slot_map.update_value(|map| {
         for (idx, file_arc) in loaded.files.iter().enumerate() {
             keep_paths.insert(file_arc.path.as_str());
             if let Some(slot) = map.get(&file_arc.path).cloned() {
-                let file_changed = slot
-                    .file
-                    .with_untracked(|old| old.as_ref() != file_arc.as_ref());
+                let same_commits = slot
+                    .commits
+                    .with_untracked(|c| c.0 == loaded.base_commit && c.1 == loaded.commit);
+                let keep_existing_hydrated = commits_are_immutable_oids
+                    && same_rebase_mode
+                    && same_commits
+                    && slot.file.with_untracked(|old| {
+                        old.chunks_loaded
+                            && !file_arc.chunks_loaded
+                            && old.path == file_arc.path
+                            && old.old_path == file_arc.old_path
+                            && old.status == file_arc.status
+                            && old.additions == file_arc.additions
+                            && old.deletions == file_arc.deletions
+                            && old.is_generated == file_arc.is_generated
+                    });
+                let file_changed = !keep_existing_hydrated
+                    && slot
+                        .file
+                        .with_untracked(|old| old.as_ref() != file_arc.as_ref());
                 if file_changed {
                     changed_paths.insert(file_arc.path.as_str());
                     slot.file.set(Arc::clone(file_arc));
                     slot.drag_state.set(None);
                     slot.active_composer.set(None);
+                    slot.loading_chunks.set(false);
+                    slot.load_error.set(None);
+                    slot.visible_line_limit.set(CHUNK_WINDOW_STEP_LINES);
                 }
                 if slot.file_index.get_untracked() != idx {
                     slot.file_index.set(idx);
                 }
-                if slot
-                    .commits
-                    .with_untracked(|c| c.0 != loaded.base_commit || c.1 != loaded.commit)
-                {
+                if !same_commits {
                     slot.commits
                         .set((loaded.base_commit.clone(), loaded.commit.clone()));
                 }
@@ -293,6 +605,10 @@ fn sync_file_slots(ctx: AppCtx, loaded: &LoadedDiff) -> Vec<FileCardSlot> {
                     drag_state: RwSignal::new(None),
                     active_composer: RwSignal::new(None),
                     md_tab: RwSignal::new(MarkdownTab::Preview),
+                    is_near_viewport: RwSignal::new(false),
+                    loading_chunks: RwSignal::new(false),
+                    load_error: RwSignal::new(None),
+                    visible_line_limit: RwSignal::new(CHUNK_WINDOW_STEP_LINES),
                 };
                 map.insert(file_arc.path.clone(), slot.clone());
                 ordered.push(slot);
@@ -370,7 +686,10 @@ fn load_diff_and_comments(ctx: AppCtx, target: String, base: Option<String>, ign
                     return;
                 }
                 let loaded = Arc::new(LoadedDiff::from(diff));
-                let _ = next_req_id(ctx.diff_generation);
+                let generation = next_req_id(ctx.diff_generation);
+                ctx.file_fetch_queue.update_value(|q| q.reset(generation));
+                ctx.pending_thread_scroll.set_value(None);
+                ctx.pending_cursor_scroll_block.set_value(None);
                 ctx.expanded_lines.set(HashMap::new());
                 ctx.prefetched_line_counts.update_value(HashSet::clear);
                 ctx.highlighted_word.set(None);
@@ -393,14 +712,17 @@ fn load_diff_and_comments(ctx: AppCtx, target: String, base: Option<String>, ign
                 }
                 let mut collapsed: HashSet<String> = viewed.clone();
                 for file in &loaded.files {
-                    if file.is_generated {
+                    if state::auto_collapse_reason(file).is_some() {
                         collapsed.insert(file.path.clone());
                     }
                 }
+                let prev_rebase_ignored = ctx
+                    .diff_data
+                    .with_untracked(|d| d.as_ref().map(|prev| prev.rebase_ignored));
                 prune_removed_file_slots(ctx, &loaded);
                 ctx.reviewed_files.set(viewed);
                 ctx.collapsed_files.set(collapsed);
-                let evicted_slots = sync_file_slots(ctx, &loaded);
+                let evicted_slots = sync_file_slots(ctx, &loaded, prev_rebase_ignored);
                 ctx.diff_data.set(Some(loaded));
                 for slot in evicted_slots {
                     slot.dispose();
@@ -804,9 +1126,44 @@ fn jump_to_thread(ctx: AppCtx, thread: JjCommentThread) {
     ctx.collapsed_files.update(|set| {
         set.remove(&thread.file_path);
     });
+    mark_file_near_viewport(ctx, &thread.file_path);
+    let mut needs_hydration = false;
+    if let Some(slot) = ctx
+        .file_slot_map
+        .try_with_value(|map| map.get(&thread.file_path).cloned())
+        .flatten()
+    {
+        if slot
+            .visible_line_limit
+            .try_get_untracked()
+            .unwrap_or(usize::MAX)
+            < usize::MAX
+        {
+            let _ = slot.visible_line_limit.try_set(usize::MAX);
+            let _ = ctx.hydrated_files_rev.try_update(|rev| *rev += 1);
+        }
+        needs_hydration = slot
+            .file
+            .try_with_untracked(|f| !f.chunks_loaded)
+            .unwrap_or(false);
+    }
 
     let thread_dom = state::thread_element_id(&thread.id);
     let file_dom = state::file_element_id(&thread.file_path);
+
+    if needs_hydration {
+        let generation = ctx.diff_generation.get_value();
+        ctx.pending_thread_scroll.set_value(Some((
+            generation,
+            thread.file_path.clone(),
+            thread_dom,
+        )));
+        enqueue_file_diff_fetch_priority(ctx, thread.file_path);
+        let _ = keyboard::scroll_to_element_id(&file_dom, ScrollLogicalPosition::Start);
+        return;
+    }
+
+    ctx.pending_thread_scroll.set_value(None);
     let do_scroll = move || {
         if !keyboard::scroll_to_element_id(&thread_dom, ScrollLogicalPosition::Center) {
             let _ = keyboard::scroll_to_element_id(&file_dom, ScrollLogicalPosition::Start);
@@ -940,6 +1297,7 @@ pub fn App() -> impl IntoView {
     let ctx = AppCtx::new();
     let heartbeat_handle = StoredValue::new_local(None::<api::SseSubscription>);
     let watch_handle = StoredValue::new_local(None::<api::SseSubscription>);
+    let viewport_observer = StoredValue::new_local(create_viewport_observer(ctx));
 
     let sidebar_open = RwSignal::new(state::load_storage_bool(
         state::SIDEBAR_OPEN_STORAGE_KEY,
@@ -983,6 +1341,7 @@ pub fn App() -> impl IntoView {
         // Track layout/content mutations only while an active highlight exists.
         ctx.diff_data.track();
         ctx.ordered_file_slots.track();
+        ctx.hydrated_files_rev.track();
         ctx.diff_mode.track();
         ctx.collapsed_files.track();
         ctx.expanded_lines.track();
@@ -1015,6 +1374,7 @@ pub fn App() -> impl IntoView {
         ctx.diff_mode.track();
         ctx.diff_data.track();
         ctx.ordered_file_slots.track();
+        ctx.hydrated_files_rev.track();
         ctx.collapsed_files.track();
         ctx.expanded_lines.track();
 
@@ -1038,14 +1398,15 @@ pub fn App() -> impl IntoView {
             let Some(mode) = ctx.diff_mode.try_get_untracked() else {
                 return;
             };
-            let Some(diff) = ctx
-                .diff_data
-                .try_with_untracked(|d| d.as_ref().map(Arc::clone))
-                .flatten()
-            else {
+            let Some(files) = ctx.ordered_file_slots.try_with_untracked(|slots| {
+                slots
+                    .iter()
+                    .filter_map(|s| s.file.try_get_untracked())
+                    .collect::<Vec<_>>()
+            }) else {
                 return;
             };
-            let Some(element_id) = keyboard::cursor_scroll_id(cur, &diff.files, mode) else {
+            let Some(element_id) = keyboard::cursor_scroll_id(cur, &files, mode) else {
                 return;
             };
             let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
@@ -1160,6 +1521,7 @@ pub fn App() -> impl IntoView {
             }
         });
         word_highlight::clear_css_word_highlight();
+        viewport_observer.set_value(None);
         heartbeat_handle.set_value(None);
         watch_handle.set_value(None);
         mousemove_handle.remove();
@@ -1256,16 +1618,53 @@ pub fn App() -> impl IntoView {
         });
 
     let on_toggle_collapse = Callback::new(move |path: String| {
+        let mut expanded = false;
         ctx.collapsed_files.update(|set| {
-            if !set.remove(&path) {
-                set.insert(path);
+            if set.remove(&path) {
+                expanded = true;
+            } else {
+                set.insert(path.clone());
             }
         });
+        if expanded {
+            mark_file_near_viewport(ctx, &path);
+        }
     });
 
     let on_select_file = Callback::new(move |path: String| {
         ctx.selected_file_path.set(Some(path.clone()));
+        mark_file_near_viewport(ctx, &path);
         scroll_to_file_element(&path);
+    });
+
+    let on_register_card = Callback::new(move |(path, el): (String, web_sys::Element)| {
+        let observed = viewport_observer.with_value(|opt| {
+            if let Some(handle) = opt {
+                handle.observer.observe(&el);
+                true
+            } else {
+                false
+            }
+        });
+        if !observed {
+            mark_file_near_viewport(ctx, &path);
+        }
+    });
+
+    let on_unregister_card = Callback::new(move |el: web_sys::Element| {
+        let _ = viewport_observer.try_with_value(|opt| {
+            if let Some(handle) = opt {
+                handle.observer.unobserve(&el);
+            }
+        });
+    });
+
+    let on_request_file_diff = Callback::new(move |path: String| {
+        enqueue_file_diff_fetch(ctx, path);
+    });
+
+    let on_window_expanded = Callback::new(move |()| {
+        let _ = ctx.hydrated_files_rev.try_update(|rev| *rev += 1);
     });
 
     let on_toggle_word = Callback::new(move |word: String| {
@@ -1855,6 +2254,10 @@ pub fn App() -> impl IntoView {
                                                                 drag_state=slot.drag_state
                                                                 active_composer=slot.active_composer
                                                                 md_tab=slot.md_tab
+                                                                is_near_viewport=slot.is_near_viewport
+                                                                loading_chunks=slot.loading_chunks
+                                                                load_error=slot.load_error
+                                                                visible_line_limit=slot.visible_line_limit
                                                                 all_threads=ctx.comments
                                                                 reviewed_files=ctx.reviewed_files
                                                                 collapsed_files=ctx.collapsed_files
@@ -1862,6 +2265,10 @@ pub fn App() -> impl IntoView {
                                                                 show_resolved_inline=ctx.show_resolved_inline
                                                                 expanded_lines=ctx.expanded_lines
                                                                 expand_loading=ctx.expand_loading
+                                                                on_register_card=on_register_card
+                                                                on_unregister_card=on_unregister_card
+                                                                on_request_file_diff=on_request_file_diff
+                                                                on_window_expanded=on_window_expanded
                                                                 on_toggle_viewed=on_toggle_reviewed
                                                                 on_toggle_collapse=on_toggle_collapse
                                                                 on_open_in_editor=on_open_in_editor
@@ -2175,7 +2582,14 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
     let Some(diff) = ctx.current_diff() else {
         return;
     };
-    let files = &diff.files;
+    let live_files: Vec<Arc<DiffFile>> = ctx
+        .ordered_file_slots
+        .with_untracked(|slots| slots.iter().map(|s| s.file.get_untracked()).collect());
+    let files: &[Arc<DiffFile>] = if live_files.is_empty() {
+        &diff.files
+    } else {
+        &live_files
+    };
     let mode = ctx.diff_mode.get_untracked();
 
     match key.as_str() {
@@ -2462,11 +2876,42 @@ fn scroll_cursor(
     files: &[Arc<DiffFile>],
     block: ScrollLogicalPosition,
 ) {
+    if let Some(file) = files.get(pos.file_index) {
+        mark_file_near_viewport(ctx, &file.path);
+        if !file.chunks_loaded {
+            ctx.pending_cursor_scroll_block.set_value(Some(block));
+            enqueue_file_diff_fetch_priority(ctx, file.path.clone());
+            let _ = keyboard::scroll_to_element_id(&state::file_element_id(&file.path), block);
+            return;
+        }
+    }
+    ctx.pending_cursor_scroll_block.set_value(None);
     let mode = ctx.diff_mode.get_untracked();
-    if let Some(id) = keyboard::cursor_scroll_id(pos, files, mode)
-        && keyboard::scroll_to_element_id(&id, block)
-    {
-        return;
+    if let Some(id) = keyboard::cursor_scroll_id(pos, files, mode) {
+        if keyboard::scroll_to_element_id(&id, block) {
+            return;
+        }
+        // If the target row lies past a large file's progressive render window, expand the window.
+        if let Some(file) = files.get(pos.file_index)
+            && file.chunks_loaded
+            && let Some(slot) = ctx
+                .file_slot_map
+                .try_with_value(|map| map.get(&file.path).cloned())
+                .flatten()
+            && slot
+                .visible_line_limit
+                .try_get_untracked()
+                .unwrap_or(usize::MAX)
+                < usize::MAX
+        {
+            let _ = slot.visible_line_limit.try_set(usize::MAX);
+            let _ = ctx.hydrated_files_rev.try_update(|rev| *rev += 1);
+            spawn_local(async move {
+                let _ = JsFuture::from(js_sys::Promise::resolve(&JsValue::UNDEFINED)).await;
+                let _ = keyboard::scroll_to_element_id(&id, block);
+            });
+            return;
+        }
     }
     if let Some(file) = files.get(pos.file_index) {
         let _ = keyboard::scroll_to_element_id(&state::file_element_id(&file.path), block);

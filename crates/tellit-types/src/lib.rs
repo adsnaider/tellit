@@ -662,6 +662,10 @@ pub struct DiffChunk {
     pub lines: Vec<DiffLine>,
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 /// Changed file entry in [`JjDiffResponse`], including the virtual `"Commit Message"` entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -681,6 +685,10 @@ pub struct DiffFile {
     pub is_generated: bool,
     /// Parsed diff hunks for this file.
     pub chunks: Vec<DiffChunk>,
+    /// `true` when `chunks` contains full parsed hunks; `false` for summary-only entries
+    /// whose chunks are loaded on demand via `GET /api/jj/diff/file`.
+    #[serde(default = "default_true")]
+    pub chunks_loaded: bool,
 }
 
 /// Response payload returned by `GET /api/jj/diff`.

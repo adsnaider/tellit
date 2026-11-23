@@ -4,7 +4,9 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -739,8 +741,14 @@ fn enrich_file_chunks(path: &str, chunks: &mut [DiffChunk]) {
     }
 }
 
-fn parse_file_block(block: &str) -> Option<tellit_types::DiffFile> {
-    let lines: Vec<&str> = block.lines().collect();
+struct BlockHeader {
+    path: String,
+    old_path: Option<String>,
+    status: FileStatus,
+    header_end: usize,
+}
+
+fn parse_block_header(lines: &[&str]) -> Option<BlockHeader> {
     let header_line = *lines.first()?;
     let header_paths = parse_diff_git_header(header_line);
 
@@ -810,7 +818,19 @@ fn parse_file_block(block: &str) -> Option<tellit_types::DiffFile> {
         None
     };
 
-    let mut chunks = parse_chunks(&lines[header_end..]);
+    Some(BlockHeader {
+        path,
+        old_path,
+        status,
+        header_end,
+    })
+}
+
+fn parse_file_block(block: &str) -> Option<tellit_types::DiffFile> {
+    let lines: Vec<&str> = block.lines().collect();
+    let header = parse_block_header(&lines)?;
+
+    let mut chunks = parse_chunks(&lines[header.header_end..]);
     let mut additions = 0u32;
     let mut deletions = 0u32;
     let mut header_sample: Vec<&str> = Vec::new();
@@ -836,31 +856,109 @@ fn parse_file_block(block: &str) -> Option<tellit_types::DiffFile> {
         }
     }
 
-    let is_generated = is_generated_file(&path, &header_sample);
+    let is_generated = is_generated_file(&header.path, &header_sample);
     if !is_generated {
-        enrich_file_chunks(&path, &mut chunks);
+        enrich_file_chunks(&header.path, &mut chunks);
     }
 
     Some(tellit_types::DiffFile {
-        path,
-        old_path,
-        status,
+        path: header.path,
+        old_path: header.old_path,
+        status: header.status,
         additions,
         deletions,
         is_generated,
         chunks,
+        chunks_loaded: true,
     })
 }
 
-fn split_diff_blocks(diff_text: &str) -> Vec<&str> {
-    let mut blocks = Vec::new();
+/// Parses and highlights a single `diff --git ...` file block into a [`tellit_types::DiffFile`].
+#[must_use]
+pub fn parse_single_file_block(block: &str) -> Option<tellit_types::DiffFile> {
+    parse_file_block(block)
+}
+
+/// Fast header + line-count summary of a raw `git diff` / `jj diff --git` output without
+/// running syntax highlighting or word-level diffing.
+#[derive(Debug, Clone)]
+pub struct DiffSummary {
+    /// Summary-only [`tellit_types::DiffFile`] entries (`chunks: []`, `chunks_loaded: false`).
+    pub files: Vec<tellit_types::DiffFile>,
+    /// Byte ranges inside the raw diff text for O(1) single-file slice extraction by path.
+    pub block_ranges: HashMap<String, Range<usize>>,
+    /// Total number of hunk lines (`+`, `-`, and context) across all files.
+    pub total_diff_lines: usize,
+}
+
+fn summarize_file_block(block: &str) -> Option<(tellit_types::DiffFile, usize)> {
+    let lines: Vec<&str> = block.lines().collect();
+    let header = parse_block_header(&lines)?;
+
+    let mut additions = 0u32;
+    let mut deletions = 0u32;
+    let mut hunk_lines = 0usize;
+    let mut in_hunk = false;
+    let mut collect_header_sample = false;
+    let mut header_sample: Vec<&str> = Vec::new();
+
+    for &line in &lines[header.header_end..] {
+        if line.starts_with("@@ ") {
+            if let Some(hdr) = parse_hunk_header(line) {
+                in_hunk = true;
+                collect_header_sample = hdr.new_start == 1;
+            } else {
+                in_hunk = false;
+                collect_header_sample = false;
+            }
+            continue;
+        }
+        if !in_hunk {
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix('+') {
+            additions = additions.saturating_add(1);
+            hunk_lines += 1;
+            if collect_header_sample && header_sample.len() < 20 {
+                header_sample.push(rest);
+            }
+        } else if line.starts_with('-') {
+            deletions = deletions.saturating_add(1);
+            hunk_lines += 1;
+        } else if let Some(rest) = line.strip_prefix(' ') {
+            hunk_lines += 1;
+            if collect_header_sample && header_sample.len() < 20 {
+                header_sample.push(rest);
+            }
+        }
+    }
+
+    let is_generated = is_generated_file(&header.path, &header_sample);
+    Some((
+        tellit_types::DiffFile {
+            path: header.path,
+            old_path: header.old_path,
+            status: header.status,
+            additions,
+            deletions,
+            is_generated,
+            chunks: Vec::new(),
+            chunks_loaded: false,
+        },
+        hunk_lines,
+    ))
+}
+
+fn split_diff_block_ranges(diff_text: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
     let mut current_start: Option<usize> = None;
     let mut line_offset = 0usize;
 
     for raw_line in diff_text.split_inclusive('\n') {
         if raw_line.starts_with("diff --git ") {
             if let Some(start) = current_start {
-                blocks.push(&diff_text[start..line_offset]);
+                ranges.push(start..line_offset);
             }
             current_start = Some(line_offset);
         }
@@ -871,10 +969,59 @@ fn split_diff_blocks(diff_text: &str) -> Vec<&str> {
         current_start = Some(0);
     }
     if let Some(start) = current_start {
-        blocks.push(&diff_text[start..]);
+        ranges.push(start..diff_text.len());
     }
 
-    blocks
+    ranges
+}
+
+fn split_diff_blocks(diff_text: &str) -> Vec<&str> {
+    split_diff_block_ranges(diff_text)
+        .into_iter()
+        .map(|range| &diff_text[range])
+        .collect()
+}
+
+/// Scans `diff_text` in a single fast pass to produce file summaries, total diff line count,
+/// and per-file byte ranges without allocating hunks or running `syntect`/`similar`.
+#[must_use]
+pub fn summarize_unified_git_diff(diff_text: &str) -> DiffSummary {
+    let ranges = split_diff_block_ranges(diff_text);
+    let mut files = Vec::with_capacity(ranges.len());
+    let mut block_ranges = HashMap::with_capacity(ranges.len());
+    let mut total_diff_lines = 0usize;
+
+    for range in ranges {
+        let block = &diff_text[range.clone()];
+        if let Some((file, hunk_lines)) = summarize_file_block(block) {
+            total_diff_lines = total_diff_lines.saturating_add(hunk_lines);
+            block_ranges.insert(file.path.clone(), range);
+            files.push(file);
+        }
+    }
+
+    DiffSummary {
+        files,
+        block_ranges,
+        total_diff_lines,
+    }
+}
+
+/// Finds the raw `diff --git ...` block inside `diff_text` matching `target_path`.
+#[must_use]
+pub fn extract_file_block_by_path<'a>(diff_text: &'a str, target_path: &str) -> Option<&'a str> {
+    for block in split_diff_blocks(diff_text) {
+        let header_lines: Vec<&str> = block
+            .lines()
+            .take_while(|l| !l.starts_with("@@ "))
+            .collect();
+        if let Some(header) = parse_block_header(&header_lines)
+            && header.path == target_path
+        {
+            return Some(block);
+        }
+    }
+    None
 }
 
 /// Parses `git diff` / `jj diff --git` output into structured [`tellit_types::DiffFile`] entries.
@@ -969,6 +1116,7 @@ pub fn build_commit_message_file(
                         word_diff: Vec::new(),
                     }],
                 }],
+                chunks_loaded: true,
             };
         }
 
@@ -1002,6 +1150,7 @@ pub fn build_commit_message_file(
                 new_lines: count,
                 lines,
             }],
+            chunks_loaded: true,
         };
     }
 
@@ -1044,6 +1193,7 @@ pub fn build_commit_message_file(
                 new_lines: count,
                 lines,
             }],
+            chunks_loaded: true,
         };
     }
 
@@ -1158,6 +1308,7 @@ pub fn build_commit_message_file(
         deletions,
         is_generated: false,
         chunks,
+        chunks_loaded: true,
     }
 }
 
@@ -1348,5 +1499,61 @@ index 1111111..2222222 100644
             }
             assert_eq!(cursor, line.content.len());
         }
+    }
+
+    #[test]
+    fn summarize_matches_full_parse_metadata_and_indexes_single_file_blocks() {
+        let raw = "\
+diff --git a/src/old.rs b/src/new.rs
+similarity index 80%
+rename from src/old.rs
+rename to src/new.rs
+--- a/src/old.rs
++++ b/src/new.rs
+@@ -1,2 +1,3 @@
+ fn keep() {}
+-let old_val = 1;
++let new_val = 2;
++let extra = 3;
+diff --git a/gen/output.rs b/gen/output.rs
+new file mode 100644
+--- /dev/null
++++ b/gen/output.rs
+@@ -0,0 +1,2 @@
++// DO NOT EDIT - generated by tool
++pub const VERSION: u32 = 1;
+diff --git a/removed.txt b/removed.txt
+deleted file mode 100644
+--- a/removed.txt
++++ /dev/null
+@@ -1,1 +0,0 @@
+-goodbye
+";
+        let summary = summarize_unified_git_diff(raw);
+        let full = parse_unified_git_diff(raw);
+
+        assert_eq!(summary.files.len(), full.len());
+        assert_eq!(summary.total_diff_lines, 4 + 2 + 1);
+
+        for (sum_file, full_file) in summary.files.iter().zip(full.iter()) {
+            assert_eq!(sum_file.path, full_file.path);
+            assert_eq!(sum_file.old_path, full_file.old_path);
+            assert_eq!(sum_file.status, full_file.status);
+            assert_eq!(sum_file.additions, full_file.additions);
+            assert_eq!(sum_file.deletions, full_file.deletions);
+            assert_eq!(sum_file.is_generated, full_file.is_generated);
+            assert!(sum_file.chunks.is_empty());
+            assert!(!sum_file.chunks_loaded);
+            assert!(full_file.chunks_loaded);
+
+            let range = summary.block_ranges.get(&sum_file.path).unwrap();
+            let parsed_single = parse_single_file_block(&raw[range.clone()]).unwrap();
+            assert_eq!(parsed_single, *full_file);
+        }
+
+        assert!(summary.files[1].is_generated);
+        assert_eq!(summary.files[2].status, FileStatus::Deleted);
+        assert!(extract_file_block_by_path(raw, "src/new.rs").is_some());
+        assert!(extract_file_block_by_path(raw, "missing.rs").is_none());
     }
 }

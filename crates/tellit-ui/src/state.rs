@@ -7,10 +7,64 @@ use alloc::vec::Vec;
 use std::collections::HashSet;
 
 use tellit_types::{
-    AppearanceSettings, CommentSide, HeartbeatEvent, JjCommentThread, JjStatusResponse,
-    LineRangeSpec, ThemePreference,
+    AppearanceSettings, CommentSide, DiffFile, FileStatus, HeartbeatEvent, JjCommentThread,
+    JjStatusResponse, LineRangeSpec, ThemePreference,
 };
 use wasm_bindgen::JsCast;
+
+/// Default combined changed-line threshold above which a file card starts auto-collapsed.
+pub const LARGE_DIFF_COLLAPSE_THRESHOLD: u32 = 500;
+
+/// Reason a file diff card starts collapsed by default on load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoCollapseReason {
+    /// Classified as generated or lockfile output.
+    Generated,
+    /// File was deleted in the target revision.
+    Deleted,
+    /// Combined additions and deletions exceed [`LARGE_DIFF_COLLAPSE_THRESHOLD`].
+    LargeDiff,
+}
+
+impl AutoCollapseReason {
+    /// Short badge text rendered on the file card header.
+    #[must_use]
+    pub const fn badge_label(self) -> &'static str {
+        match self {
+            Self::Generated => "Generated",
+            Self::Deleted => "Deleted",
+            Self::LargeDiff => "Large diff",
+        }
+    }
+
+    /// Human-readable prefix used inside collapsed card summary notes.
+    #[must_use]
+    pub const fn collapsed_prefix(self) -> &'static str {
+        match self {
+            Self::Generated => "Generated file collapsed",
+            Self::Deleted => "Deleted file collapsed",
+            Self::LargeDiff => "Large diff collapsed",
+        }
+    }
+}
+
+/// Classifies whether `file` should start collapsed by default and why.
+#[must_use]
+pub fn auto_collapse_reason(file: &DiffFile) -> Option<AutoCollapseReason> {
+    if file.path == "Commit Message" {
+        return None;
+    }
+    if file.is_generated {
+        return Some(AutoCollapseReason::Generated);
+    }
+    if file.status == FileStatus::Deleted {
+        return Some(AutoCollapseReason::Deleted);
+    }
+    if file.additions.saturating_add(file.deletions) > LARGE_DIFF_COLLAPSE_THRESHOLD {
+        return Some(AutoCollapseReason::LargeDiff);
+    }
+    None
+}
 
 /// `localStorage` key controlling whether the left sidebar starts open.
 pub const SIDEBAR_OPEN_STORAGE_KEY: &str = "difit.sidebarOpen";
@@ -754,5 +808,57 @@ mod tests {
             &patterns
         ));
         assert!(!matches_auto_viewed_patterns("src/main.rs", &patterns));
+    }
+
+    #[test]
+    fn auto_collapse_rules_classify_generated_deleted_and_large_files() {
+        let base_file =
+            |path: &str, status: FileStatus, add: u32, del: u32, is_gen: bool| DiffFile {
+                path: String::from(path),
+                old_path: None,
+                status,
+                additions: add,
+                deletions: del,
+                is_generated: is_gen,
+                chunks: Vec::new(),
+                chunks_loaded: false,
+            };
+
+        assert_eq!(
+            auto_collapse_reason(&base_file(
+                "Commit Message",
+                FileStatus::Modified,
+                900,
+                0,
+                false
+            )),
+            None
+        );
+        assert_eq!(
+            auto_collapse_reason(&base_file("Cargo.lock", FileStatus::Deleted, 0, 900, true)),
+            Some(AutoCollapseReason::Generated)
+        );
+        assert_eq!(
+            auto_collapse_reason(&base_file("old.rs", FileStatus::Deleted, 0, 12, false)),
+            Some(AutoCollapseReason::Deleted)
+        );
+        assert_eq!(
+            auto_collapse_reason(&base_file("big.rs", FileStatus::Modified, 300, 201, false)),
+            Some(AutoCollapseReason::LargeDiff)
+        );
+        assert_eq!(
+            auto_collapse_reason(&base_file(
+                "exact.rs",
+                FileStatus::Modified,
+                250,
+                250,
+                false
+            )),
+            None
+        );
+        assert_eq!(
+            auto_collapse_reason(&base_file("small.rs", FileStatus::Added, 40, 0, false)),
+            None
+        );
     }
 }

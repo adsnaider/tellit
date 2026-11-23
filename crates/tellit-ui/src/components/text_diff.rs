@@ -278,6 +278,7 @@ pub fn TextDiffCard(
     #[prop(into)] show_resolved_inline: Signal<bool>,
     #[prop(into)] expanded_lines: Signal<ExpandedLinesMap>,
     #[prop(into)] expand_loading: Signal<bool>,
+    #[prop(default = true)] show_collapse_toggle: bool,
     on_register_card: Callback<(String, web_sys::Element)>,
     on_unregister_card: Callback<web_sys::Element>,
     on_request_file_diff: Callback<String>,
@@ -490,15 +491,17 @@ pub fn TextDiffCard(
         >
             <header class="diff-card__header">
                 <div class="diff-card__left">
-                    <button
-                        type="button"
-                        class="icon-btn"
-                        title=move || if is_collapsed_sig.get() { "Expand file" } else { "Collapse file" }
-                        aria-expanded=move || !is_collapsed_sig.get()
-                        on:click=move |_| on_toggle_collapse.run(path_toggle_collapse.clone())
-                    >
-                        {move || if is_collapsed_sig.get() { "▸" } else { "▾" }}
-                    </button>
+                    {show_collapse_toggle.then(|| view! {
+                        <button
+                            type="button"
+                            class="icon-btn"
+                            title=move || if is_collapsed_sig.get() { "Expand file" } else { "Collapse file" }
+                            aria-expanded=move || !is_collapsed_sig.get()
+                            on:click=move |_| on_toggle_collapse.run(path_toggle_collapse.clone())
+                        >
+                            {move || if is_collapsed_sig.get() { "▸" } else { "▾" }}
+                        </button>
+                    })}
                     <span class=move || file.with(|f| status_badge_class(f.status))>
                         {move || file.with(|f| f.status.short_code())}
                     </span>

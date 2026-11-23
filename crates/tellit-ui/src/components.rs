@@ -1,5 +1,6 @@
 //! UI components for Jujutsu revision navigation, diff rendering, and review threads.
 
+pub mod change_overview;
 pub mod comments;
 pub mod file_list;
 pub mod help_modal;
@@ -10,4 +11,5 @@ pub mod review_dot;
 pub mod revision_selector;
 pub mod revision_tree;
 pub mod settings_modal;
+pub mod single_file_view;
 pub mod text_diff;

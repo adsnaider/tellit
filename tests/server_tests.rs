@@ -2118,3 +2118,70 @@ async fn two_phase_diff_summary_per_file_endpoint_and_blob_head_content_length()
     cold_server.shutdown();
     cold_server.wait().await.unwrap();
 }
+
+#[tokio::test]
+async fn spa_change_and_file_routes_serve_index_html_without_masking_404s() {
+    let temp = tempfile::tempdir().unwrap();
+    let web_dir = temp.path().join("web");
+    fs::create_dir_all(&web_dir).unwrap();
+    let html_body =
+        "<!doctype html><html><head><title>tellit-spa-test</title></head><body></body></html>";
+    fs::write(web_dir.join("index.html"), html_body).unwrap();
+
+    let server = start_server(
+        ServerConfig::new(temp.path().to_path_buf())
+            .with_port(Some(0))
+            .with_web_dir(Some(web_dir))
+            .with_keep_alive(true)
+            .with_quiet(true),
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+
+    for route_path in [
+        "/c",
+        "/c/",
+        "/c/ysxkykzrroro",
+        "/c/ysxkykzrroro/file/COMMIT_MSG",
+        "/c/ysxkykzrroro/file/src/server.rs",
+        "/c/ysxkykzrroro/file/docs/my%20file%20%231.md?target=abc123&base=def456",
+    ] {
+        let resp = client
+            .get(format!("{}{route_path}", server.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "SPA route {route_path} must return 200 OK"
+        );
+        assert_eq!(
+            header_str(&resp, reqwest::header::CONTENT_TYPE),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            header_str(&resp, reqwest::header::CACHE_CONTROL),
+            Some("no-cache, no-store, must-revalidate")
+        );
+        assert_eq!(resp.text().await.unwrap(), html_body);
+    }
+
+    // Unknown API paths and missing non-`/c/` static assets must continue returning 404.
+    for missing_path in ["/api/nonexistent", "/missing-asset.js", "/other/src/lib.rs"] {
+        let resp = client
+            .get(format!("{}{missing_path}", server.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "Missing route {missing_path} must return 404"
+        );
+    }
+
+    server.shutdown();
+    server.wait().await.unwrap();
+}

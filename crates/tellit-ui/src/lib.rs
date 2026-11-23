@@ -21,6 +21,7 @@ extern crate alloc;
 
 mod api;
 mod components;
+mod route;
 mod state;
 
 use alloc::collections::VecDeque;
@@ -42,6 +43,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{KeyboardEvent, MouseEvent, ScrollLogicalPosition};
 
+use components::change_overview::ChangeOverview;
 use components::comments::{CommentReplyEvent, CommentsDrawer, UnresolvedJumpMenu};
 use components::file_list::{FileList, FileTreeEntry};
 use components::help_modal::HelpModal;
@@ -56,14 +58,16 @@ pub use components::revision_tree::{
     GraphCellLayout, GraphNodeKind, GraphRowLayout, compute_graph_layout,
 };
 use components::settings_modal::SettingsModal;
+use components::single_file_view::SingleFileView;
 use components::text_diff::expanded::{
     ExpandedLinesMap, record_expand_all_before, record_line_expansion, split_blob_lines,
 };
 use components::text_diff::word_highlight;
 use components::text_diff::{
     ActiveComposer, CHUNK_WINDOW_STEP_LINES, CreateThreadEvent, ExpandLinesEvent,
-    LineSelectionDrag, TextDiffCard, extract_snippet_for_file, parse_comment_side,
+    LineSelectionDrag, extract_snippet_for_file, parse_comment_side,
 };
+use route::{AppRoute, RouteQuery};
 pub use state::{ConnectionState, DiffViewMode, RepoStatusState, ResolvedTheme};
 
 const MAX_CONCURRENT_FILE_FETCHES: usize = 4;
@@ -94,19 +98,35 @@ impl From<JjDiffResponse> for LoadedDiff {
     }
 }
 
-#[derive(Clone)]
-struct FileCardSlot {
-    path: String,
-    file: RwSignal<Arc<DiffFile>>,
-    file_index: RwSignal<usize>,
-    commits: RwSignal<(String, String)>,
-    drag_state: RwSignal<Option<LineSelectionDrag>>,
-    active_composer: RwSignal<Option<ActiveComposer>>,
-    md_tab: RwSignal<MarkdownTab>,
-    is_near_viewport: RwSignal<bool>,
-    loading_chunks: RwSignal<bool>,
-    load_error: RwSignal<Option<String>>,
-    visible_line_limit: RwSignal<usize>,
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct FileCardSlot {
+    pub(crate) path: String,
+    pub(crate) file: RwSignal<Arc<DiffFile>>,
+    pub(crate) file_index: RwSignal<usize>,
+    pub(crate) commits: RwSignal<(String, String)>,
+    pub(crate) drag_state: RwSignal<Option<LineSelectionDrag>>,
+    pub(crate) active_composer: RwSignal<Option<ActiveComposer>>,
+    pub(crate) md_tab: RwSignal<MarkdownTab>,
+    pub(crate) is_near_viewport: RwSignal<bool>,
+    pub(crate) loading_chunks: RwSignal<bool>,
+    pub(crate) load_error: RwSignal<Option<String>>,
+    pub(crate) visible_line_limit: RwSignal<usize>,
+}
+
+/// Shared callback bundle passed from `App` down to inline and single-file `TextDiffCard` mounts.
+#[derive(Clone, Copy)]
+pub(crate) struct DiffCardCallbacks {
+    pub(crate) on_register_card: Callback<(String, web_sys::Element)>,
+    pub(crate) on_unregister_card: Callback<web_sys::Element>,
+    pub(crate) on_request_file_diff: Callback<String>,
+    pub(crate) on_window_expanded: Callback<()>,
+    pub(crate) on_toggle_viewed: Callback<String>,
+    pub(crate) on_open_in_editor: Callback<(String, usize)>,
+    pub(crate) on_prefetch_line_count: Callback<Arc<DiffFile>>,
+    pub(crate) on_expand_lines: Callback<ExpandLinesEvent>,
+    pub(crate) on_create_thread: Callback<CreateThreadEvent>,
+    pub(crate) on_reply: Callback<CommentReplyEvent>,
+    pub(crate) on_toggle_resolve: Callback<(String, bool)>,
 }
 
 impl FileCardSlot {
@@ -180,7 +200,6 @@ fn create_viewport_observer(ctx: AppCtx) -> Option<ViewportObserverHandle> {
 enum DiffPaneState {
     Loading,
     Idle,
-    Empty { base: String, target: String },
     Ready,
 }
 
@@ -190,6 +209,7 @@ struct AppCtx {
     connection: RwSignal<ConnectionState>,
     watch_connected: RwSignal<bool>,
     reloading: RwSignal<bool>,
+    route: RwSignal<AppRoute>,
     changes: RwSignal<Vec<JjChange>>,
     graph_rows: RwSignal<Vec<JjGraphRow>>,
     loading_changes: RwSignal<bool>,
@@ -208,7 +228,7 @@ struct AppCtx {
     error_banner: RwSignal<Option<String>>,
     lookup_error: RwSignal<Option<String>>,
     reviewed_files: RwSignal<HashSet<String>>,
-    collapsed_files: RwSignal<HashSet<String>>,
+    overview_expanded_files: RwSignal<HashSet<String>>,
     selected_file_path: RwSignal<Option<String>>,
     diff_mode: RwSignal<DiffViewMode>,
     show_resolved_inline: RwSignal<bool>,
@@ -242,11 +262,18 @@ impl AppCtx {
     fn new() -> Self {
         let appearance_init = state::load_appearance_settings();
         let resolved_init = state::apply_appearance_to_document(&appearance_init);
+        let initial_route = route::current_browser_route();
+        let initial_ignore_rebase = initial_route
+            .query()
+            .and_then(|q| q.ignore_rebase)
+            .unwrap_or(true);
+        let initial_selected_file = initial_route.file_path().map(String::from);
         Self {
             repo_status: RwSignal::new(RepoStatusState::Loading),
             connection: RwSignal::new(ConnectionState::Connecting),
             watch_connected: RwSignal::new(false),
             reloading: RwSignal::new(false),
+            route: RwSignal::new(initial_route),
             changes: RwSignal::new(Vec::new()),
             graph_rows: RwSignal::new(Vec::new()),
             loading_changes: RwSignal::new(true),
@@ -255,7 +282,7 @@ impl AppCtx {
             loading_commits: RwSignal::new(false),
             target_commit_id: RwSignal::new(String::new()),
             base_commit_id: RwSignal::new(String::from("parent")),
-            ignore_rebase: RwSignal::new(true),
+            ignore_rebase: RwSignal::new(initial_ignore_rebase),
             diff_data: RwSignal::new(None),
             ordered_file_slots: RwSignal::new(Vec::new()),
             hydrated_files_rev: RwSignal::new(0),
@@ -265,8 +292,8 @@ impl AppCtx {
             error_banner: RwSignal::new(None),
             lookup_error: RwSignal::new(None),
             reviewed_files: RwSignal::new(HashSet::new()),
-            collapsed_files: RwSignal::new(HashSet::new()),
-            selected_file_path: RwSignal::new(None),
+            overview_expanded_files: RwSignal::new(HashSet::new()),
+            selected_file_path: RwSignal::new(initial_selected_file),
             diff_mode: RwSignal::new(state::load_diff_view_mode()),
             show_resolved_inline: RwSignal::new(state::load_storage_bool(
                 state::SHOW_RESOLVED_INLINE_STORAGE_KEY,
@@ -672,6 +699,231 @@ fn next_req_id(slot: StoredValue<u64, LocalStorage>) -> u64 {
     next
 }
 
+fn current_route_query(ctx: AppCtx) -> RouteQuery {
+    let cid = ctx.selected_change_id.get_untracked();
+    let head_commit = ctx.changes.with_untracked(|list| {
+        list.iter()
+            .find(|c| c.change_id == cid)
+            .map(|c| c.commit_id.clone())
+    });
+    let target = ctx.target_commit_id.get_untracked();
+    let base = ctx.base_commit_id.get_untracked();
+    let ignore_rebase = ctx.ignore_rebase.get_untracked();
+    RouteQuery::from_ui_state(
+        (!target.is_empty()).then_some(target.as_str()),
+        head_commit.as_deref(),
+        &base,
+        ignore_rebase,
+    )
+}
+
+fn scroll_diff_main_to_top() {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|doc| doc.query_selector(".diff-main").ok().flatten())
+    {
+        el.set_scroll_top(0);
+    }
+}
+
+fn navigate_to_route(ctx: AppCtx, next: AppRoute, replace: bool, scroll_top: bool) {
+    let next_file = next.file_path().map(String::from);
+    ctx.route.set(next.clone());
+    if let Some(ref path) = next_file {
+        ctx.selected_file_path.set(Some(path.clone()));
+    }
+    ctx.active_cursor.set(None);
+    if replace {
+        route::replace_browser_route(&next);
+    } else {
+        route::push_browser_route(&next);
+    }
+    if let Some(ref path) = next_file {
+        mark_file_near_viewport(ctx, path);
+        enqueue_file_diff_fetch_priority(ctx, path.clone());
+    }
+    if scroll_top {
+        scroll_diff_main_to_top();
+    }
+}
+
+fn navigate_to_file(ctx: AppCtx, path: String, scroll_top: bool) {
+    let cid = ctx.selected_change_id.get_untracked();
+    if cid.is_empty() {
+        return;
+    }
+    let next = AppRoute::FileDiff {
+        change_id: cid,
+        file_path: path,
+        query: current_route_query(ctx),
+    };
+    navigate_to_route(ctx, next, false, scroll_top);
+}
+
+fn navigate_to_overview(ctx: AppCtx) {
+    let cid = ctx.selected_change_id.get_untracked();
+    if cid.is_empty() {
+        return;
+    }
+    let next = AppRoute::ChangeOverview {
+        change_id: cid,
+        query: current_route_query(ctx),
+    };
+    navigate_to_route(ctx, next, false, true);
+}
+
+fn sync_browser_query(ctx: AppCtx) {
+    let cid = ctx.selected_change_id.get_untracked();
+    if cid.is_empty() {
+        return;
+    }
+    let query = current_route_query(ctx);
+    let next = match ctx.route.get_untracked() {
+        AppRoute::FileDiff { file_path, .. } => AppRoute::FileDiff {
+            change_id: cid,
+            file_path,
+            query,
+        },
+        AppRoute::ChangeOverview { .. } | AppRoute::Root => AppRoute::ChangeOverview {
+            change_id: cid,
+            query,
+        },
+    };
+    ctx.route.set(next.clone());
+    route::replace_browser_route(&next);
+}
+
+fn find_matching_change_id(changes: &[JjChange], requested: &str) -> Option<String> {
+    changes
+        .iter()
+        .find(|c| c.change_id == requested || c.short_change_id == requested)
+        .or_else(|| {
+            changes
+                .iter()
+                .find(|c| c.change_id.starts_with(requested) || requested.starts_with(&c.change_id))
+        })
+        .map(|c| c.change_id.clone())
+}
+
+fn handle_popstate(ctx: AppCtx) {
+    let prev_route = ctx.route.get_untracked();
+    let next = route::current_browser_route();
+    ctx.active_cursor.set(None);
+
+    match next.clone() {
+        AppRoute::Root => {
+            let current_cid = ctx.selected_change_id.get_untracked();
+            if !current_cid.is_empty() {
+                let fallback = AppRoute::ChangeOverview {
+                    change_id: current_cid,
+                    query: RouteQuery::default(),
+                };
+                ctx.route.set(fallback.clone());
+                route::replace_browser_route(&fallback);
+            } else {
+                ctx.route.set(AppRoute::Root);
+            }
+        }
+        AppRoute::ChangeOverview { change_id, query }
+        | AppRoute::FileDiff {
+            change_id, query, ..
+        } => {
+            let resolved_cid = ctx
+                .changes
+                .with_untracked(|list| find_matching_change_id(list, &change_id));
+            let current_cid = ctx.selected_change_id.get_untracked();
+            let desired_ignore_rebase = query.ignore_rebase.unwrap_or(true);
+            let desired_base = query.base.clone().unwrap_or_else(|| String::from("parent"));
+
+            if resolved_cid.as_deref() == Some(current_cid.as_str()) || change_id == current_cid {
+                ctx.route.set(next.clone());
+                if let Some(path) = next.file_path() {
+                    ctx.selected_file_path.set(Some(String::from(path)));
+                }
+                let head_commit = ctx.changes.with_untracked(|list| {
+                    list.iter()
+                        .find(|c| c.change_id == current_cid)
+                        .map(|c| c.commit_id.clone())
+                });
+                let desired_target = query.target.clone().or(head_commit);
+                let cur_target = ctx.target_commit_id.get_untracked();
+                let cur_base = ctx.base_commit_id.get_untracked();
+                let cur_ignore = ctx.ignore_rebase.get_untracked();
+
+                let target_changed = desired_target
+                    .as_deref()
+                    .is_some_and(|t| !commit_ids_match(t, &cur_target));
+                if target_changed || desired_base != cur_base || desired_ignore_rebase != cur_ignore
+                {
+                    ctx.ignore_rebase.set(desired_ignore_rebase);
+                    ctx.base_commit_id.set(desired_base.clone());
+                    if let Some(t) = desired_target {
+                        ctx.target_commit_id.set(t.clone());
+                        let base_opt = (desired_base != "parent" && !desired_base.is_empty())
+                            .then_some(desired_base);
+                        load_diff_and_comments(ctx, t, base_opt, desired_ignore_rebase);
+                    }
+                }
+            } else if let Some(found_cid) = resolved_cid {
+                ctx.route.set(next.clone());
+                ctx.selected_file_path
+                    .set(next.file_path().map(String::from));
+                ctx.ignore_rebase.set(desired_ignore_rebase);
+                ctx.pending_initial_target.set_value(query.target);
+                ctx.pending_initial_base.set_value(query.base);
+                select_change_inner(ctx, found_cid, false);
+            } else {
+                let next_file = next.file_path().map(String::from);
+                spawn_local(async move {
+                    if let Ok(resp) = api::fetch_jj_changes(Some(&change_id)).await
+                        && let Some(found) = resp.changes.into_iter().next()
+                    {
+                        let cid = found.change_id.clone();
+                        ctx.changes.update(|list| {
+                            if !list.iter().any(|c| c.change_id == cid) {
+                                list.insert(0, found.clone());
+                            }
+                        });
+                        ctx.graph_rows.update(|rows| {
+                            let exists = rows.iter().any(|r| {
+                                matches!(r, JjGraphRow::Commit { change, .. } if change.change_id == cid)
+                            });
+                            if !exists {
+                                rows.insert(0, JjGraphRow::standalone(&found));
+                            }
+                        });
+                        let canonical = match next_file {
+                            Some(file_path) => AppRoute::FileDiff {
+                                change_id: cid.clone(),
+                                file_path,
+                                query: query.clone(),
+                            },
+                            None => AppRoute::ChangeOverview {
+                                change_id: cid.clone(),
+                                query: query.clone(),
+                            },
+                        };
+                        ctx.route.set(canonical.clone());
+                        ctx.selected_file_path
+                            .set(canonical.file_path().map(String::from));
+                        route::replace_browser_route(&canonical);
+                        ctx.ignore_rebase.set(desired_ignore_rebase);
+                        ctx.pending_initial_target.set_value(query.target);
+                        ctx.pending_initial_base.set_value(query.base);
+                        ctx.error_banner.set(None);
+                        select_change_inner(ctx, cid, false);
+                    } else {
+                        ctx.error_banner
+                            .set(Some(alloc::format!("Change '{change_id}' was not found.")));
+                        ctx.route.set(prev_route.clone());
+                        route::replace_browser_route(&prev_route);
+                    }
+                });
+            }
+        }
+    }
+}
+
 fn load_diff_and_comments(ctx: AppCtx, target: String, base: Option<String>, ignore_rebase: bool) {
     let diff_id = next_req_id(ctx.diff_req_id);
     let comments_id = next_req_id(ctx.comments_req_id);
@@ -710,18 +962,35 @@ fn load_diff_and_comments(ctx: AppCtx, target: String, base: Option<String>, ign
                         }
                     }
                 }
-                let mut collapsed: HashSet<String> = viewed.clone();
-                for file in &loaded.files {
-                    if state::auto_collapse_reason(file).is_some() {
-                        collapsed.insert(file.path.clone());
-                    }
-                }
-                let prev_rebase_ignored = ctx
-                    .diff_data
-                    .with_untracked(|d| d.as_ref().map(|prev| prev.rebase_ignored));
+                let prev_meta = ctx.diff_data.with_untracked(|d| {
+                    d.as_ref().map(|prev| {
+                        (
+                            prev.base_commit.clone(),
+                            prev.commit.clone(),
+                            prev.rebase_ignored,
+                        )
+                    })
+                });
+                let prev_rebase_ignored = prev_meta.as_ref().map(|(_, _, r)| *r);
+                let same_immutable_diff = prev_meta.as_ref().is_some_and(|(pb, pc, pr)| {
+                    *pb == loaded.base_commit
+                        && *pc == loaded.commit
+                        && *pr == loaded.rebase_ignored
+                        && is_strict_40_hex_oid(&loaded.commit)
+                        && is_strict_40_hex_oid(&loaded.base_commit)
+                });
+
                 prune_removed_file_slots(ctx, &loaded);
                 ctx.reviewed_files.set(viewed);
-                ctx.collapsed_files.set(collapsed);
+                if same_immutable_diff {
+                    let keep_paths: HashSet<&str> =
+                        loaded.files.iter().map(|f| f.path.as_str()).collect();
+                    ctx.overview_expanded_files.update(|set| {
+                        set.retain(|p| keep_paths.contains(p.as_str()));
+                    });
+                } else {
+                    ctx.overview_expanded_files.set(HashSet::new());
+                }
                 let evicted_slots = sync_file_slots(ctx, &loaded, prev_rebase_ignored);
                 ctx.diff_data.set(Some(loaded));
                 for slot in evicted_slots {
@@ -767,12 +1036,27 @@ fn refresh_comments_only(ctx: AppCtx) {
 }
 
 fn select_change(ctx: AppCtx, change_id: String) {
+    select_change_inner(ctx, change_id, true);
+}
+
+fn select_change_inner(ctx: AppCtx, change_id: String, push_overview_route: bool) {
     if change_id.is_empty() {
         return;
     }
     clear_all_slot_interactions(ctx);
     ctx.selected_change_id.set(change_id.clone());
     ctx.lookup_error.set(None);
+    ctx.overview_expanded_files.set(HashSet::new());
+
+    if push_overview_route {
+        ctx.ignore_rebase.set(true);
+        ctx.selected_file_path.set(None);
+        let next = AppRoute::ChangeOverview {
+            change_id: change_id.clone(),
+            query: RouteQuery::default(),
+        };
+        navigate_to_route(ctx, next, false, true);
+    }
 
     let immediate_target = ctx
         .changes
@@ -860,10 +1144,38 @@ fn select_change(ctx: AppCtx, change_id: String) {
     });
 }
 
+struct InitialChangePick {
+    change_id: String,
+    url_change_matched: bool,
+}
+
 async fn resolve_initial_change_into_response(
     resp: &mut tellit_types::JjChangesResponse,
+    url_change_id: Option<&str>,
     initial_target: Option<&str>,
-) -> Option<String> {
+) -> Option<InitialChangePick> {
+    if let Some(req_cid) = url_change_id {
+        if let Some(found_cid) = find_matching_change_id(&resp.changes, req_cid) {
+            return Some(InitialChangePick {
+                change_id: found_cid,
+                url_change_matched: true,
+            });
+        }
+        if let Ok(extra) = api::fetch_jj_changes(Some(req_cid)).await
+            && let Some(found) = extra.changes.into_iter().next()
+        {
+            let cid = found.change_id.clone();
+            if !resp.changes.iter().any(|c| c.change_id == cid) {
+                resp.graph_rows.insert(0, JjGraphRow::standalone(&found));
+                resp.changes.insert(0, found);
+            }
+            return Some(InitialChangePick {
+                change_id: cid,
+                url_change_matched: true,
+            });
+        }
+    }
+
     let mut picked_id =
         pick_initial_change(&resp.changes, initial_target).map(|c| c.change_id.clone());
 
@@ -885,22 +1197,90 @@ async fn resolve_initial_change_into_response(
         picked_id = Some(cid);
     }
 
-    picked_id
+    picked_id.map(|change_id| InitialChangePick {
+        change_id,
+        url_change_matched: url_change_id.is_none(),
+    })
+}
+
+fn finalize_initial_change_selection(ctx: AppCtx, pick: InitialChangePick) {
+    let cid = pick.change_id;
+    let cur_route = ctx.route.get_untracked();
+    let canonical_route = if !pick.url_change_matched {
+        let missing = cur_route.change_id().unwrap_or_default();
+        ctx.error_banner.set(Some(alloc::format!(
+            "Change '{missing}' was not found; showing active revision instead."
+        )));
+        ctx.pending_initial_target.set_value(None);
+        ctx.pending_initial_base.set_value(None);
+        ctx.ignore_rebase.set(true);
+        AppRoute::ChangeOverview {
+            change_id: cid.clone(),
+            query: RouteQuery::default(),
+        }
+    } else {
+        match cur_route {
+            AppRoute::FileDiff {
+                file_path, query, ..
+            } => AppRoute::FileDiff {
+                change_id: cid.clone(),
+                file_path,
+                query,
+            },
+            AppRoute::ChangeOverview { query, .. } => AppRoute::ChangeOverview {
+                change_id: cid.clone(),
+                query,
+            },
+            AppRoute::Root => {
+                let head_commit = ctx.changes.with_untracked(|list| {
+                    list.iter()
+                        .find(|c| c.change_id == cid)
+                        .map(|c| c.commit_id.clone())
+                });
+                let init_target = ctx.pending_initial_target.get_value();
+                let init_base = ctx
+                    .pending_initial_base
+                    .get_value()
+                    .unwrap_or_else(|| String::from("parent"));
+                let query = RouteQuery::from_ui_state(
+                    init_target.as_deref(),
+                    head_commit.as_deref(),
+                    &init_base,
+                    ctx.ignore_rebase.get_untracked(),
+                );
+                AppRoute::ChangeOverview {
+                    change_id: cid.clone(),
+                    query,
+                }
+            }
+        }
+    };
+    ctx.route.set(canonical_route.clone());
+    ctx.selected_file_path
+        .set(canonical_route.file_path().map(String::from));
+    route::replace_browser_route(&canonical_route);
+    select_change_inner(ctx, cid, false);
 }
 
 fn load_initial_jj_data(ctx: AppCtx) {
     let changes_id = next_req_id(ctx.changes_req_id);
     ctx.loading_changes.set(true);
     spawn_local(async move {
+        let url_change_id = ctx
+            .route
+            .with_untracked(|r| r.change_id().map(String::from));
         let initial_target = ctx.pending_initial_target.get_value();
         match api::fetch_jj_changes(None).await {
             Ok(mut resp) => {
                 if ctx.changes_req_id.get_value() != changes_id {
                     return;
                 }
-                let picked_id =
-                    resolve_initial_change_into_response(&mut resp, initial_target.as_deref())
-                        .await;
+                let picked = resolve_initial_change_into_response(
+                    &mut resp,
+                    url_change_id.as_deref(),
+                    initial_target.as_deref(),
+                )
+                .await;
                 if ctx.changes_req_id.get_value() != changes_id {
                     return;
                 }
@@ -909,10 +1289,10 @@ fn load_initial_jj_data(ctx: AppCtx) {
                 ctx.graph_rows.set(resp.graph_rows);
                 ctx.loading_changes.set(false);
 
-                if let Some(cid) = picked_id
+                if let Some(pick) = picked
                     && ctx.selected_change_id.get_untracked().is_empty()
                 {
-                    select_change(ctx, cid);
+                    finalize_initial_change_selection(ctx, pick);
                 }
             }
             Err(err) => {
@@ -954,9 +1334,16 @@ fn reload_changes_and_commits(ctx: AppCtx, reload_diff: bool) {
         // finish initial selection here so the UI never stalls on "Loading Jujutsu revisions...".
         let current_selected = ctx.selected_change_id.get_untracked();
         if current_selected.is_empty() {
+            let url_change_id = ctx
+                .route
+                .with_untracked(|r| r.change_id().map(String::from));
             let initial_target = ctx.pending_initial_target.get_value();
-            let picked_id =
-                resolve_initial_change_into_response(&mut resp, initial_target.as_deref()).await;
+            let picked = resolve_initial_change_into_response(
+                &mut resp,
+                url_change_id.as_deref(),
+                initial_target.as_deref(),
+            )
+            .await;
             if ctx.changes_req_id.get_value() != changes_id {
                 return;
             }
@@ -964,10 +1351,10 @@ fn reload_changes_and_commits(ctx: AppCtx, reload_diff: bool) {
             ctx.graph_rows.set(resp.graph_rows);
             ctx.loading_changes.set(false);
             ctx.reloading.set(false);
-            if let Some(cid) = picked_id
+            if let Some(pick) = picked
                 && ctx.selected_change_id.get_untracked().is_empty()
             {
-                select_change(ctx, cid);
+                finalize_initial_change_selection(ctx, pick);
             }
             return;
         }
@@ -1017,6 +1404,7 @@ fn reload_changes_and_commits(ctx: AppCtx, reload_diff: bool) {
             {
                 target = String::from(new_head);
                 ctx.target_commit_id.set(target.clone());
+                sync_browser_query(ctx);
             }
             if !target.is_empty() {
                 let base_opt = (base != "parent" && !base.is_empty()).then_some(base);
@@ -1064,10 +1452,19 @@ fn load_jj_status(ctx: AppCtx) {
         match api::fetch_jj_status().await {
             Ok(status) => {
                 let is_jj = status.is_jj;
-                ctx.pending_initial_target
-                    .set_value(status.initial_target.clone());
-                ctx.pending_initial_base
-                    .set_value(status.initial_base.clone());
+                let cur_route = ctx.route.get_untracked();
+                match cur_route.query() {
+                    Some(q) => {
+                        ctx.pending_initial_target.set_value(q.target.clone());
+                        ctx.pending_initial_base.set_value(q.base.clone());
+                    }
+                    None => {
+                        ctx.pending_initial_target
+                            .set_value(status.initial_target.clone());
+                        ctx.pending_initial_base
+                            .set_value(status.initial_base.clone());
+                    }
+                }
                 ctx.repo_status.set(RepoStatusState::Loaded(status));
                 if is_jj {
                     load_initial_jj_data(ctx);
@@ -1116,16 +1513,23 @@ fn connect_watch(
     }
 }
 
-fn scroll_to_file_element(path: &str) {
-    let _ =
-        keyboard::scroll_to_element_id(&state::file_element_id(path), ScrollLogicalPosition::Start);
-}
-
 fn jump_to_thread(ctx: AppCtx, thread: JjCommentThread) {
-    ctx.selected_file_path.set(Some(thread.file_path.clone()));
-    ctx.collapsed_files.update(|set| {
-        set.remove(&thread.file_path);
-    });
+    let in_overview_expanded = matches!(ctx.route.get_untracked(), AppRoute::ChangeOverview { .. })
+        && ctx
+            .overview_expanded_files
+            .with_untracked(|set| set.contains(&thread.file_path));
+
+    if in_overview_expanded {
+        ctx.selected_file_path.set(Some(thread.file_path.clone()));
+    } else {
+        let already_on_file = ctx
+            .route
+            .with_untracked(|r| r.file_path() == Some(thread.file_path.as_str()));
+        if !already_on_file {
+            navigate_to_file(ctx, thread.file_path.clone(), false);
+        }
+    }
+
     mark_file_near_viewport(ctx, &thread.file_path);
     let mut needs_hydration = false;
     if let Some(slot) = ctx
@@ -1159,7 +1563,9 @@ fn jump_to_thread(ctx: AppCtx, thread: JjCommentThread) {
             thread_dom,
         )));
         enqueue_file_diff_fetch_priority(ctx, thread.file_path);
-        let _ = keyboard::scroll_to_element_id(&file_dom, ScrollLogicalPosition::Start);
+        if in_overview_expanded {
+            let _ = keyboard::scroll_to_element_id(&file_dom, ScrollLogicalPosition::Start);
+        }
         return;
     }
 
@@ -1332,18 +1738,19 @@ pub fn App() -> impl IntoView {
     });
 
     // Apply CSS Custom Highlight API matches on a microtask after Leptos flushes DOM updates,
-    // avoiding per-token DOM spans and ensuring mode/collapse/expansion renders are already mounted.
+    // avoiding per-token DOM spans and ensuring mode/route/expansion renders are already mounted.
     Effect::new(move |_| {
         if ctx.highlighted_word.with(Option::is_none) {
             word_highlight::clear_css_word_highlight();
             return;
         }
         // Track layout/content mutations only while an active highlight exists.
+        ctx.route.track();
         ctx.diff_data.track();
         ctx.ordered_file_slots.track();
         ctx.hydrated_files_rev.track();
         ctx.diff_mode.track();
-        ctx.collapsed_files.track();
+        ctx.overview_expanded_files.track();
         ctx.expanded_lines.track();
 
         if highlight_sync_pending.get_value() {
@@ -1371,11 +1778,12 @@ pub fn App() -> impl IntoView {
             });
             return;
         }
+        ctx.route.track();
         ctx.diff_mode.track();
         ctx.diff_data.track();
         ctx.ordered_file_slots.track();
         ctx.hydrated_files_rev.track();
-        ctx.collapsed_files.track();
+        ctx.overview_expanded_files.track();
         ctx.expanded_lines.track();
 
         if kbd_sync_pending.get_value() {
@@ -1427,6 +1835,37 @@ pub fn App() -> impl IntoView {
             newly_marked.push(el);
             let _ = marked_kbd_els.try_set_value(newly_marked);
         });
+    });
+
+    // In Single-File View, prioritize hydrating the active file and proactively prefetch its
+    // immediate neighbors (i + 1, then i - 1) at normal priority so `[` / `]` stepping is instant.
+    Effect::new(move |_| {
+        let active_path = ctx.route.with(|r| r.file_path().map(String::from));
+        let Some(active_path) = active_path else {
+            return;
+        };
+        let slots = ctx.ordered_file_slots.get();
+        let Some(idx) = slots.iter().position(|s| s.path == active_path) else {
+            return;
+        };
+        let active_slot = &slots[idx];
+        if !active_slot.is_near_viewport.get_untracked() {
+            active_slot.is_near_viewport.set(true);
+        }
+        if active_slot.file.with_untracked(|f| !f.chunks_loaded) {
+            enqueue_file_diff_fetch_priority(ctx, active_path);
+        }
+        if let Some(next_slot) = slots.get(idx + 1)
+            && next_slot.file.with_untracked(|f| !f.chunks_loaded)
+        {
+            enqueue_file_diff_fetch(ctx, next_slot.path.clone());
+        }
+        if let Some(prev_idx) = idx.checked_sub(1)
+            && let Some(prev_slot) = slots.get(prev_idx)
+            && prev_slot.file.with_untracked(|f| !f.chunks_loaded)
+        {
+            enqueue_file_diff_fetch(ctx, prev_slot.path.clone());
+        }
     });
 
     let apply_settings_update = Callback::new(move |next: AppearanceSettings| {
@@ -1502,6 +1941,10 @@ pub fn App() -> impl IntoView {
         handle_global_keydown(ctx, &ev);
     });
 
+    let popstate_handle = window_event_listener(ev::popstate, move |_| {
+        handle_popstate(ctx);
+    });
+
     on_cleanup(move || {
         if let Some(id) = resize_raf_id.get_value() {
             resize_raf_id.set_value(None);
@@ -1527,6 +1970,7 @@ pub fn App() -> impl IntoView {
         mousemove_handle.remove();
         mouseup_handle.remove();
         keydown_handle.remove();
+        popstate_handle.remove();
     });
 
     let on_toggle_sidebar = move |_| {
@@ -1540,6 +1984,7 @@ pub fn App() -> impl IntoView {
 
     let on_select_target = Callback::new(move |new_target: String| {
         ctx.target_commit_id.set(new_target.clone());
+        sync_browser_query(ctx);
         let base = ctx.base_commit_id.get_untracked();
         let base_opt = (base != "parent" && !base.is_empty()).then_some(base);
         load_diff_and_comments(ctx, new_target, base_opt, ctx.ignore_rebase.get_untracked());
@@ -1547,6 +1992,7 @@ pub fn App() -> impl IntoView {
 
     let on_select_base = Callback::new(move |new_base: String| {
         ctx.base_commit_id.set(new_base.clone());
+        sync_browser_query(ctx);
         let target = ctx.target_commit_id.get_untracked();
         if !target.is_empty() {
             let base_opt = (new_base != "parent" && !new_base.is_empty()).then_some(new_base);
@@ -1557,6 +2003,7 @@ pub fn App() -> impl IntoView {
     let on_toggle_ignore_rebase = Callback::new(move |()| {
         let next = !ctx.ignore_rebase.get_untracked();
         ctx.ignore_rebase.set(next);
+        sync_browser_query(ctx);
         let target = ctx.target_commit_id.get_untracked();
         if !target.is_empty() {
             let base = ctx.base_commit_id.get_untracked();
@@ -1578,7 +2025,10 @@ pub fn App() -> impl IntoView {
         let Some(diff) = ctx.current_diff() else {
             return;
         };
-        toggle_file_viewed_and_collapse(ctx, &diff.commit, &path);
+        let in_single_file = ctx
+            .route
+            .with_untracked(|r| matches!(r, AppRoute::FileDiff { .. }));
+        toggle_file_viewed(ctx, &diff.commit, &path, !in_single_file);
     });
 
     let on_toggle_folder_reviewed =
@@ -1606,35 +2056,61 @@ pub fn App() -> impl IntoView {
                 }
                 state::save_viewed_files(&ctx.repo_root_string(), &diff.commit, set);
             });
-            ctx.collapsed_files.update(|set| {
-                for p in &affected {
-                    if mark_reviewed {
-                        set.insert(p.clone());
-                    } else {
+            if mark_reviewed {
+                ctx.overview_expanded_files.update(|set| {
+                    for p in &affected {
                         set.remove(p);
                     }
-                }
-            });
-        });
-
-    let on_toggle_collapse = Callback::new(move |path: String| {
-        let mut expanded = false;
-        ctx.collapsed_files.update(|set| {
-            if set.remove(&path) {
-                expanded = true;
-            } else {
-                set.insert(path.clone());
+                });
             }
         });
-        if expanded {
+
+    let on_toggle_inline_expand = Callback::new(move |path: String| {
+        let mut now_expanded = false;
+        ctx.overview_expanded_files.update(|set| {
+            if !set.remove(&path) {
+                set.insert(path.clone());
+                now_expanded = true;
+            }
+        });
+        if now_expanded {
             mark_file_near_viewport(ctx, &path);
         }
     });
 
+    let on_expand_all_inline = Callback::new(move |paths: Vec<String>| {
+        ctx.overview_expanded_files.update(|set| {
+            for path in paths {
+                set.insert(path);
+            }
+        });
+    });
+
+    let on_collapse_all_inline = Callback::new(move |()| {
+        ctx.overview_expanded_files.set(HashSet::new());
+    });
+
     let on_select_file = Callback::new(move |path: String| {
-        ctx.selected_file_path.set(Some(path.clone()));
-        mark_file_near_viewport(ctx, &path);
-        scroll_to_file_element(&path);
+        navigate_to_file(ctx, path, true);
+    });
+
+    let on_back_to_overview = Callback::new(move |()| {
+        navigate_to_overview(ctx);
+    });
+
+    let on_viewed_and_next = Callback::new(move |path: String| {
+        let Some(diff) = ctx.current_diff() else {
+            return;
+        };
+        let live_files: Vec<Arc<DiffFile>> = ctx
+            .ordered_file_slots
+            .with_untracked(|slots| slots.iter().map(|s| s.file.get_untracked()).collect());
+        let files: &[Arc<DiffFile>] = if live_files.is_empty() {
+            &diff.files
+        } else {
+            &live_files
+        };
+        mark_viewed_and_advance_single_file(ctx, &diff.commit, &path, files);
     });
 
     let on_register_card = Callback::new(move |(path, el): (String, web_sys::Element)| {
@@ -1759,6 +2235,29 @@ pub fn App() -> impl IntoView {
         state::save_storage_bool(state::SHOW_RESOLVED_INLINE_STORAGE_KEY, show);
     });
 
+    let diff_card_callbacks = DiffCardCallbacks {
+        on_register_card,
+        on_unregister_card,
+        on_request_file_diff,
+        on_window_expanded,
+        on_toggle_viewed: on_toggle_reviewed,
+        on_open_in_editor,
+        on_prefetch_line_count,
+        on_expand_lines,
+        on_create_thread,
+        on_reply,
+        on_toggle_resolve,
+    };
+
+    let is_single_file_view =
+        Memo::new(move |_| ctx.route.with(|r| matches!(r, AppRoute::FileDiff { .. })));
+    let active_route_file_path = Memo::new(move |_| {
+        ctx.route
+            .with(|r| r.file_path().map_or_else(String::new, String::from))
+    });
+    let active_route_query =
+        Memo::new(move |_| ctx.route.with(|r| r.query().cloned().unwrap_or_default()));
+
     let comment_counts_by_file = Memo::new(move |_| {
         ctx.comments.with(|list| {
             let mut counts: HashMap<String, usize> = HashMap::new();
@@ -1811,6 +2310,15 @@ pub fn App() -> impl IntoView {
         })
     });
 
+    let active_commit_description = Memo::new(move |_| {
+        active_commit.with(|opt| opt.as_ref().map(|(_, c)| c.description.clone()))
+    });
+
+    let is_empty_diff = Memo::new(move |_| {
+        ctx.diff_data
+            .with(|opt| opt.as_ref().is_some_and(|d| d.is_empty))
+    });
+
     let is_jj_workspace = Memo::new(move |_| {
         ctx.repo_status
             .with(|s| matches!(s, RepoStatusState::Loaded(status) if status.is_jj))
@@ -1820,10 +2328,6 @@ pub fn App() -> impl IntoView {
         ctx.diff_data.with(|opt| match opt.as_ref() {
             None if ctx.loading_diff.get() => DiffPaneState::Loading,
             None => DiffPaneState::Idle,
-            Some(d) if d.is_empty && d.files.len() <= 1 => DiffPaneState::Empty {
-                base: d.base_commit.clone(),
-                target: d.commit.clone(),
-            },
             Some(_) => DiffPaneState::Ready,
         })
     });
@@ -1941,8 +2445,15 @@ pub fn App() -> impl IntoView {
                         </>
                     })}
                     {move || {
-                        let total = ctx.diff_data.with(|d| d.as_ref().map_or(0, |d| d.files.len()));
-                        let viewed = ctx.reviewed_files.with(HashSet::len).min(total);
+                        let (total, viewed) = ctx.diff_data.with(|d| {
+                            ctx.reviewed_files.with(|rev| {
+                                d.as_ref().map_or((0, 0), |d| {
+                                    let done =
+                                        d.files.iter().filter(|f| rev.contains(&f.path)).count();
+                                    (d.files.len(), done)
+                                })
+                            })
+                        });
                         (total > 0).then(|| {
                             let pct = (viewed * 100) / total;
                             view! {
@@ -2227,61 +2738,51 @@ pub fn App() -> impl IntoView {
                                         DiffPaneState::Idle => view! {
                                             <div class="center-message">"Select a revision to inspect its diff."</div>
                                         }.into_any(),
-                                        DiffPaneState::Empty { base, target } => view! {
-                                            <div class="empty-diff-card">
-                                                <h2>"No changes in this revision"</h2>
-                                                <p>
-                                                    {alloc::format!(
-                                                        "Commit {} has no modified files against {}.",
-                                                        target.chars().take(8).collect::<String>(),
-                                                        base.chars().take(8).collect::<String>(),
-                                                    )}
-                                                </p>
-                                            </div>
-                                        }.into_any(),
                                         DiffPaneState::Ready => view! {
-                                            <div class="diff-file-list">
-                                                <For
-                                                    each=move || ctx.ordered_file_slots.get()
-                                                    key=|slot| slot.path.clone()
-                                                    children=move |slot| {
-                                                        view! {
-                                                            <TextDiffCard
-                                                                path=slot.path
-                                                                file=slot.file
-                                                                file_index=slot.file_index
-                                                                commits=slot.commits
-                                                                drag_state=slot.drag_state
-                                                                active_composer=slot.active_composer
-                                                                md_tab=slot.md_tab
-                                                                is_near_viewport=slot.is_near_viewport
-                                                                loading_chunks=slot.loading_chunks
-                                                                load_error=slot.load_error
-                                                                visible_line_limit=slot.visible_line_limit
-                                                                all_threads=ctx.comments
-                                                                reviewed_files=ctx.reviewed_files
-                                                                collapsed_files=ctx.collapsed_files
-                                                                diff_mode=ctx.diff_mode
-                                                                show_resolved_inline=ctx.show_resolved_inline
-                                                                expanded_lines=ctx.expanded_lines
-                                                                expand_loading=ctx.expand_loading
-                                                                on_register_card=on_register_card
-                                                                on_unregister_card=on_unregister_card
-                                                                on_request_file_diff=on_request_file_diff
-                                                                on_window_expanded=on_window_expanded
-                                                                on_toggle_viewed=on_toggle_reviewed
-                                                                on_toggle_collapse=on_toggle_collapse
-                                                                on_open_in_editor=on_open_in_editor
-                                                                on_prefetch_line_count=on_prefetch_line_count
-                                                                on_expand_lines=on_expand_lines
-                                                                on_create_thread=on_create_thread
-                                                                on_reply=on_reply
-                                                                on_toggle_resolve=on_toggle_resolve
-                                                            />
-                                                        }
-                                                    }
-                                                />
-                                            </div>
+                                            {move || if is_single_file_view.get() {
+                                                view! {
+                                                    <SingleFileView
+                                                        change_id=ctx.selected_change_id
+                                                        route_query=active_route_query
+                                                        file_path=active_route_file_path
+                                                        ordered_file_slots=ctx.ordered_file_slots
+                                                        reviewed_files=ctx.reviewed_files
+                                                        all_threads=ctx.comments
+                                                        diff_mode=ctx.diff_mode
+                                                        show_resolved_inline=ctx.show_resolved_inline
+                                                        expanded_lines=ctx.expanded_lines
+                                                        expand_loading=ctx.expand_loading
+                                                        callbacks=diff_card_callbacks
+                                                        on_back_to_overview=on_back_to_overview
+                                                        on_open_file=on_select_file
+                                                        on_viewed_and_next=on_viewed_and_next
+                                                    />
+                                                }.into_any()
+                                            } else {
+                                                view! {
+                                                    <ChangeOverview
+                                                        change_id=ctx.selected_change_id
+                                                        route_query=active_route_query
+                                                        active_change=active_change
+                                                        active_commit_description=active_commit_description
+                                                        selected_file_path=ctx.selected_file_path
+                                                        is_empty_diff=is_empty_diff
+                                                        ordered_file_slots=ctx.ordered_file_slots
+                                                        overview_expanded_files=ctx.overview_expanded_files
+                                                        reviewed_files=ctx.reviewed_files
+                                                        all_threads=ctx.comments
+                                                        diff_mode=ctx.diff_mode
+                                                        show_resolved_inline=ctx.show_resolved_inline
+                                                        expanded_lines=ctx.expanded_lines
+                                                        expand_loading=ctx.expand_loading
+                                                        callbacks=diff_card_callbacks
+                                                        on_open_file=on_select_file
+                                                        on_toggle_inline_expand=on_toggle_inline_expand
+                                                        on_expand_all_inline=on_expand_all_inline
+                                                        on_collapse_all_inline=on_collapse_all_inline
+                                                    />
+                                                }.into_any()
+                                            }}
                                         }.into_any(),
                                     }}
                                 </div>
@@ -2633,53 +3134,67 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
                 mode,
             );
         }
-        "]" => {
+        "]" if !files.is_empty() => {
             ev.prevent_default();
-            step_keyboard_cursor(
-                ctx,
-                NavigationDirection::Next,
-                NavigationTarget::File,
-                files,
-                mode,
-            );
+            if let Some(active_path) = ctx
+                .route
+                .with_untracked(|r| r.file_path().map(String::from))
+            {
+                if let Some(cur_idx) = files.iter().position(|f| f.path == active_path)
+                    && let Some(next_idx) = keyboard::adjacent_file_index(
+                        cur_idx,
+                        files.len(),
+                        NavigationDirection::Next,
+                    )
+                {
+                    navigate_to_file(ctx, files[next_idx].path.clone(), true);
+                }
+            } else {
+                let next_idx = ctx
+                    .selected_file_path
+                    .with_untracked(|sel| {
+                        sel.as_deref()
+                            .and_then(|p| files.iter().position(|f| f.path == p))
+                            .map(|i| (i + 1) % files.len())
+                    })
+                    .unwrap_or(0);
+                navigate_to_file(ctx, files[next_idx].path.clone(), true);
+            }
         }
-        "[" => {
+        "[" if !files.is_empty() => {
             ev.prevent_default();
-            step_keyboard_cursor(
-                ctx,
-                NavigationDirection::Prev,
-                NavigationTarget::File,
-                files,
-                mode,
-            );
+            if let Some(active_path) = ctx
+                .route
+                .with_untracked(|r| r.file_path().map(String::from))
+            {
+                if let Some(cur_idx) = files.iter().position(|f| f.path == active_path)
+                    && let Some(prev_idx) = keyboard::adjacent_file_index(
+                        cur_idx,
+                        files.len(),
+                        NavigationDirection::Prev,
+                    )
+                {
+                    navigate_to_file(ctx, files[prev_idx].path.clone(), true);
+                }
+            } else {
+                let prev_idx = ctx
+                    .selected_file_path
+                    .with_untracked(|sel| {
+                        sel.as_deref()
+                            .and_then(|p| files.iter().position(|f| f.path == p))
+                            .map(|i| (i + files.len() - 1) % files.len())
+                    })
+                    .unwrap_or(files.len() - 1);
+                navigate_to_file(ctx, files[prev_idx].path.clone(), true);
+            }
         }
         "{" if !files.is_empty() => {
             ev.prevent_default();
-            let pos = keyboard::normalize_cursor_side(
-                CursorPosition {
-                    file_index: 0,
-                    chunk_index: 0,
-                    line_index: 0,
-                    side: CommentSide::New,
-                },
-                files,
-            );
-            ctx.active_cursor.set(Some(pos));
-            scroll_cursor(ctx, pos, files, ScrollLogicalPosition::Start);
+            navigate_to_file(ctx, files[0].path.clone(), true);
         }
         "}" if !files.is_empty() => {
             ev.prevent_default();
-            let pos = keyboard::normalize_cursor_side(
-                CursorPosition {
-                    file_index: files.len() - 1,
-                    chunk_index: 0,
-                    line_index: 0,
-                    side: CommentSide::New,
-                },
-                files,
-            );
-            ctx.active_cursor.set(Some(pos));
-            scroll_cursor(ctx, pos, files, ScrollLogicalPosition::Start);
+            navigate_to_file(ctx, files[files.len() - 1].path.clone(), true);
         }
         "h" | "ArrowLeft" if mode == DiffViewMode::Split => {
             if let Some(cur) = ctx.active_cursor.get_untracked() {
@@ -2720,6 +3235,15 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
             jump_to_thread(ctx, unresolved[target_idx].clone());
         }
         "u" => {
+            if ctx
+                .route
+                .with_untracked(|r| matches!(r, AppRoute::FileDiff { .. }))
+            {
+                ev.prevent_default();
+                navigate_to_overview(ctx);
+            }
+        }
+        "U" => {
             ev.prevent_default();
             ctx.diff_mode.set(DiffViewMode::Unified);
             state::save_diff_view_mode(DiffViewMode::Unified);
@@ -2730,49 +3254,55 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
             state::save_diff_view_mode(DiffViewMode::Split);
         }
         "v" => {
-            let file_idx = ctx
-                .active_cursor
-                .get_untracked()
-                .map(|c| c.file_index)
-                .or_else(|| ctx.hovered_file_index.get_untracked());
-            if let Some(idx) = file_idx
-                && let Some(file) = files.get(idx)
+            if let Some(active_path) = ctx
+                .route
+                .with_untracked(|r| r.file_path().map(String::from))
             {
                 ev.prevent_default();
-                toggle_file_viewed_and_collapse(ctx, &diff.commit, &file.path);
+                toggle_file_viewed(ctx, &diff.commit, &active_path, false);
+            } else {
+                let file_idx = ctx
+                    .active_cursor
+                    .get_untracked()
+                    .map(|c| c.file_index)
+                    .or_else(|| ctx.hovered_file_index.get_untracked());
+                if let Some(idx) = file_idx
+                    && let Some(file) = files.get(idx)
+                {
+                    ev.prevent_default();
+                    toggle_file_viewed(ctx, &diff.commit, &file.path, true);
+                }
             }
         }
         "V" => {
-            let file_idx = ctx
-                .active_cursor
-                .get_untracked()
-                .map(|c| c.file_index)
-                .or_else(|| ctx.hovered_file_index.get_untracked());
-            if let Some(idx) = file_idx
-                && let Some(file) = files.get(idx)
+            if let Some(active_path) = ctx
+                .route
+                .with_untracked(|r| r.file_path().map(String::from))
             {
                 ev.prevent_default();
-                let already_reviewed = ctx
-                    .reviewed_files
-                    .with_untracked(|set| set.contains(&file.path));
-                if !already_reviewed {
-                    toggle_file_viewed_and_collapse(ctx, &diff.commit, &file.path);
-                }
-                let next_idx = ctx.reviewed_files.with_untracked(|updated_reviewed| {
-                    keyboard::next_unviewed_file_index(idx, files, updated_reviewed)
-                });
-                if let Some(next_idx) = next_idx {
-                    let pos = keyboard::normalize_cursor_side(
-                        CursorPosition {
-                            file_index: next_idx,
-                            chunk_index: 0,
-                            line_index: 0,
-                            side: CommentSide::New,
-                        },
-                        files,
-                    );
-                    ctx.active_cursor.set(Some(pos));
-                    scroll_cursor(ctx, pos, files, ScrollLogicalPosition::Start);
+                mark_viewed_and_advance_single_file(ctx, &diff.commit, &active_path, files);
+            } else {
+                let file_idx = ctx
+                    .active_cursor
+                    .get_untracked()
+                    .map(|c| c.file_index)
+                    .or_else(|| ctx.hovered_file_index.get_untracked());
+                if let Some(idx) = file_idx
+                    && let Some(file) = files.get(idx)
+                {
+                    ev.prevent_default();
+                    let already_reviewed = ctx
+                        .reviewed_files
+                        .with_untracked(|set| set.contains(&file.path));
+                    if !already_reviewed {
+                        toggle_file_viewed(ctx, &diff.commit, &file.path, true);
+                    }
+                    let next_idx = ctx.reviewed_files.with_untracked(|updated_reviewed| {
+                        keyboard::next_unviewed_file_index(idx, files, updated_reviewed)
+                    });
+                    if let Some(next_idx) = next_idx {
+                        navigate_to_file(ctx, files[next_idx].path.clone(), true);
+                    }
                 }
             }
         }
@@ -2794,9 +3324,11 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
                         .with_value(|map| map.get(&file.path).cloned())
                 {
                     ev.prevent_default();
-                    ctx.collapsed_files.update(|set| {
-                        set.remove(&file.path);
-                    });
+                    if matches!(ctx.route.get_untracked(), AppRoute::ChangeOverview { .. }) {
+                        ctx.overview_expanded_files.update(|set| {
+                            set.insert(file.path.clone());
+                        });
+                    }
                     if file.path != "Commit Message" && state::is_markdown_file(&file.path) {
                         slot.md_tab.set(MarkdownTab::Code);
                     }
@@ -2846,19 +3378,46 @@ fn step_keyboard_cursor(
     files: &[Arc<DiffFile>],
     mode: DiffViewMode,
 ) {
-    let next = ctx.reviewed_files.with_untracked(|reviewed| {
-        ctx.collapsed_files.with_untracked(|collapsed| {
-            keyboard::find_next_position(
-                ctx.active_cursor.get_untracked(),
-                dir,
-                target,
-                files,
-                mode,
-                reviewed,
-                collapsed,
-            )
-        })
-    });
+    let active_single_file = ctx
+        .route
+        .with_untracked(|r| r.file_path().map(String::from));
+    let next = if let Some(ref active_path) = active_single_file {
+        let collapsed: HashSet<String> = files
+            .iter()
+            .filter(|f| f.path != *active_path)
+            .map(|f| f.path.clone())
+            .collect();
+        let empty_reviewed = HashSet::new();
+        keyboard::find_next_position(
+            ctx.active_cursor.get_untracked(),
+            dir,
+            target,
+            files,
+            mode,
+            &empty_reviewed,
+            &collapsed,
+        )
+    } else {
+        let collapsed: HashSet<String> = ctx.overview_expanded_files.with_untracked(|expanded| {
+            files
+                .iter()
+                .filter(|f| !expanded.contains(&f.path))
+                .map(|f| f.path.clone())
+                .collect()
+        });
+        // Any file explicitly expanded inline in Overview should remain keyboard-navigable
+        // even if it is already marked Viewed.
+        let empty_reviewed = HashSet::new();
+        keyboard::find_next_position(
+            ctx.active_cursor.get_untracked(),
+            dir,
+            target,
+            files,
+            mode,
+            &empty_reviewed,
+            &collapsed,
+        )
+    };
     if let Some(next) = next {
         ctx.active_cursor.set(Some(next));
         let block = if target == NavigationTarget::File {
@@ -2918,7 +3477,7 @@ fn scroll_cursor(
     }
 }
 
-fn toggle_file_viewed_and_collapse(ctx: AppCtx, commit: &str, path: &str) {
+fn toggle_file_viewed(ctx: AppCtx, commit: &str, path: &str, collapse_in_overview: bool) {
     let mut now_viewed = false;
     ctx.reviewed_files.update(|set| {
         if !set.remove(path) {
@@ -2927,13 +3486,32 @@ fn toggle_file_viewed_and_collapse(ctx: AppCtx, commit: &str, path: &str) {
         }
         state::save_viewed_files(&ctx.repo_root_string(), commit, set);
     });
-    ctx.collapsed_files.update(|set| {
-        if now_viewed {
-            set.insert(String::from(path));
-        } else {
+    if collapse_in_overview && now_viewed {
+        ctx.overview_expanded_files.update(|set| {
             set.remove(path);
-        }
-    });
+        });
+    }
+}
+
+fn mark_viewed_and_advance_single_file(
+    ctx: AppCtx,
+    commit: &str,
+    path: &str,
+    files: &[Arc<DiffFile>],
+) {
+    let already_reviewed = ctx.reviewed_files.with_untracked(|set| set.contains(path));
+    if !already_reviewed {
+        toggle_file_viewed(ctx, commit, path, false);
+    }
+    let cur_idx = files.iter().position(|f| f.path == path).unwrap_or(0);
+    let next_idx = ctx
+        .reviewed_files
+        .with_untracked(|updated| keyboard::next_unviewed_file_index(cur_idx, files, updated));
+    if let Some(next_idx) = next_idx {
+        navigate_to_file(ctx, files[next_idx].path.clone(), true);
+    } else {
+        navigate_to_overview(ctx);
+    }
 }
 
 #[cfg(test)]

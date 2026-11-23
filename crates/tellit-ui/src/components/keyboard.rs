@@ -474,6 +474,22 @@ fn open_line_budget<F: Borrow<DiffFile>>(
         .saturating_add(1)
 }
 
+/// Returns the adjacent file index in `0..total` without wrapping (for single-file stepping).
+#[must_use]
+pub fn adjacent_file_index(
+    current: usize,
+    total: usize,
+    dir: NavigationDirection,
+) -> Option<usize> {
+    if total == 0 || current >= total {
+        return None;
+    }
+    match dir {
+        NavigationDirection::Next => (current + 1 < total).then_some(current + 1),
+        NavigationDirection::Prev => current.checked_sub(1),
+    }
+}
+
 /// Returns the first unviewed file index strictly following `after_index`, wrapping around.
 #[must_use]
 pub fn next_unviewed_file_index<F: Borrow<DiffFile>>(
@@ -867,5 +883,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(wrapped.file_index, 0);
+    }
+
+    #[test]
+    fn adjacent_file_index_and_next_unviewed_cover_single_file_transitions() {
+        assert_eq!(adjacent_file_index(0, 0, NavigationDirection::Next), None);
+        assert_eq!(adjacent_file_index(0, 3, NavigationDirection::Prev), None);
+        assert_eq!(
+            adjacent_file_index(0, 3, NavigationDirection::Next),
+            Some(1)
+        );
+        assert_eq!(
+            adjacent_file_index(2, 3, NavigationDirection::Prev),
+            Some(1)
+        );
+        assert_eq!(adjacent_file_index(2, 3, NavigationDirection::Next), None);
+
+        let files = alloc::vec![
+            mk_file("Commit Message", Vec::new()),
+            mk_file("src/a.rs", Vec::new()),
+            mk_file("src/b.rs", Vec::new()),
+        ];
+        let mut reviewed = HashSet::new();
+        reviewed.insert(String::from("Commit Message"));
+        assert_eq!(next_unviewed_file_index(0, &files, &reviewed), Some(1));
+        reviewed.insert(String::from("src/a.rs"));
+        assert_eq!(next_unviewed_file_index(1, &files, &reviewed), Some(2));
+        reviewed.insert(String::from("src/b.rs"));
+        // All viewed -> returns None so Shift+V returns cleanly to Change Overview.
+        assert_eq!(next_unviewed_file_index(2, &files, &reviewed), None);
     }
 }

@@ -1133,6 +1133,9 @@ fn build_router(state: Arc<AppState>) -> Router {
     let compressed_routes = Router::new()
         .route("/", get(get_index))
         .route("/index.html", get(get_index))
+        .route("/c", get(get_index))
+        .route("/c/", get(get_index))
+        .route("/c/{*rest}", get(get_index))
         .merge(api_routes)
         .route("/{*path}", get(get_static_asset))
         .layer(axum::middleware::from_fn(compression::compress_response));

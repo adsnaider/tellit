@@ -60,7 +60,8 @@ pub fn HelpModal(#[prop(into)] is_open: Signal<bool>, on_close: Callback<()>) ->
                         </section>
 
                         <section class="help-section">
-                            <h3 class="help-section__title">"File Navigation"</h3>
+                            <h3 class="help-section__title">"File & View Navigation"</h3>
+                            <ShortcutRow keys=&["u"] label="Return to change overview" />
                             <ShortcutRow keys=&["]"] label="Next file" />
                             <ShortcutRow keys=&["["] label="Previous file" />
                             <ShortcutRow keys=&["{"] label="First file" />
@@ -69,10 +70,10 @@ pub fn HelpModal(#[prop(into)] is_open: Signal<bool>, on_close: Callback<()>) ->
 
                         <section class="help-section">
                             <h3 class="help-section__title">"Review & View Actions"</h3>
-                            <ShortcutRow keys=&["u"] label="Unified diff view" />
+                            <ShortcutRow keys=&["Shift+U"] label="Unified diff view" />
                             <ShortcutRow keys=&["s"] label="Split diff view" />
                             <ShortcutRow keys=&["v"] label="Toggle viewed on active file" />
-                            <ShortcutRow keys=&["Shift+V"] label="Mark viewed and go to next unviewed" />
+                            <ShortcutRow keys=&["Shift+V"] label="Mark viewed and open next unviewed (or overview)" />
                             <ShortcutRow keys=&["c"] label="Comment on focused line" />
                             <ShortcutRow keys=&["Shift+L"] label="Toggle comments drawer" />
                             <ShortcutRow keys=&["Shift+C"] label="Copy all comments prompt" />

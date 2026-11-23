@@ -49,6 +49,7 @@ use components::file_list::{FileList, FileTreeEntry};
 use components::help_modal::HelpModal;
 use components::keyboard::{self, CursorPosition, NavigationDirection, NavigationTarget};
 use components::markdown_diff::MarkdownTab;
+use components::markdown_diff::scroll_anchor::{TabScrollAnchor, switch_markdown_tab_for_line};
 use components::review_dot::ReviewDot;
 use components::revision_selector::{
     JjChangeSelector, JjCommitComparisonSelector, commit_ids_match, pick_initial_change,
@@ -107,6 +108,7 @@ pub(crate) struct FileCardSlot {
     pub(crate) drag_state: RwSignal<Option<LineSelectionDrag>>,
     pub(crate) active_composer: RwSignal<Option<ActiveComposer>>,
     pub(crate) md_tab: RwSignal<MarkdownTab>,
+    pub(crate) pending_md_scroll: RwSignal<Option<TabScrollAnchor>>,
     pub(crate) is_near_viewport: RwSignal<bool>,
     pub(crate) loading_chunks: RwSignal<bool>,
     pub(crate) load_error: RwSignal<Option<String>>,
@@ -137,6 +139,7 @@ impl FileCardSlot {
         self.drag_state.dispose();
         self.active_composer.dispose();
         self.md_tab.dispose();
+        self.pending_md_scroll.dispose();
         self.is_near_viewport.dispose();
         self.loading_chunks.dispose();
         self.load_error.dispose();
@@ -621,6 +624,7 @@ fn sync_file_slots(
                     slot.file_index.set(idx);
                 }
                 if !same_commits {
+                    slot.pending_md_scroll.set(None);
                     slot.commits
                         .set((loaded.base_commit.clone(), loaded.commit.clone()));
                 }
@@ -634,6 +638,7 @@ fn sync_file_slots(
                     drag_state: RwSignal::new(None),
                     active_composer: RwSignal::new(None),
                     md_tab: RwSignal::new(MarkdownTab::Preview),
+                    pending_md_scroll: RwSignal::new(None),
                     is_near_viewport: RwSignal::new(false),
                     loading_chunks: RwSignal::new(false),
                     load_error: RwSignal::new(None),
@@ -3349,7 +3354,16 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
                         });
                     }
                     if file.path != "Commit Message" && state::is_markdown_file(&file.path) {
-                        slot.md_tab.set(MarkdownTab::Code);
+                        let card_el = web_sys::window()
+                            .and_then(|w| w.document())
+                            .and_then(|d| d.get_element_by_id(&state::file_element_id(&file.path)));
+                        switch_markdown_tab_for_line(
+                            card_el.as_ref(),
+                            slot.md_tab,
+                            slot.pending_md_scroll,
+                            MarkdownTab::Code,
+                            ln,
+                        );
                     }
                     let range = LineRangeSpec { start: ln, end: ln };
                     let snippet = ctx.expanded_lines.with_untracked(|map| {

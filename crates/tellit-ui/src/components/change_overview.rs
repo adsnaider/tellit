@@ -462,6 +462,7 @@ pub fn ChangeOverview(
                                                     drag_state=card_slot.drag_state
                                                     active_composer=card_slot.active_composer
                                                     md_tab=card_slot.md_tab
+                                                    pending_md_scroll=card_slot.pending_md_scroll
                                                     is_near_viewport=card_slot.is_near_viewport
                                                     loading_chunks=card_slot.loading_chunks
                                                     load_error=card_slot.load_error

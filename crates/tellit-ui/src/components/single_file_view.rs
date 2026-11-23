@@ -141,6 +141,7 @@ pub fn SingleFileView(
                             drag_state=slot.drag_state
                             active_composer=slot.active_composer
                             md_tab=slot.md_tab
+                            pending_md_scroll=slot.pending_md_scroll
                             is_near_viewport=slot.is_near_viewport
                             loading_chunks=slot.loading_chunks
                             load_error=slot.load_error

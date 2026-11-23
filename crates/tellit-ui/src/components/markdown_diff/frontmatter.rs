@@ -362,13 +362,16 @@ fn render_frontmatter_value(value: Option<&FrontmatterValue>, depth: usize) -> A
 pub fn FrontmatterDiffTable(
     entries: Vec<FrontmatterDiffEntry>,
     #[prop(optional)] label: Option<String>,
+    #[prop(default = None)] line_end: Option<u32>,
 ) -> impl IntoView {
     if entries.is_empty() {
         return ().into_any();
     }
+    let start_attr = line_end.map(|_| "1");
+    let end_attr = line_end.map(|n| n.to_string());
 
     view! {
-        <div class="fm-wrap">
+        <div class="fm-wrap" data-md-line=start_attr data-md-line-end=end_attr>
             {label.map(|lbl| view! { <div class="fm-label">{lbl}</div> })}
             <table class="fm-table">
                 <thead>
@@ -420,13 +423,16 @@ pub fn FrontmatterDiffTable(
 pub fn FrontmatterSnapshotTable(
     entries: Vec<(String, FrontmatterValue)>,
     #[prop(optional)] label: Option<String>,
+    #[prop(default = None)] line_end: Option<u32>,
 ) -> impl IntoView {
     if entries.is_empty() {
         return ().into_any();
     }
+    let start_attr = line_end.map(|_| "1");
+    let end_attr = line_end.map(|n| n.to_string());
 
     view! {
-        <div class="fm-wrap">
+        <div class="fm-wrap" data-md-line=start_attr data-md-line-end=end_attr>
             {label.map(|lbl| view! { <div class="fm-label">{lbl}</div> })}
             <table class="fm-table">
                 <thead>

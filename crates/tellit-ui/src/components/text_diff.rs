@@ -16,6 +16,7 @@ use leptos::task::spawn_local;
 use tellit_types::{
     CommentSide, DiffFile, DiffLine, DiffLineKind, FileStatus, JjCommentThread, LineRangeSpec,
 };
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
@@ -25,6 +26,10 @@ use crate::components::comments::{
 use crate::components::file_list::status_badge_class;
 use crate::components::image_diff::ImageDiffBody;
 use crate::components::is_plain_primary_click;
+use crate::components::markdown_diff::scroll_anchor::{
+    TabScrollAnchor, clear_chunk_content_visibility_overrides, finish_code_scroll_restore,
+    required_window_limit_for_line, restore_tab_scroll_anchor, switch_markdown_tab,
+};
 use crate::components::markdown_diff::{MarkdownPreviewBody, MarkdownTab};
 use crate::state::{self, AutoCollapseReason, DiffViewMode};
 
@@ -287,6 +292,7 @@ pub fn TextDiffCard(
     drag_state: RwSignal<Option<LineSelectionDrag>>,
     active_composer: RwSignal<Option<ActiveComposer>>,
     md_tab: RwSignal<MarkdownTab>,
+    pending_md_scroll: RwSignal<Option<TabScrollAnchor>>,
     #[prop(into)] is_near_viewport: Signal<bool>,
     #[prop(into)] loading_chunks: Signal<bool>,
     #[prop(into)] load_error: Signal<Option<String>>,
@@ -338,10 +344,37 @@ pub fn TextDiffCard(
         Memo::new(move |_| collapsed_files.with(|set| set.contains(&path_for_collapsed)));
 
     let whole_file_composing = RwSignal::new(false);
+    let md_full_ready = RwSignal::new(false);
     let card_ref = NodeRef::<leptos::html::Article>::new();
     let observed_el = StoredValue::new_local(Option::<web_sys::Element>::None);
     let marked_selection_els = StoredValue::new_local(Vec::<web_sys::Element>::new());
     let selection_sync_pending = StoredValue::new_local(false);
+    let restore_raf_id = StoredValue::new_local(Option::<i32>::None);
+    let restore_raf_cb = StoredValue::new_local(Option::<Closure<dyn FnMut()>>::None);
+    let chunks_cv_overridden = StoredValue::new_local(false);
+    let last_commits = StoredValue::new_local(Option::<(String, String)>::None);
+
+    let cancel_pending_restore_raf = move || {
+        let mut prev_id = None;
+        let _ = restore_raf_id.try_update_value(|slot| {
+            prev_id = slot.take();
+        });
+        if let Some(id) = prev_id
+            && let Some(window) = web_sys::window()
+        {
+            let _ = window.cancel_animation_frame(id);
+        }
+        let _ = restore_raf_cb.try_set_value(None);
+        if chunks_cv_overridden.try_get_value().unwrap_or(false) {
+            let _ = chunks_cv_overridden.try_set_value(false);
+            if let Some(article) = card_ref.try_get_untracked().flatten() {
+                let el: &web_sys::Element = article.as_ref();
+                if el.is_connected() {
+                    clear_chunk_content_visibility_overrides(el);
+                }
+            }
+        }
+    };
 
     Effect::new(move |_| {
         if let Some(article) = card_ref.get()
@@ -353,6 +386,8 @@ pub fn TextDiffCard(
         }
     });
     on_cleanup(move || {
+        cancel_pending_restore_raf();
+        let _ = pending_md_scroll.try_set(None);
         let mut prev = None;
         let _ = observed_el.try_update_value(|slot| {
             prev = slot.take();
@@ -498,6 +533,132 @@ pub fn TextDiffCard(
     };
 
     let show_code = Memo::new(move |_| !is_md || md_tab.get() == MarkdownTab::Code);
+
+    // Clear stale Markdown tab scroll anchors whenever the compared commits change.
+    Effect::new(move |_| {
+        let cur_commits = commits.get();
+        let changed = last_commits.with_value(|prev| {
+            prev.as_ref()
+                .is_some_and(|prev_pair| *prev_pair != cur_commits)
+        });
+        last_commits.set_value(Some(cur_commits));
+        if changed {
+            cancel_pending_restore_raf();
+            let _ = pending_md_scroll.try_set(None);
+        }
+    });
+
+    // Restore viewport scroll position once the destination Markdown tab mounts and lays out.
+    Effect::new(move |_| {
+        if !is_md {
+            return;
+        }
+        let Some(anchor) = pending_md_scroll.get() else {
+            return;
+        };
+        let current_tab = md_tab.get();
+        if current_tab != anchor.target_tab || is_collapsed_sig.get() {
+            cancel_pending_restore_raf();
+            pending_md_scroll.set(None);
+            return;
+        }
+
+        match current_tab {
+            MarkdownTab::Code => {
+                let chunks_loaded = file.with(|f| f.chunks_loaded);
+                if !chunks_loaded {
+                    if load_error.with(Option::is_some) {
+                        pending_md_scroll.set(None);
+                    }
+                    return;
+                }
+                let merged_chunks = merged_chunks_memo.get();
+                let mode = diff_mode.get();
+                if let Some(target_line) = anchor.source_line {
+                    let current_limit = visible_line_limit.get();
+                    if let Some(next_limit) = required_window_limit_for_line(
+                        &merged_chunks,
+                        mode,
+                        current_limit,
+                        target_line,
+                    ) {
+                        visible_line_limit.set(next_limit);
+                        on_window_expanded.run(());
+                        return;
+                    }
+                }
+            }
+            MarkdownTab::Full => {
+                if !is_near_viewport.get() || !md_full_ready.get() {
+                    return;
+                }
+            }
+            MarkdownTab::Preview => {
+                if !is_near_viewport.get() {
+                    return;
+                }
+                if !file.with(|f| f.chunks_loaded) {
+                    if load_error.with(Option::is_some) {
+                        pending_md_scroll.set(None);
+                    }
+                    return;
+                }
+            }
+        }
+
+        pending_md_scroll.set(None);
+        cancel_pending_restore_raf();
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            let _ = restore_raf_id.try_set_value(None);
+            let _current_cb = restore_raf_cb.try_update_value(Option::take);
+            if let Some(article) = card_ref.try_get_untracked().flatten() {
+                let el: &web_sys::Element = article.as_ref();
+                if el.is_connected()
+                    && let Some(follow_up) = restore_tab_scroll_anchor(el, anchor)
+                {
+                    let _ = chunks_cv_overridden.try_set_value(true);
+                    if let Some(win) = web_sys::window() {
+                        let finish_cb = Closure::<dyn FnMut()>::new(move || {
+                            let _ = restore_raf_id.try_set_value(None);
+                            let _finish_self = restore_raf_cb.try_update_value(Option::take);
+                            let _ = chunks_cv_overridden.try_set_value(false);
+                            if let Some(art) = card_ref.try_get_untracked().flatten() {
+                                let card: &web_sys::Element = art.as_ref();
+                                if card.is_connected() {
+                                    finish_code_scroll_restore(card, &follow_up);
+                                }
+                            }
+                        });
+                        if let Ok(follow_id) =
+                            win.request_animation_frame(finish_cb.as_ref().unchecked_ref())
+                        {
+                            let _ = restore_raf_id.try_set_value(Some(follow_id));
+                            let _ = restore_raf_cb.try_set_value(Some(finish_cb));
+                        } else {
+                            let _ = chunks_cv_overridden.try_set_value(false);
+                            clear_chunk_content_visibility_overrides(el);
+                        }
+                    } else {
+                        let _ = chunks_cv_overridden.try_set_value(false);
+                        clear_chunk_content_visibility_overrides(el);
+                    }
+                }
+            }
+        });
+        if let Ok(id) = window.request_animation_frame(cb.as_ref().unchecked_ref()) {
+            restore_raf_id.set_value(Some(id));
+            restore_raf_cb.set_value(Some(cb));
+        }
+    });
+
+    let on_select_md_tab = move |next_tab: MarkdownTab| {
+        let article = card_ref.get_untracked();
+        let card_el: Option<&web_sys::Element> = article.as_deref().map(AsRef::as_ref);
+        switch_markdown_tab(card_el, md_tab, pending_md_scroll, next_tab);
+    };
     let display_path = Memo::new(move |_| {
         file.with(|f| match f.old_path {
             Some(ref old) => alloc::format!("{old} -> {path_for_title}"),
@@ -609,21 +770,21 @@ pub fn TextDiffCard(
                             <button
                                 type="button"
                                 class=move || if md_tab.get() == MarkdownTab::Preview { "segmented__btn segmented__btn--active" } else { "segmented__btn" }
-                                on:click=move |_| md_tab.set(MarkdownTab::Preview)
+                                on:click=move |_| on_select_md_tab(MarkdownTab::Preview)
                             >
                                 "Preview"
                             </button>
                             <button
                                 type="button"
                                 class=move || if md_tab.get() == MarkdownTab::Full { "segmented__btn segmented__btn--active" } else { "segmented__btn" }
-                                on:click=move |_| md_tab.set(MarkdownTab::Full)
+                                on:click=move |_| on_select_md_tab(MarkdownTab::Full)
                             >
                                 "Full"
                             </button>
                             <button
                                 type="button"
                                 class=move || if md_tab.get() == MarkdownTab::Code { "segmented__btn segmented__btn--active" } else { "segmented__btn" }
-                                on:click=move |_| md_tab.set(MarkdownTab::Code)
+                                on:click=move |_| on_select_md_tab(MarkdownTab::Code)
                             >
                                 "Code"
                             </button>
@@ -803,6 +964,9 @@ pub fn TextDiffCard(
                                 </>
                             }.into_any()
                         } else {
+                            let md_meta = Memo::new(move |_| {
+                                file.with(|f| (f.status, f.old_path.clone()))
+                            });
                             let md_preview_panel = is_md.then(|| {
                                 view! {
                                     <div style:display=move || show_code.get().then_some("none")>
@@ -815,8 +979,11 @@ pub fn TextDiffCard(
                                                     <div class="diff-card__summary">"Loading Markdown preview..."</div>
                                                 }.into_any();
                                             }
-                                            let md_file = file.get();
+                                            // Only re-mount when commit IDs or file identity/status change,
+                                            // not when diff chunks finish hydrating (which merged_chunks_memo handles).
+                                            md_meta.track();
                                             let (md_base, md_target) = commits.get();
+                                            let md_file = file.get_untracked();
                                             view! {
                                                 <MarkdownPreviewBody
                                                     file=md_file
@@ -824,6 +991,7 @@ pub fn TextDiffCard(
                                                     base_commit=md_base
                                                     target_commit=md_target
                                                     active_tab=md_tab
+                                                    full_ready=md_full_ready
                                                 />
                                             }.into_any()
                                         }}

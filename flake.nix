@@ -95,6 +95,7 @@
             cargoExtraArgs = "--locked -p tellit-ui";
             nativeBuildInputs = [
               pkgs.lld
+              pkgs.binaryen
             ];
           };
 
@@ -118,6 +119,7 @@
             # takes optional bool values on those flags and misparses a trailing index path.
             TRUNK_OFFLINE = "true";
             TRUNK_BUILD_LOCKED = "true";
+            TRUNK_BUILD_NO_SRI = "true";
             TRUNK_TOOLS_WASM_BINDGEN = wasmBindgenCli.version;
             # Cargo requires every workspace member to have at least one target file on disk.
             postPatch = ''
@@ -130,6 +132,10 @@
               cd crates/tellit-ui
             '';
             postBuild = ''
+              for wasm in ./dist/*_bg.wasm; do
+                wasm-opt -Oz "$wasm" -o "$wasm.opt"
+                mv "$wasm.opt" "$wasm"
+              done
               mv ./dist ../..
               cd ../..
             '';
@@ -227,6 +233,7 @@
             pkgs.trunk
             wasmBindgenCli
             pkgs.lld
+            pkgs.binaryen
             pkgs.dprint
           ];
         };

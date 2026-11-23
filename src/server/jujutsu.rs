@@ -87,6 +87,15 @@ pub struct BlobPayload {
     pub content_type: &'static str,
 }
 
+/// Result of counting lines for `GET /api/line-count/{*path}` with lookup-completeness metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineCountOutcome {
+    /// Serialized old/new line count response payload.
+    pub counts: LineCountResponse,
+    /// `true` when every requested revision lookup succeeded without falling back to `0`.
+    pub all_lookups_succeeded: bool,
+}
+
 #[derive(Debug, Clone)]
 struct CommitMeta {
     commit_id: String,
@@ -577,13 +586,16 @@ impl JujutsuService {
         old_ref: Option<&str>,
         new_ref: Option<&str>,
         old_path: Option<&str>,
-    ) -> Result<LineCountResponse, JujutsuError> {
+    ) -> Result<LineCountOutcome, JujutsuError> {
         let clean_new = validate_repo_relative_path(raw_path)?;
         let new_str = clean_new.to_string_lossy().replace('\\', "/");
         if new_str == COMMIT_MESSAGE_PATH {
-            return Ok(LineCountResponse {
-                old_line_count: Some(0),
-                new_line_count: Some(0),
+            return Ok(LineCountOutcome {
+                counts: LineCountResponse {
+                    old_line_count: Some(0),
+                    new_line_count: Some(0),
+                },
+                all_lookups_succeeded: false,
             });
         }
 
@@ -603,30 +615,33 @@ impl JujutsuService {
             None => None,
         };
 
-        let (old_line_count, new_line_count) = tokio::join!(
+        let ((old_line_count, old_ok), (new_line_count, new_ok)) = tokio::join!(
             async {
                 match old_rev.as_deref() {
-                    Some(rev) => Some(match self.get_blob_content(&clean_old, Some(rev)).await {
-                        Ok(blob) => count_blob_lines(&blob.bytes),
-                        Err(_) => 0,
-                    }),
-                    None => None,
+                    Some(rev) => match self.get_blob_content(&clean_old, Some(rev)).await {
+                        Ok(blob) => (Some(count_blob_lines(&blob.bytes)), true),
+                        Err(_) => (Some(0), false),
+                    },
+                    None => (None, true),
                 }
             },
             async {
                 match new_rev.as_deref() {
-                    Some(rev) => Some(match self.get_blob_content(&new_str, Some(rev)).await {
-                        Ok(blob) => count_blob_lines(&blob.bytes),
-                        Err(_) => 0,
-                    }),
-                    None => None,
+                    Some(rev) => match self.get_blob_content(&new_str, Some(rev)).await {
+                        Ok(blob) => (Some(count_blob_lines(&blob.bytes)), true),
+                        Err(_) => (Some(0), false),
+                    },
+                    None => (None, true),
                 }
             }
         );
 
-        Ok(LineCountResponse {
-            old_line_count,
-            new_line_count,
+        Ok(LineCountOutcome {
+            counts: LineCountResponse {
+                old_line_count,
+                new_line_count,
+            },
+            all_lookups_succeeded: old_ok && new_ok,
         })
     }
 

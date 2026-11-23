@@ -2223,6 +2223,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "flate2",
  "mime_guess",
  "notify",
  "open",

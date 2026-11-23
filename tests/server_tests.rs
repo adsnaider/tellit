@@ -6,9 +6,11 @@ use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::str::FromStr;
 use core::time::Duration;
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::Command;
 
+use flate2::read::GzDecoder;
 use reqwest::StatusCode;
 use tellit_cli::server::{BackgroundServerInfo, ServerConfig, start_server};
 use tellit_types::{
@@ -1209,6 +1211,438 @@ async fn user_settings_get_and_put_persist_and_validate_payloads() {
         .await
         .unwrap();
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+    server.shutdown();
+    server.wait().await.unwrap();
+}
+
+fn gunzip_bytes(compressed: &[u8]) -> Vec<u8> {
+    let mut decoder = GzDecoder::new(compressed);
+    let mut out = Vec::new();
+    decoder
+        .read_to_end(&mut out)
+        .expect("response body must be valid gzip");
+    out
+}
+
+fn header_str(resp: &reqwest::Response, name: reqwest::header::HeaderName) -> Option<&str> {
+    resp.headers().get(name).and_then(|v| v.to_str().ok())
+}
+
+#[tokio::test]
+async fn gzip_compression_applies_to_json_and_static_assets_and_respects_accept_encoding() {
+    let repo = setup_jj_test_repo();
+    let root = repo.path();
+
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn alpha() -> i32 { 1 }\npub fn beta() -> i32 { 2 }\n".repeat(40),
+    )
+    .unwrap();
+    run_jj_test(root, &["describe", "-m", "feat: add compressible source"]);
+    let commit_oid = run_jj_test(root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+
+    let web_dir = root.join("web");
+    fs::create_dir_all(&web_dir).unwrap();
+    let wasm_payload = [b"\0asm\x01\x00\x00\x00".as_slice(), &vec![b'A'; 32 * 1024]].concat();
+    let js_payload = "export function renderDiff() { return 'tellit'; }\n".repeat(20);
+    let css_payload = ".diff-card { contain: content; color: #eee; }\n".repeat(20);
+    let png_payload = [b"\x89PNG\r\n\x1a\n".as_slice(), &vec![0x42u8; 4096]].concat();
+
+    fs::write(
+        web_dir.join("tellit-ui-8aaef9e7a356ea33_bg.wasm"),
+        &wasm_payload,
+    )
+    .unwrap();
+    fs::write(web_dir.join("tellit-ui-8aaef9e7a356ea33.js"), &js_payload).unwrap();
+    fs::write(web_dir.join("styles-0123456789abcdef.css"), &css_payload).unwrap();
+    fs::write(web_dir.join("preview.png"), &png_payload).unwrap();
+
+    let server = start_server(
+        ServerConfig::new(root.to_path_buf())
+            .with_port(Some(0))
+            .with_web_dir(Some(web_dir))
+            .with_keep_alive(true),
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+
+    // Large WASM (> 16 KiB spawn_blocking threshold), JS, CSS, and diff JSON compress with gzip.
+    let wasm_resp = client
+        .get(format!("{}/tellit-ui-8aaef9e7a356ea33_bg.wasm", server.url))
+        .header(reqwest::header::ACCEPT_ENCODING, "br, gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wasm_resp.status(), StatusCode::OK);
+    assert_eq!(
+        header_str(&wasm_resp, reqwest::header::CONTENT_ENCODING),
+        Some("gzip")
+    );
+    assert_eq!(
+        header_str(&wasm_resp, reqwest::header::VARY),
+        Some("accept-encoding")
+    );
+    let wasm_wire = wasm_resp.bytes().await.unwrap();
+    assert!(wasm_wire.len() < wasm_payload.len());
+    assert_eq!(gunzip_bytes(&wasm_wire), wasm_payload);
+
+    let js_resp = client
+        .get(format!("{}/tellit-ui-8aaef9e7a356ea33.js", server.url))
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        header_str(&js_resp, reqwest::header::CONTENT_ENCODING),
+        Some("gzip")
+    );
+    let js_wire = js_resp.bytes().await.unwrap();
+    assert_eq!(
+        String::from_utf8(gunzip_bytes(&js_wire)).unwrap(),
+        js_payload
+    );
+
+    let css_resp = client
+        .get(format!("{}/styles-0123456789abcdef.css", server.url))
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        header_str(&css_resp, reqwest::header::CONTENT_ENCODING),
+        Some("gzip")
+    );
+    let css_wire = css_resp.bytes().await.unwrap();
+    assert_eq!(
+        String::from_utf8(gunzip_bytes(&css_wire)).unwrap(),
+        css_payload
+    );
+
+    let diff_resp = client
+        .get(format!("{}/api/jj/diff?target={commit_oid}", server.url))
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip, deflate")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(diff_resp.status(), StatusCode::OK);
+    assert_eq!(
+        header_str(&diff_resp, reqwest::header::CONTENT_ENCODING),
+        Some("gzip")
+    );
+    assert_eq!(
+        header_str(&diff_resp, reqwest::header::VARY),
+        Some("accept-encoding")
+    );
+    let diff_wire = diff_resp.bytes().await.unwrap();
+    let diff_json = gunzip_bytes(&diff_wire);
+    assert!(diff_wire.len() < diff_json.len());
+    let parsed_diff: JjDiffResponse = serde_json::from_slice(&diff_json).unwrap();
+    assert_eq!(parsed_diff.commit, commit_oid);
+
+    // Without Accept-Encoding or with gzip;q=0, responses stay uncompressed while advertising Vary.
+    let plain_js = client
+        .get(format!("{}/tellit-ui-8aaef9e7a356ea33.js", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        header_str(&plain_js, reqwest::header::CONTENT_ENCODING),
+        None
+    );
+    assert_eq!(
+        header_str(&plain_js, reqwest::header::VARY),
+        Some("accept-encoding")
+    );
+    assert_eq!(plain_js.text().await.unwrap(), js_payload);
+
+    let rejected_gzip = client
+        .get(format!("{}/tellit-ui-8aaef9e7a356ea33.js", server.url))
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip;q=0, *;q=1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        header_str(&rejected_gzip, reqwest::header::CONTENT_ENCODING),
+        None
+    );
+    assert_eq!(rejected_gzip.text().await.unwrap(), js_payload);
+
+    // HEAD responses on compressible routes preserve `Vary: accept-encoding` without compressing.
+    let head_js = client
+        .head(format!("{}/tellit-ui-8aaef9e7a356ea33.js", server.url))
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head_js.status(), StatusCode::OK);
+    assert_eq!(
+        header_str(&head_js, reqwest::header::CONTENT_ENCODING),
+        None
+    );
+    assert_eq!(
+        header_str(&head_js, reqwest::header::VARY),
+        Some("accept-encoding")
+    );
+
+    // Already-compressed image formats must never be gzipped.
+    let png_resp = client
+        .get(format!("{}/preview.png", server.url))
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        header_str(&png_resp, reqwest::header::CONTENT_ENCODING),
+        None
+    );
+    assert_eq!(
+        png_resp.bytes().await.unwrap().as_ref(),
+        png_payload.as_slice()
+    );
+
+    server.shutdown();
+    server.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn sse_endpoints_stream_uncompressed_when_client_accepts_gzip() {
+    let repo = setup_jj_test_repo();
+    let root = repo.path();
+
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn init() {}\n").unwrap();
+    run_jj_test(root, &["describe", "-m", "init"]);
+    let commit_oid = run_jj_test(root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+
+    let server = start_server(
+        ServerConfig::new(root.to_path_buf())
+            .with_port(Some(0))
+            .with_keep_alive(true)
+            .with_heartbeat_timings(Duration::from_millis(25), Duration::from_millis(25)),
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+
+    // `/api/heartbeat` must not compress or buffer even when `Accept-Encoding: gzip` is requested.
+    let mut hb_resp = client
+        .get(format!("{}/api/heartbeat", server.url))
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip, deflate, br")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hb_resp.status(), StatusCode::OK);
+    assert_eq!(
+        header_str(&hb_resp, reqwest::header::CONTENT_ENCODING),
+        None
+    );
+    assert_eq!(
+        header_str(&hb_resp, reqwest::header::CACHE_CONTROL),
+        Some("no-cache, no-transform")
+    );
+    let mut hb_events = Vec::new();
+    while hb_events.len() < 2 {
+        let chunk = tokio::time::timeout(Duration::from_secs(2), hb_resp.chunk())
+            .await
+            .expect("heartbeat SSE stream timed out under Accept-Encoding: gzip")
+            .unwrap()
+            .expect("heartbeat SSE stream closed prematurely");
+        hb_events.extend(extract_sse_data_lines(&String::from_utf8_lossy(&chunk)));
+    }
+    assert_eq!(hb_events[0], HeartbeatEvent::Connected);
+    assert_eq!(hb_events[1], HeartbeatEvent::Ping);
+
+    // `/api/watch` must also stream uncompressed and deliver live events immediately.
+    let mut watch_resp = client
+        .get(format!("{}/api/watch", server.url))
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip, deflate, br")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(watch_resp.status(), StatusCode::OK);
+    assert_eq!(
+        header_str(&watch_resp, reqwest::header::CONTENT_ENCODING),
+        None
+    );
+    assert_eq!(
+        header_str(&watch_resp, reqwest::header::CACHE_CONTROL),
+        Some("no-cache, no-transform")
+    );
+    let first_watch = tokio::time::timeout(Duration::from_secs(2), watch_resp.chunk())
+        .await
+        .expect("watch SSE stream timed out under Accept-Encoding: gzip")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        extract_watch_events(&String::from_utf8_lossy(&first_watch)),
+        vec![WatchEvent::Connected]
+    );
+
+    let comment_status = client
+        .post(format!("{}/api/jj/comments", server.url))
+        .json(&CreateCommentRequest {
+            commit_id: commit_oid,
+            file_path: String::from("src/lib.rs"),
+            line_range: Some(LineRangeSpec { start: 1, end: 1 }),
+            content: String::from("stream check"),
+        })
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(comment_status, StatusCode::OK);
+
+    let second_watch = tokio::time::timeout(Duration::from_secs(2), watch_resp.chunk())
+        .await
+        .expect("watch CommentsChanged timed out under Accept-Encoding: gzip")
+        .unwrap()
+        .unwrap();
+    assert!(
+        extract_watch_events(&String::from_utf8_lossy(&second_watch))
+            .contains(&WatchEvent::CommentsChanged)
+    );
+
+    server.shutdown();
+    server.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn cache_control_headers_distinguish_hashed_assets_commit_oids_and_mutable_refs() {
+    let repo = setup_jj_test_repo();
+    let root = repo.path();
+
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn v1() {}\n").unwrap();
+    run_jj_test(root, &["describe", "-m", "v1"]);
+    let rev1 = run_jj_test(root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+
+    run_jj_test(root, &["new", "-m", "v2"]);
+    fs::write(root.join("src/lib.rs"), "pub fn v2() {}\n").unwrap();
+    run_jj_test(root, &["bookmark", "create", "feat-branch", "-r", "@"]);
+    let rev2 = run_jj_test(root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    let change2 = run_jj_test(root, &["log", "-r", "@", "--no-graph", "-T", "change_id"]);
+    assert_eq!(rev1.len(), 40);
+    assert_eq!(rev2.len(), 40);
+
+    let web_dir = root.join("web");
+    fs::create_dir_all(&web_dir).unwrap();
+    fs::write(web_dir.join("index.html"), "<!doctype html><html></html>").unwrap();
+    fs::write(
+        web_dir.join("tellit-ui-8aaef9e7a356ea33_bg.wasm"),
+        b"\0asm\x01\x00\x00\x00",
+    )
+    .unwrap();
+    fs::write(web_dir.join("tellit-ui-8aaef9e7a356ea33.js"), "export {};").unwrap();
+    fs::write(web_dir.join("styles-0123456789abcdef.css"), "body{}").unwrap();
+    fs::write(web_dir.join("favicon.svg"), "<svg/>").unwrap();
+    fs::write(web_dir.join("app.js"), "export {};").unwrap();
+
+    let server = start_server(
+        ServerConfig::new(root.to_path_buf())
+            .with_port(Some(0))
+            .with_web_dir(Some(web_dir))
+            .with_keep_alive(true),
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+
+    // Static assets: HTML is no-store, content-hashed assets are immutable, unhashed assets are no-cache.
+    let index_resp = client
+        .get(format!("{}/index.html", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        header_str(&index_resp, reqwest::header::CACHE_CONTROL),
+        Some("no-cache, no-store, must-revalidate")
+    );
+    for hashed in [
+        "/tellit-ui-8aaef9e7a356ea33_bg.wasm",
+        "/tellit-ui-8aaef9e7a356ea33.js",
+        "/styles-0123456789abcdef.css",
+    ] {
+        let resp = client
+            .get(format!("{}{hashed}", server.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            header_str(&resp, reqwest::header::CACHE_CONTROL),
+            Some("public, max-age=31536000, immutable"),
+            "expected immutable cache header for {hashed}"
+        );
+    }
+    for unhashed in ["/favicon.svg", "/app.js"] {
+        let resp = client
+            .get(format!("{}{unhashed}", server.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            header_str(&resp, reqwest::header::CACHE_CONTROL),
+            Some("no-cache"),
+            "expected no-cache header for {unhashed}"
+        );
+    }
+
+    // Immutable commit-OID-addressed diff, blob, and line-count responses get private immutable caching.
+    for immutable_api in [
+        format!("/api/jj/diff?target={rev2}"),
+        format!("/api/jj/diff?target={rev2}&base={rev1}"),
+        format!("/api/blob/src/lib.rs?ref={rev2}"),
+        format!("/api/line-count/src/lib.rs?oldRef={rev1}&newRef={rev2}"),
+    ] {
+        let resp = client
+            .get(format!("{}{immutable_api}", server.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "failed {immutable_api}");
+        assert_eq!(
+            header_str(&resp, reqwest::header::CACHE_CONTROL),
+            Some("private, max-age=31536000, immutable"),
+            "expected private immutable cache header for {immutable_api}"
+        );
+    }
+
+    // Mutable refs (`@`, bookmarks, short prefixes, `working`), fallback line counts on
+    // non-existent 40-hex commit OIDs, and mutable endpoints stay no-cache, no-store.
+    let short_rev2 = &rev2[..12];
+    let missing_oid = "ffffffffffffffffffffffffffffffffffffffff";
+    for mutable_api in [
+        String::from("/api/jj/diff?target=@"),
+        String::from("/api/jj/diff?target=feat-branch"),
+        format!("/api/jj/diff?target={short_rev2}"),
+        format!("/api/jj/diff?target={rev2}&base=@-"),
+        String::from("/api/blob/src/lib.rs?ref=@"),
+        String::from("/api/blob/src/lib.rs?ref=working"),
+        String::from("/api/blob/src/lib.rs?ref=feat-branch"),
+        format!("/api/line-count/src/lib.rs?oldRef=@-&newRef={rev2}"),
+        format!("/api/line-count/src/lib.rs?oldRef={missing_oid}&newRef={rev2}"),
+        String::from("/api/jj/status"),
+        String::from("/api/jj/changes"),
+        format!("/api/jj/changes/{change2}/commits"),
+        format!("/api/jj/comments?target={rev2}"),
+        String::from("/api/user-settings"),
+    ] {
+        let resp = client
+            .get(format!("{}{mutable_api}", server.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "failed {mutable_api}");
+        assert_eq!(
+            header_str(&resp, reqwest::header::CACHE_CONTROL),
+            Some("no-cache, no-store"),
+            "expected no-cache, no-store header for {mutable_api}"
+        );
+    }
 
     server.shutdown();
     server.wait().await.unwrap();

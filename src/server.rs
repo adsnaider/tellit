@@ -23,6 +23,7 @@ extern crate alloc;
 
 mod assets;
 mod background;
+mod compression;
 mod diff_parser;
 mod editor;
 mod jujutsu;
@@ -57,9 +58,8 @@ use serde::Deserialize;
 use tellit_types::{
     ApiErrorResponse, ApproveCommitRequest, ApproveCommitResponse, CreateCommentRequest,
     CreateCommentResponse, HeartbeatEvent, JjChangesResponse, JjCommentsResponse,
-    JjCommitsResponse, JjDiffResponse, JjStatusResponse, LineCountResponse, OpenInEditorRequest,
-    OpenInEditorResponse, ReplyCommentRequest, ReplyCommentResponse, ResolveCommentRequest,
-    ResolveCommentResponse,
+    JjCommitsResponse, JjDiffResponse, JjStatusResponse, OpenInEditorRequest, OpenInEditorResponse,
+    ReplyCommentRequest, ReplyCommentResponse, ResolveCommentRequest, ResolveCommentResponse,
 };
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -77,6 +77,8 @@ pub const DEFAULT_HOST: &str = "127.0.0.1";
 
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_DISCONNECT_GRACE: Duration = Duration::from_millis(250);
+const IMMUTABLE_PRIVATE_CACHE: &str = "private, max-age=31536000, immutable";
+const API_NO_STORE_CACHE: &str = "no-cache, no-store";
 
 /// Errors returned when configuring, binding, or running the `tellit` HTTP server.
 #[derive(Debug, Error)]
@@ -649,17 +651,60 @@ async fn get_jj_change_commits(
     Ok(Json(JjCommitsResponse { commits }))
 }
 
+/// Returns `true` when `rev` is a full 40-character hexadecimal commit ID.
+fn is_immutable_commit_oid(rev: &str) -> bool {
+    let trimmed = rev.trim();
+    trimmed.len() == 40 && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Returns `true` when a diff request addresses full 40-character commit IDs and matches the
+/// resolved commit IDs in `diff`.
+fn is_immutable_diff_query(target: &str, base: Option<&str>, diff: &JjDiffResponse) -> bool {
+    let trimmed_target = target.trim();
+    if !is_immutable_commit_oid(trimmed_target) || !diff.commit.eq_ignore_ascii_case(trimmed_target)
+    {
+        return false;
+    }
+    match base.map(str::trim).filter(|s| !s.is_empty()) {
+        None => is_immutable_commit_oid(&diff.base_commit),
+        Some(base_rev) => {
+            is_immutable_commit_oid(base_rev) && diff.base_commit.eq_ignore_ascii_case(base_rev)
+        }
+    }
+}
+
+/// Returns `true` when a line-count query specifies at least one revision and every provided
+/// revision is a full 40-character hexadecimal commit ID.
+fn is_immutable_line_count_query(old_ref: Option<&str>, new_ref: Option<&str>) -> bool {
+    let old = old_ref.map(str::trim).filter(|s| !s.is_empty());
+    let new = new_ref.map(str::trim).filter(|s| !s.is_empty());
+    if old.is_none() && new.is_none() {
+        return false;
+    }
+    old.is_none_or(is_immutable_commit_oid) && new.is_none_or(is_immutable_commit_oid)
+}
+
 async fn get_jj_diff(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DiffQuery>,
-) -> Result<Json<JjDiffResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let target = query.target.or(query.commit).unwrap_or_default();
     let ignore_rebase = query.ignore_rebase.unwrap_or(true);
     let diff = state
         .jj
         .get_diff(&target, query.base.as_deref(), ignore_rebase)
         .await?;
-    Ok(Json(diff))
+    let cache_control = if is_immutable_diff_query(&target, query.base.as_deref(), &diff) {
+        IMMUTABLE_PRIVATE_CACHE
+    } else {
+        API_NO_STORE_CACHE
+    };
+    let mut response = Json(diff).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
+    );
+    Ok(response)
 }
 
 async fn get_jj_comments(
@@ -736,9 +781,14 @@ async fn get_blob(
         header::CONTENT_TYPE,
         HeaderValue::from_static(blob.content_type),
     );
+    let cache_control = if query.rev.as_deref().is_some_and(is_immutable_commit_oid) {
+        IMMUTABLE_PRIVATE_CACHE
+    } else {
+        API_NO_STORE_CACHE
+    };
     headers.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+        HeaderValue::from_static(cache_control),
     );
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -757,8 +807,8 @@ async fn get_line_count(
     State(state): State<Arc<AppState>>,
     AxumPath(path): AxumPath<String>,
     Query(query): Query<LineCountQuery>,
-) -> Result<Json<LineCountResponse>, ApiError> {
-    let counts = state
+) -> Result<Response, ApiError> {
+    let outcome = state
         .jj
         .get_line_count(
             &path,
@@ -767,7 +817,19 @@ async fn get_line_count(
             query.old_path.as_deref(),
         )
         .await?;
-    Ok(Json(counts))
+    let cache_control = if outcome.all_lookups_succeeded
+        && is_immutable_line_count_query(query.old_ref.as_deref(), query.new_ref.as_deref())
+    {
+        IMMUTABLE_PRIVATE_CACHE
+    } else {
+        API_NO_STORE_CACHE
+    };
+    let mut response = Json(outcome.counts).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
+    );
+    Ok(response)
 }
 
 async fn post_open_in_editor(
@@ -900,7 +962,7 @@ async fn get_watch(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn get_index(State(state): State<Arc<AppState>>) -> Response {
-    let asset = assets::load_asset("index.html", state.web_dir.as_deref());
+    let asset = assets::load_asset("index.html", state.web_dir.as_deref()).await;
     assets::into_http_response(asset)
 }
 
@@ -908,14 +970,26 @@ async fn get_static_asset(
     State(state): State<Arc<AppState>>,
     AxumPath(path): AxumPath<String>,
 ) -> Response {
-    let asset = assets::load_asset(&path, state.web_dir.as_deref());
+    let asset = assets::load_asset(&path, state.web_dir.as_deref()).await;
     assets::into_http_response(asset)
 }
 
+async fn default_api_no_store_cache(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    if !response.headers().contains_key(header::CACHE_CONTROL) {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(API_NO_STORE_CACHE),
+        );
+    }
+    response
+}
+
 fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/", get(get_index))
-        .route("/index.html", get(get_index))
+    let api_routes = Router::new()
         .route("/api/jj/status", get(get_jj_status))
         .route("/api/jj/changes", get(get_jj_changes))
         .route(
@@ -943,9 +1017,20 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/user-settings",
             get(get_user_settings).put(put_user_settings),
         )
+        .layer(axum::middleware::from_fn(default_api_no_store_cache));
+
+    let compressed_routes = Router::new()
+        .route("/", get(get_index))
+        .route("/index.html", get(get_index))
+        .merge(api_routes)
+        .route("/{*path}", get(get_static_asset))
+        .layer(axum::middleware::from_fn(compression::compress_response));
+
+    // Keep SSE routes outside the compression layer so event frames flush immediately.
+    Router::new()
         .route("/api/heartbeat", get(get_heartbeat))
         .route("/api/watch", get(get_watch))
-        .route("/{*path}", get(get_static_asset))
+        .merge(compressed_routes)
         .with_state(state)
 }
 
@@ -1090,5 +1175,64 @@ mod tests {
         assert!(!is_external_bind_addr(v6_loop));
         assert!(is_external_bind_addr(v4_any));
         assert!(is_external_bind_addr(v6_any));
+    }
+
+    #[test]
+    fn immutable_commit_oid_requires_full_40_char_hex() {
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        assert!(is_immutable_commit_oid(oid));
+        assert!(is_immutable_commit_oid(&alloc::format!("  {oid}  ")));
+        assert!(is_immutable_commit_oid(&oid.to_ascii_uppercase()));
+
+        assert!(!is_immutable_commit_oid(""));
+        assert!(!is_immutable_commit_oid("@"));
+        assert!(!is_immutable_commit_oid("@-"));
+        assert!(!is_immutable_commit_oid("main"));
+        assert!(!is_immutable_commit_oid("working"));
+        assert!(!is_immutable_commit_oid(&oid[..12]));
+        assert!(!is_immutable_commit_oid(&oid[..39]));
+        assert!(!is_immutable_commit_oid(&alloc::format!("{oid}0")));
+        assert!(!is_immutable_commit_oid(
+            "ysxkykzrroro0123456789abcdef0123456789ab"
+        ));
+    }
+
+    #[test]
+    fn immutable_diff_and_line_count_queries_reject_mutable_refs() {
+        let oid1 = "0123456789abcdef0123456789abcdef01234567";
+        let oid2 = "fedcba9876543210fedcba9876543210fedcba98";
+        let diff = JjDiffResponse {
+            commit: String::from(oid2),
+            base_commit: String::from(oid1),
+            files: alloc::vec![],
+            is_empty: true,
+            is_rebase_diff: false,
+            rebase_ignored: false,
+            rebase_conflict: false,
+        };
+
+        assert!(is_immutable_diff_query(oid2, None, &diff));
+        assert!(is_immutable_diff_query(oid2, Some(""), &diff));
+        assert!(is_immutable_diff_query(oid2, Some(oid1), &diff));
+        assert!(!is_immutable_diff_query("@", None, &diff));
+        assert!(!is_immutable_diff_query(oid2, Some("@-"), &diff));
+        assert!(!is_immutable_diff_query(oid2, Some("main"), &diff));
+        // A 40-hex string that resolved to a different commit ID (e.g. bookmark collision) is mutable.
+        assert!(!is_immutable_diff_query(oid1, None, &diff));
+
+        // A degraded parent diff whose `fetch_commit_meta` failed falls back to `{oid}-` and must not cache.
+        let degraded_diff = JjDiffResponse {
+            base_commit: alloc::format!("{oid2}-"),
+            ..diff
+        };
+        assert!(!is_immutable_diff_query(oid2, None, &degraded_diff));
+
+        assert!(is_immutable_line_count_query(Some(oid1), Some(oid2)));
+        assert!(is_immutable_line_count_query(Some(oid1), None));
+        assert!(is_immutable_line_count_query(None, Some(oid2)));
+        assert!(!is_immutable_line_count_query(None, None));
+        assert!(!is_immutable_line_count_query(Some(""), Some("")));
+        assert!(!is_immutable_line_count_query(Some("@-"), Some(oid2)));
+        assert!(!is_immutable_line_count_query(Some(oid1), Some("working")));
     }
 }

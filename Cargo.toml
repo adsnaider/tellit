@@ -36,6 +36,7 @@ path = "src/main.rs"
 anyhow = "1.0"
 axum = "0.8"
 clap = { version = "4.6.7", features = ["derive"] }
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 mime_guess = "2.0"
 notify = "8.2"
 open = "5.4"
@@ -46,7 +47,7 @@ similar = { version = "3.2", features = ["inline"] }
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 tellit-types.workspace = true
 thiserror = { workspace = true, features = ["std"] }
-tokio = { version = "1.44", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.44", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 walkdir = "2.5"
@@ -54,3 +55,11 @@ walkdir = "2.5"
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 tempfile = "3.17"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+
+[profile.release.package.tellit-ui]
+opt-level = "s"

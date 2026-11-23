@@ -690,16 +690,30 @@ async fn get_jj_diff(
 ) -> Result<Response, ApiError> {
     let target = query.target.or(query.commit).unwrap_or_default();
     let ignore_rebase = query.ignore_rebase.unwrap_or(true);
-    let diff = state
+    let outcome = state
         .jj
         .get_diff(&target, query.base.as_deref(), ignore_rebase)
         .await?;
-    let cache_control = if is_immutable_diff_query(&target, query.base.as_deref(), &diff) {
-        IMMUTABLE_PRIVATE_CACHE
-    } else {
-        API_NO_STORE_CACHE
-    };
-    let mut response = Json(diff).into_response();
+    if outcome.is_working_copy_parent_diff {
+        let rel_paths = outcome
+            .response
+            .files
+            .iter()
+            .filter(|file| file.path != diff_parser::COMMIT_MESSAGE_PATH)
+            .flat_map(|file| {
+                core::iter::once(PathBuf::from(&file.path))
+                    .chain(file.old_path.as_deref().map(PathBuf::from))
+            })
+            .collect();
+        state.watch.update_working_copy_files(rel_paths);
+    }
+    let cache_control =
+        if is_immutable_diff_query(&target, query.base.as_deref(), &outcome.response) {
+            IMMUTABLE_PRIVATE_CACHE
+        } else {
+            API_NO_STORE_CACHE
+        };
+    let mut response = Json(outcome.response).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static(cache_control),

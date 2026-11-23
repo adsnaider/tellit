@@ -29,7 +29,7 @@ const MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
 
 const JJ_CHANGE_FIELDS_EXPR: &str = r#"change_id ++ "\t" ++ change_id.shortest() ++ "\t" ++ commit_id ++ "\t" ++ if(current_working_copy, "1", "0") ++ "\t" ++ if(empty, "1", "0") ++ "\t" ++ if(immutable, "1", "0") ++ "\t" ++ if(conflict, "1", "0") ++ "\t" ++ if(root, "1", "0") ++ "\t" ++ bookmarks.map(|b| b.name()).join(",") ++ "\t" ++ parents.map(|p| p.commit_id()).join(",") ++ "\t" ++ if(author.name(), author.name(), author.email()) ++ "\t" ++ committer.timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ description.first_line()"#;
 
-const JJ_COMMIT_META_TEMPLATE: &str = r#"commit_id ++ "\t" ++ change_id ++ "\t" ++ parents.map(|p| p.commit_id()).join(",") ++ "\t" ++ description.escape_json() ++ "\n""#;
+const JJ_COMMIT_META_TEMPLATE: &str = r#"commit_id ++ "\t" ++ change_id ++ "\t" ++ parents.map(|p| p.commit_id()).join(",") ++ "\t" ++ if(current_working_copy, "1", "0") ++ "\t" ++ description.escape_json() ++ "\n""#;
 
 const JJ_EVOLOG_TEMPLATE: &str = r#"commit.commit_id() ++ "\t" ++ commit.committer().timestamp().format("%Y-%m-%d %H:%M:%S") ++ "\t" ++ if(commit.current_working_copy(), "1", "0") ++ "\t" ++ commit.parents().map(|p| p.commit_id()).join(",") ++ "\t" ++ commit.description().escape_json() ++ "\t" ++ commit.description().first_line() ++ "\n""#;
 
@@ -96,11 +96,21 @@ pub struct LineCountOutcome {
     pub all_lookups_succeeded: bool,
 }
 
+/// Result of computing a diff for `GET /api/jj/diff` with working-copy watch metadata.
+#[derive(Debug, Clone)]
+pub struct DiffOutcome {
+    /// Serialized diff payload returned to the client.
+    pub response: JjDiffResponse,
+    /// `true` when this diff represents the current working-copy commit (`@`) against its parent.
+    pub is_working_copy_parent_diff: bool,
+}
+
 #[derive(Debug, Clone)]
 struct CommitMeta {
     commit_id: String,
     change_id: String,
     parents: Vec<String>,
+    is_working_copy: bool,
     description: String,
 }
 
@@ -235,6 +245,7 @@ impl JujutsuService {
                     commit_id: entry.commit_id.clone(),
                     change_id: String::from(trimmed),
                     parents: entry.parents.clone(),
+                    is_working_copy: entry.is_working_copy,
                     description: entry.description.clone(),
                 },
             );
@@ -398,7 +409,7 @@ impl JujutsuService {
         target: &str,
         base: Option<&str>,
         ignore_rebase: bool,
-    ) -> Result<JjDiffResponse, JujutsuError> {
+    ) -> Result<DiffOutcome, JujutsuError> {
         let trimmed_target = target.trim();
         if trimmed_target.is_empty() {
             return Err(JujutsuError::InvalidInput(String::from(
@@ -502,14 +513,20 @@ impl JujutsuService {
                 .unwrap_or_else(|| alloc::format!("{resolved_target}-")),
         };
 
-        Ok(JjDiffResponse {
-            commit: resolved_target,
-            base_commit: effective_base,
-            files,
-            is_empty,
-            is_rebase_diff,
-            rebase_ignored,
-            rebase_conflict,
+        let is_working_copy_parent_diff =
+            !is_inter_diff && target_meta.as_ref().is_some_and(|m| m.is_working_copy);
+
+        Ok(DiffOutcome {
+            response: JjDiffResponse {
+                commit: resolved_target,
+                base_commit: effective_base,
+                files,
+                is_empty,
+                is_rebase_diff,
+                rebase_ignored,
+                rebase_conflict,
+            },
+            is_working_copy_parent_diff,
         })
     }
 
@@ -1239,7 +1256,7 @@ impl JujutsuService {
             .ok()?;
         let line = output.lines().find(|l| !l.trim().is_empty())?;
         let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 4 {
+        if parts.len() < 5 {
             return None;
         }
         let commit_id = parts[0].trim();
@@ -1252,11 +1269,13 @@ impl JujutsuService {
             .filter(|s| !s.is_empty())
             .map(String::from)
             .collect();
-        let description = serde_json::from_str::<String>(parts[3]).unwrap_or_default();
+        let is_working_copy = parts[3].trim() == "1";
+        let description = serde_json::from_str::<String>(parts[4]).unwrap_or_default();
         Some(CommitMeta {
             commit_id: String::from(commit_id),
             change_id: String::from(change_id),
             parents,
+            is_working_copy,
             description,
         })
     }
@@ -1403,6 +1422,47 @@ impl JujutsuService {
         run_command_with_retry("git", &self.repo_path, args, env_pair)
             .await
             .ok()
+    }
+}
+
+/// Lists repository-relative paths modified in the current working-copy commit (`@`) without
+/// snapshotting the working copy.
+pub async fn list_working_copy_diff_files(repo_path: &Path) -> Option<Vec<PathBuf>> {
+    let args = [
+        "--no-pager",
+        "--ignore-working-copy",
+        "diff",
+        "--revision=@",
+        "--name-only",
+    ];
+    let output = run_command_with_retry("jj", repo_path, &args, None)
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let paths = stdout
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    Some(paths)
+}
+
+/// Resolves the root directory of the active Jujutsu workspace containing `repo_dir`.
+#[must_use]
+pub fn find_jj_workspace_root(repo_dir: &Path) -> Option<PathBuf> {
+    let start_dir = repo_dir
+        .canonicalize()
+        .unwrap_or_else(|_| repo_dir.to_path_buf());
+    let mut cur = start_dir.as_path();
+    loop {
+        if cur.join(".jj").is_dir() {
+            return Some(cur.to_path_buf());
+        }
+        cur = cur.parent()?;
     }
 }
 

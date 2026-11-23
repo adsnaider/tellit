@@ -1647,3 +1647,188 @@ async fn cache_control_headers_distinguish_hashed_assets_commit_oids_and_mutable
     server.shutdown();
     server.wait().await.unwrap();
 }
+
+async fn wait_for_watch_event(
+    resp: &mut reqwest::Response,
+    expected: WatchEvent,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, resp.chunk()).await {
+            Ok(Ok(Some(chunk))) => {
+                if extract_watch_events(&String::from_utf8_lossy(&chunk)).contains(&expected) {
+                    return true;
+                }
+            }
+            Ok(Ok(None)) | Err(_) => return false,
+            Ok(Err(err)) => panic!("watch stream read error: {err}"),
+        }
+    }
+    false
+}
+
+#[tokio::test]
+async fn watch_targets_only_diffed_files_handles_atomic_saves_store_and_jj_op_refresh() {
+    let repo = setup_jj_test_repo();
+    let root = repo.path();
+
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("unrelated/deep")).unwrap();
+    fs::create_dir_all(root.join("target/debug")).unwrap();
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    fs::write(root.join("src/unrelated.rs"), "pub fn untouched() {}\n").unwrap();
+    fs::write(root.join("unrelated/deep/file.txt"), "base\n").unwrap();
+    run_jj_test(root, &["describe", "-m", "base"]);
+
+    // Working copy (`@`) modifies only `src/main.rs`.
+    run_jj_test(root, &["new", "-m", "feat: edit main only"]);
+    fs::write(
+        root.join("src/main.rs"),
+        "fn main() { println!(\"v1\"); }\n",
+    )
+    .unwrap();
+    run_jj_test(root, &["status"]);
+
+    let server = start_server(
+        ServerConfig::new(root.to_path_buf())
+            .with_port(Some(0))
+            .with_keep_alive(true),
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+
+    let mut watch_resp = client
+        .get(format!("{}/api/watch", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(watch_resp.status(), StatusCode::OK);
+    assert!(
+        wait_for_watch_event(
+            &mut watch_resp,
+            WatchEvent::Connected,
+            Duration::from_secs(2)
+        )
+        .await,
+        "expected initial Connected event on /api/watch"
+    );
+
+    // Fetch working-copy diff so the targeted watch set is synchronized.
+    let diff_status = client
+        .get(format!("{}/api/jj/diff?target=@", server.url))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(diff_status, StatusCode::OK);
+    // Allow the watch task a moment to apply the updated watch set.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 1. Edits to `target/`, untouched nested directories, and untracked siblings inside the
+    //    watched `src/` directory must NOT emit `WorkingTree` reload events.
+    fs::write(root.join("target/debug/build.out"), "artifact\n").unwrap();
+    fs::write(root.join("unrelated/deep/file.txt"), "changed\n").unwrap();
+    fs::write(
+        root.join("src/unrelated.rs"),
+        "pub fn untouched() { /* edit */ }\n",
+    )
+    .unwrap();
+    let unexpected = tokio::time::timeout(Duration::from_millis(600), watch_resp.chunk()).await;
+    assert!(
+        unexpected.is_err(),
+        "edits to unrelated dirs or sibling files must not trigger watch events"
+    );
+
+    // 2. Atomic editor save (write temp file + rename) on diffed `src/main.rs` emits WorkingTree.
+    let tmp_path = root.join("src/.main.rs.tmp");
+    fs::write(&tmp_path, "fn main() { println!(\"atomic\"); }\n").unwrap();
+    fs::rename(&tmp_path, root.join("src/main.rs")).unwrap();
+    assert!(
+        wait_for_watch_event(
+            &mut watch_resp,
+            WatchEvent::Reload {
+                source: WatchSource::WorkingTree,
+            },
+            Duration::from_secs(3),
+        )
+        .await,
+        "atomic rename save on diffed file must emit WorkingTree reload"
+    );
+
+    // 3. External `.tellit/` creation and subsequent nested edits emit CommentsChanged.
+    let ext_thread = root.join(".tellit/ext/commit/thread.json");
+    fs::create_dir_all(ext_thread.parent().unwrap()).unwrap();
+    fs::write(&ext_thread, "{}\n").unwrap();
+    assert!(
+        wait_for_watch_event(
+            &mut watch_resp,
+            WatchEvent::CommentsChanged,
+            Duration::from_secs(3),
+        )
+        .await,
+        "creating .tellit/ store on disk must emit CommentsChanged"
+    );
+
+    fs::write(&ext_thread, "{\"updated\":true}\n").unwrap();
+    assert!(
+        wait_for_watch_event(
+            &mut watch_resp,
+            WatchEvent::CommentsChanged,
+            Duration::from_secs(3),
+        )
+        .await,
+        "modifying nested file inside .tellit/ must emit CommentsChanged"
+    );
+
+    // 4. Adding a new file in a new directory and snapshotting via `jj` emits JjOp AND refreshes
+    //    the watched diffed-file set without any `/api/jj/diff` call.
+    fs::create_dir_all(root.join("extra")).unwrap();
+    fs::write(root.join("extra/added.rs"), "pub fn added() {}\n").unwrap();
+    run_jj_test(root, &["status"]);
+    assert!(
+        wait_for_watch_event(
+            &mut watch_resp,
+            WatchEvent::Reload {
+                source: WatchSource::JjOp,
+            },
+            Duration::from_secs(3),
+        )
+        .await,
+        "jj op_heads update must emit JjOp reload"
+    );
+
+    // Wait briefly for the post-JjOp background `jj diff --name-only` refresh, then edit the newly
+    // diffed file and confirm WorkingTree fires.
+    let mut saw_refreshed_working = false;
+    for attempt in 0..5 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        fs::write(
+            root.join("extra/added.rs"),
+            format!("pub fn added() -> usize {{ {attempt} }}\n"),
+        )
+        .unwrap();
+        if wait_for_watch_event(
+            &mut watch_resp,
+            WatchEvent::Reload {
+                source: WatchSource::WorkingTree,
+            },
+            Duration::from_millis(700),
+        )
+        .await
+        {
+            saw_refreshed_working = true;
+            break;
+        }
+    }
+    assert!(
+        saw_refreshed_working,
+        "post-JjOp refresh must watch newly added working-copy diffed files"
+    );
+
+    drop(watch_resp);
+    server.shutdown();
+    server.wait().await.unwrap();
+}

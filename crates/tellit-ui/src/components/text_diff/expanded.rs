@@ -1,50 +1,258 @@
-//! Hidden context line expansion and adjacent hunk merging state.
+//! Hidden context line expansion, auto-expanded comment context, and hunk merging state.
 
 extern crate alloc;
 
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use tellit_types::{DiffChunk, DiffFile, DiffLine, DiffLineKind, FileStatus};
+use tellit_types::{
+    CommentSide, DiffChunk, DiffFile, DiffLine, DiffLineKind, FileStatus, HighlightedLine,
+    HighlightedLinesResponse, JjCommentThread,
+};
 
-/// Default number of context lines revealed per expansion click.
+/// Default number of context lines revealed per manual expansion click.
 pub const DEFAULT_EXPAND_COUNT: u32 = 20;
 
-/// Direction relative to an existing diff hunk in which hidden lines are expanded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExpandDirection {
-    /// Reveal lines immediately preceding the hunk.
-    Up,
-    /// Reveal lines immediately following the hunk.
-    Down,
+/// Lines of context revealed above and below an unresolved comment outside visible diff hunks.
+pub const COMMENT_AUTO_EXPAND_CONTEXT: u32 = 5;
+
+/// Half-open 0-based line offset range `[start_offset, end_offset)` inside one unchanged gap.
+///
+/// `gap_index` addresses the unchanged region immediately before `file.chunks[gap_index]`, or the
+/// trailing region after the final hunk when `gap_index == file.chunks.len()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GapSlice {
+    /// Gap index in `0..=file.chunks.len()`.
+    pub gap_index: usize,
+    /// Inclusive 0-based start offset inside the gap.
+    pub start_offset: u32,
+    /// Exclusive 0-based end offset inside the gap (`end_offset > start_offset`).
+    pub end_offset: u32,
 }
 
-/// Recorded expansion count anchored to one original hunk index and direction.
+/// Unexpanded slice of an unchanged gap immediately before or after a [`MergedChunk`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExpandedRange {
-    /// Original index inside [`DiffFile::chunks`].
-    pub chunk_index: usize,
-    /// Expansion direction relative to `chunk_index`.
-    pub direction: ExpandDirection,
-    /// Cumulative number of lines expanded along that edge.
-    pub count: u32,
+pub struct HiddenGap {
+    /// Gap index in `0..=file.chunks.len()`.
+    pub gap_index: usize,
+    /// Inclusive 0-based start offset of this hidden sub-range inside `gap_index`.
+    pub start_offset: u32,
+    /// Exclusive 0-based end offset of this hidden sub-range inside `gap_index`.
+    pub end_offset: u32,
+    /// 1-based base-file line number corresponding to `start_offset`.
+    pub old_start_line: u32,
+    /// 1-based target-file line number corresponding to `start_offset`.
+    pub new_start_line: u32,
 }
 
-/// Cached full file contents, line counts, and active expansion ranges for one file.
+/// Concrete expansion request derived from a [`HiddenGap`] click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GapSliceRequest {
+    /// Gap slice to mark revealed in [`FileExpandedState`].
+    pub slice: GapSlice,
+    /// Inclusive 1-based target-file line range needed to render `slice`.
+    pub new_line_range: (u32, u32),
+    /// Inclusive 1-based base-file line range needed as fallback.
+    pub old_line_range: (u32, u32),
+}
+
+impl HiddenGap {
+    /// Returns the number of hidden lines covered by this gap.
+    #[must_use]
+    pub const fn line_count(&self) -> u32 {
+        self.end_offset.saturating_sub(self.start_offset)
+    }
+
+    /// Builds a request revealing up to `count` lines from the top of this gap (growing downward).
+    #[must_use]
+    pub const fn take_from_start(&self, count: u32) -> GapSliceRequest {
+        let len = self.line_count();
+        let take = if count < len { count } else { len };
+        let span = take.saturating_sub(1);
+        GapSliceRequest {
+            slice: GapSlice {
+                gap_index: self.gap_index,
+                start_offset: self.start_offset,
+                end_offset: self.start_offset.saturating_add(take),
+            },
+            new_line_range: (
+                self.new_start_line,
+                self.new_start_line.saturating_add(span),
+            ),
+            old_line_range: (
+                self.old_start_line,
+                self.old_start_line.saturating_add(span),
+            ),
+        }
+    }
+
+    /// Builds a request revealing up to `count` lines from the bottom of this gap (growing upward).
+    #[must_use]
+    pub const fn take_from_end(&self, count: u32) -> GapSliceRequest {
+        let len = self.line_count();
+        let take = if count < len { count } else { len };
+        let rel_start = len.saturating_sub(take);
+        let span = take.saturating_sub(1);
+        let new_start = self.new_start_line.saturating_add(rel_start);
+        let old_start = self.old_start_line.saturating_add(rel_start);
+        GapSliceRequest {
+            slice: GapSlice {
+                gap_index: self.gap_index,
+                start_offset: self.start_offset.saturating_add(rel_start),
+                end_offset: self.end_offset,
+            },
+            new_line_range: (new_start, new_start.saturating_add(span)),
+            old_line_range: (old_start, old_start.saturating_add(span)),
+        }
+    }
+
+    /// Builds a request revealing every line in this hidden gap.
+    #[must_use]
+    pub const fn as_full_slice(&self) -> GapSliceRequest {
+        self.take_from_start(self.line_count())
+    }
+}
+
+/// Cached syntax-highlighted source lines for one revision of a file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CachedLines {
+    /// Highlighted lines keyed by 1-based line number.
+    pub by_line: HashMap<u32, HighlightedLine>,
+    /// `true` once every line `1..=total_lines` has been fetched and stored.
+    pub complete: bool,
+}
+
+/// Reference-counted wrapper over [`CachedLines`] with O(1) pointer fast-path equality.
+#[derive(Debug, Clone, Default)]
+pub struct SharedCachedLines(Arc<CachedLines>);
+
+impl PartialEq for SharedCachedLines {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
+impl Eq for SharedCachedLines {}
+
+impl SharedCachedLines {
+    /// Looks up the cached highlighted line at 1-based line number `line_num`.
+    #[must_use]
+    pub fn get(&self, line_num: u32) -> Option<&HighlightedLine> {
+        self.0.by_line.get(&line_num)
+    }
+
+    /// Returns `true` when the full file has been cached.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.0.complete
+    }
+
+    /// Returns `true` when every line in inclusive `start..=end` (clamped to `total_lines` if
+    /// known) is already cached.
+    #[must_use]
+    pub fn has_range(&self, start: u32, end: u32, total_lines: Option<u32>) -> bool {
+        if self.0.complete {
+            return true;
+        }
+        let clamped_start = start.max(1);
+        let clamped_end = match total_lines {
+            Some(total) => end.min(total),
+            None => end,
+        };
+        if clamped_start > clamped_end {
+            return total_lines.is_some();
+        }
+        (clamped_start..=clamped_end).all(|ln| self.0.by_line.contains_key(&ln))
+    }
+
+    /// Inserts highlighted lines returned by `GET /api/lines/{*path}` into the cache.
+    pub fn insert_response(&mut self, resp: HighlightedLinesResponse, full_file_request: bool) {
+        let inner = Arc::make_mut(&mut self.0);
+        let returned_len = u32::try_from(resp.lines.len()).unwrap_or(u32::MAX);
+        for (idx, line) in resp.lines.into_iter().enumerate() {
+            let line_num = resp
+                .start_line
+                .saturating_add(u32::try_from(idx).unwrap_or(u32::MAX));
+            inner.by_line.insert(line_num, line);
+        }
+        if full_file_request || (resp.start_line <= 1 && returned_len >= resp.total_lines) {
+            inner.complete = true;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_full_lines(lines: Vec<HighlightedLine>) -> Self {
+        let mut by_line = HashMap::with_capacity(lines.len());
+        for (idx, line) in lines.into_iter().enumerate() {
+            let line_num = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+            by_line.insert(line_num, line);
+        }
+        Self(Arc::new(CachedLines {
+            by_line,
+            complete: true,
+        }))
+    }
+}
+
+/// Cached highlighted file lines, line counts, and active manual/auto expansions for one file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileExpandedState {
-    /// Lines of the base revision (`old`) file when fetched.
-    pub old_content: Option<Vec<String>>,
-    /// Lines of the target revision (`new`) file when fetched.
-    pub new_content: Option<Vec<String>>,
+    /// Cached highlighted lines of the base revision (`old`) file.
+    pub old_lines: SharedCachedLines,
+    /// Cached highlighted lines of the target revision (`new`) file.
+    pub new_lines: SharedCachedLines,
     /// Total lines in the base revision file.
     pub old_total_lines: Option<u32>,
     /// Total lines in the target revision file.
     pub new_total_lines: Option<u32>,
-    /// Active line expansions anchored to original chunk indices.
-    pub expanded_ranges: Vec<ExpandedRange>,
+    /// Manually revealed gap slices from `ExpandBar` clicks.
+    pub manual_slices: Vec<GapSlice>,
+    /// Automatically revealed gap slices around unresolved inline comments.
+    pub auto_slices: Vec<GapSlice>,
+    /// Unresolved thread keys `(side, start, end)` already attempted for auto-expansion in this diff load.
+    pub attempted_auto_expands: HashSet<(CommentSide, u32, u32)>,
+    /// `true` when the user clicked "Expand file" to reveal every hidden context gap.
+    pub expand_entire_file: bool,
+}
+
+impl FileExpandedState {
+    /// Returns `true` when any manual expansion ("Expand file" or `ExpandBar` click) is active.
+    #[must_use]
+    pub fn has_manual_expansion(&self) -> bool {
+        self.expand_entire_file || !self.manual_slices.is_empty()
+    }
+
+    /// Returns `true` when full highlighted lines are cached for the primary expansion side.
+    #[must_use]
+    pub fn has_complete_lines(&self, status: FileStatus) -> bool {
+        if status == FileStatus::Deleted {
+            self.old_lines.is_complete()
+        } else {
+            self.new_lines.is_complete() || self.old_lines.is_complete()
+        }
+    }
+
+    /// Returns `true` when every line required for the given range is already cached.
+    #[must_use]
+    pub fn has_line_range(
+        &self,
+        status: FileStatus,
+        new_range: (u32, u32),
+        old_range: (u32, u32),
+    ) -> bool {
+        if status == FileStatus::Deleted {
+            self.old_lines
+                .has_range(old_range.0, old_range.1, self.old_total_lines)
+        } else {
+            self.new_lines
+                .has_range(new_range.0, new_range.1, self.new_total_lines)
+                || self
+                    .old_lines
+                    .has_range(old_range.0, old_range.1, self.old_total_lines)
+        }
+    }
 }
 
 /// Reference to one line inside a [`MergedChunk`], avoiding cloning original [`DiffLine`] entries.
@@ -52,12 +260,12 @@ pub struct FileExpandedState {
 pub enum ChunkLineRef {
     /// Original line indexed by `(chunk_index, line_index)` inside `DiffFile::chunks`.
     Original(usize, usize),
-    /// Context line materialized on demand from `/api/blob`.
+    /// Context line materialized on demand from `GET /api/lines`.
     Expanded(Arc<DiffLine>),
 }
 
 impl ChunkLineRef {
-    /// Returns `true` when this line came from `/api/blob` context expansion.
+    /// Returns `true` when this line came from context expansion.
     #[must_use]
     pub fn is_expanded(&self) -> bool {
         matches!(self, Self::Expanded(_))
@@ -86,7 +294,7 @@ pub struct MergedChunk {
     pub new_start: u32,
     /// Line span on the new side across merged hunks.
     pub new_lines: u32,
-    /// Original hunk header string.
+    /// Original or synthetic hunk header string.
     pub header: String,
     /// Ordered references to diff and expanded context lines.
     pub lines: Vec<ChunkLineRef>,
@@ -94,8 +302,12 @@ pub struct MergedChunk {
     pub original_indices: Vec<usize>,
     /// Hidden lines still collapsed immediately above this block.
     pub hidden_lines_before: u32,
+    /// Concrete hidden gap immediately above this block, if `hidden_lines_before > 0`.
+    pub before_gap: Option<HiddenGap>,
     /// Hidden lines still collapsed immediately below the last block (`None` when total file length is unknown).
     pub hidden_lines_after: Option<u32>,
+    /// Concrete hidden gap immediately below the last block, if known and non-empty.
+    pub after_gap: Option<HiddenGap>,
 }
 
 impl MergedChunk {
@@ -135,86 +347,210 @@ impl MergedChunk {
 /// Map of file paths to their cached [`FileExpandedState`].
 pub type ExpandedLinesMap = HashMap<String, FileExpandedState>;
 
-/// Splits text fetched from `/api/blob` into individual source lines without a trailing empty line.
+/// Batched auto-expansion plan for unresolved inline threads outside visible diff hunks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoExpandPlan {
+    /// Coalesced gap slices to record in [`FileExpandedState::auto_slices`].
+    pub slices: Vec<GapSlice>,
+    /// Bounding inclusive 1-based target-file line range covering all `slices`.
+    pub new_line_range: (u32, u32),
+    /// Bounding inclusive 1-based base-file line range covering all `slices`.
+    pub old_line_range: (u32, u32),
+    /// Thread attempt keys `(side, start, end)` represented by this plan.
+    pub attempt_keys: Vec<(CommentSide, u32, u32)>,
+}
+
+/// Returns `true` when `file` can have hidden unchanged context outside its diff hunks.
 #[must_use]
-pub fn split_blob_lines(text: &str) -> Vec<String> {
-    let mut lines: Vec<String> = text
-        .split('\n')
-        .map(|line| String::from(line.strip_suffix('\r').unwrap_or(line)))
-        .collect();
-    if lines.last().is_some_and(String::is_empty) {
-        lines.pop();
-    }
-    lines
+pub fn supports_expansion(file: &DiffFile) -> bool {
+    file.path != "Commit Message"
+        && file.status != FileStatus::Added
+        && file.status != FileStatus::Deleted
 }
 
-/// Records an incremental line expansion in `state` for `file_path`.
-pub fn record_line_expansion(
+/// Returns `true` when `file` still has unexpanded hidden context lines.
+#[must_use]
+pub fn has_hidden_context(
+    file: &DiffFile,
+    merged_chunks: &[MergedChunk],
+    state: Option<&FileExpandedState>,
+) -> bool {
+    if !supports_expansion(file) {
+        return false;
+    }
+    if merged_chunks
+        .iter()
+        .any(|mc| mc.hidden_lines_before > 0 || mc.hidden_lines_after.is_some_and(|n| n > 0))
+    {
+        return true;
+    }
+    if file.chunks.is_empty() && merged_chunks.is_empty() {
+        return state
+            .and_then(|st| st.new_total_lines.or(st.old_total_lines))
+            .is_some_and(|total| total > 0);
+    }
+    false
+}
+
+/// Records a manual gap slice in `map` for `file_path`, coalescing overlapping slices.
+pub fn record_manual_slice(map: &mut ExpandedLinesMap, file_path: &str, slice: GapSlice) {
+    if slice.end_offset <= slice.start_offset {
+        return;
+    }
+    let entry = map.entry(String::from(file_path)).or_default();
+    entry.manual_slices.push(slice);
+    coalesce_gap_slices(&mut entry.manual_slices);
+}
+
+/// Records attempted auto-expand thread keys in `map` for `file_path` to prevent duplicate fetches.
+pub fn record_auto_expand_attempts(
     map: &mut ExpandedLinesMap,
     file_path: &str,
-    chunk_index: usize,
-    direction: ExpandDirection,
-    count: u32,
+    keys: &[(CommentSide, u32, u32)],
 ) {
+    if keys.is_empty() {
+        return;
+    }
     let entry = map.entry(String::from(file_path)).or_default();
-    if let Some(existing) = entry
-        .expanded_ranges
-        .iter_mut()
-        .find(|r| r.chunk_index == chunk_index && r.direction == direction)
-    {
-        existing.count = existing.count.saturating_add(count);
-    } else {
-        entry.expanded_ranges.push(ExpandedRange {
-            chunk_index,
-            direction,
-            count,
-        });
+    for &key in keys {
+        entry.attempted_auto_expands.insert(key);
     }
 }
 
-/// Consolidates the remaining `hidden_lines` gap immediately before `chunk_index`.
-pub fn record_expand_all_before(
-    map: &mut ExpandedLinesMap,
-    file_path: &str,
-    chunk_index: usize,
-    hidden_lines: u32,
-) {
+/// Records auto-expanded comment context slices in `map` for `file_path`.
+pub fn record_auto_slices(map: &mut ExpandedLinesMap, file_path: &str, slices: &[GapSlice]) {
     let entry = map.entry(String::from(file_path)).or_default();
-    let up_count = expanded_count_in(entry, chunk_index, ExpandDirection::Up);
-    let prev_down_count = if chunk_index > 0 {
-        expanded_count_in(entry, chunk_index - 1, ExpandDirection::Down)
-    } else {
-        0
-    };
-    let total = up_count
-        .saturating_add(prev_down_count)
-        .saturating_add(hidden_lines);
-
-    if chunk_index > 0 {
-        entry.expanded_ranges.retain(|r| {
-            !(r.chunk_index == chunk_index - 1 && r.direction == ExpandDirection::Down)
-        });
+    for &slice in slices {
+        if slice.end_offset > slice.start_offset {
+            entry.auto_slices.push(slice);
+        }
     }
+    coalesce_gap_slices(&mut entry.auto_slices);
+}
 
-    if let Some(existing) = entry
-        .expanded_ranges
-        .iter_mut()
-        .find(|r| r.chunk_index == chunk_index && r.direction == ExpandDirection::Up)
-    {
-        existing.count = total;
-    } else {
-        entry.expanded_ranges.push(ExpandedRange {
-            chunk_index,
-            direction: ExpandDirection::Up,
-            count: total,
-        });
+/// Marks every hidden context gap in `file_path` as expanded.
+pub fn record_expand_entire_file(map: &mut ExpandedLinesMap, file_path: &str) {
+    let entry = map.entry(String::from(file_path)).or_default();
+    entry.expand_entire_file = true;
+}
+
+/// Collapses all manual context expansions for `file_path`, preserving cached lines and
+/// auto-expanded unresolved comment context.
+pub fn collapse_manual_expansions(map: &mut ExpandedLinesMap, file_path: &str) {
+    if let Some(entry) = map.get_mut(file_path) {
+        entry.expand_entire_file = false;
+        entry.manual_slices.clear();
     }
 }
 
-struct ExpandedChunkLines {
-    lines: Vec<ChunkLineRef>,
-    old_start: u32,
-    new_start: u32,
+/// Computes an [`AutoExpandPlan`] for any unresolved inline comment on `file` whose line falls
+/// outside `merged_chunks` and has not yet been attempted in `state`.
+#[must_use]
+pub fn compute_auto_expand_plan(
+    file: &DiffFile,
+    merged_chunks: &[MergedChunk],
+    state: Option<&FileExpandedState>,
+    threads: &[JjCommentThread],
+) -> Option<AutoExpandPlan> {
+    if !file.chunks_loaded || !supports_expansion(file) {
+        return None;
+    }
+
+    let covered = collect_merged_line_keys(merged_chunks);
+    let gaps = compute_file_gaps(file, state);
+    if gaps.is_empty() {
+        return None;
+    }
+
+    let mut slices: Vec<GapSlice> = Vec::new();
+    let mut attempt_keys: Vec<(CommentSide, u32, u32)> = Vec::new();
+    let mut min_new = u32::MAX;
+    let mut max_new = 0u32;
+    let mut min_old = u32::MAX;
+    let mut max_old = 0u32;
+
+    for thread in threads {
+        if thread.resolved || thread.file_path != file.path {
+            continue;
+        }
+        let Some(lr) = thread.line_range else {
+            continue;
+        };
+        let key = (thread.side, lr.start, lr.end);
+        let already_attempted = state.is_some_and(|st| st.attempted_auto_expands.contains(&key));
+        if already_attempted || covered.contains(&(thread.side, lr.end)) {
+            continue;
+        }
+
+        let want_start = lr.start.saturating_sub(COMMENT_AUTO_EXPAND_CONTEXT).max(1);
+        let want_end = lr.end.saturating_add(COMMENT_AUTO_EXPAND_CONTEXT);
+        let mut matched_any = false;
+
+        for gap in &gaps {
+            let gap_side_start = match thread.side {
+                CommentSide::Old => gap.old_start,
+                CommentSide::New => gap.new_start,
+            };
+            let gap_side_end = match gap.len {
+                Some(0) => continue,
+                Some(len) => gap_side_start.saturating_add(len).saturating_sub(1),
+                None => {
+                    if want_end < gap_side_start {
+                        continue;
+                    }
+                    want_end.max(gap_side_start)
+                }
+            };
+
+            // Only expand gaps that actually overlap the commented range itself.
+            if lr.end < gap_side_start || lr.start > gap_side_end {
+                continue;
+            }
+
+            let hit_start = want_start.max(gap_side_start);
+            let hit_end = want_end.min(gap_side_end);
+            if hit_start > hit_end {
+                continue;
+            }
+
+            let start_offset = hit_start.saturating_sub(gap_side_start);
+            let end_offset = hit_end.saturating_sub(gap_side_start).saturating_add(1);
+            let span = end_offset.saturating_sub(start_offset).saturating_sub(1);
+
+            let new_start = gap.new_start.saturating_add(start_offset);
+            let new_end = new_start.saturating_add(span);
+            let old_start = gap.old_start.saturating_add(start_offset);
+            let old_end = old_start.saturating_add(span);
+
+            min_new = min_new.min(new_start);
+            max_new = max_new.max(new_end);
+            min_old = min_old.min(old_start);
+            max_old = max_old.max(old_end);
+
+            slices.push(GapSlice {
+                gap_index: gap.gap_index,
+                start_offset,
+                end_offset,
+            });
+            matched_any = true;
+        }
+
+        if matched_any {
+            attempt_keys.push(key);
+        }
+    }
+
+    if slices.is_empty() {
+        return None;
+    }
+
+    coalesce_gap_slices(&mut slices);
+    Some(AutoExpandPlan {
+        slices,
+        new_line_range: (min_new, max_new),
+        old_line_range: (min_old, max_old),
+        attempt_keys,
+    })
 }
 
 /// Computes merged, expansion-aware diff chunks for `file` without cloning original diff lines.
@@ -223,314 +559,467 @@ pub fn merge_chunks_for_file(
     file: &Arc<DiffFile>,
     state: Option<&FileExpandedState>,
 ) -> Vec<MergedChunk> {
-    let mut merged: Vec<MergedChunk> = Vec::with_capacity(file.chunks.len());
+    if !supports_expansion(file) {
+        return file
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(idx, chunk)| {
+                let mut item = MergedChunk {
+                    file: Arc::clone(file),
+                    old_start: chunk.old_start,
+                    old_lines: chunk.old_lines,
+                    new_start: chunk.new_start,
+                    new_lines: chunk.new_lines,
+                    header: chunk.header.clone(),
+                    lines: (0..chunk.lines.len())
+                        .map(|li| ChunkLineRef::Original(idx, li))
+                        .collect(),
+                    original_indices: alloc::vec![idx],
+                    hidden_lines_before: 0,
+                    before_gap: None,
+                    hidden_lines_after: Some(0),
+                    after_gap: None,
+                };
+                update_merged_spans(&mut item);
+                item
+            })
+            .collect();
+    }
 
-    for (idx, chunk) in file.chunks.iter().enumerate() {
-        let ExpandedChunkLines {
-            lines,
-            old_start: start_old,
-            new_start: start_new,
-        } = expand_single_chunk(file, chunk, idx, state);
-        let hidden_before = hidden_lines_before(file, chunk, idx, state);
-        let hidden_after = hidden_lines_after(file, chunk, idx, state);
+    let gaps = compute_file_gaps(file, state);
+    let mut segments: Vec<Segment> = Vec::with_capacity(file.chunks.len() * 3 + 2);
 
-        if let Some(last) = merged.last_mut()
-            && hidden_before == 0
-        {
-            last.lines.extend(lines);
-            last.original_indices.push(idx);
-            last.hidden_lines_after = hidden_after;
-            update_merged_spans(last);
-        } else {
-            let mut item = MergedChunk {
-                file: Arc::clone(file),
-                old_start: start_old,
-                old_lines: chunk.old_lines,
-                new_start: start_new,
-                new_lines: chunk.new_lines,
-                header: chunk.header.clone(),
-                lines,
-                original_indices: alloc::vec![idx],
-                hidden_lines_before: hidden_before,
-                hidden_lines_after: hidden_after,
-            };
-            update_merged_spans(&mut item);
-            merged.push(item);
+    for (gap_idx, &gap) in gaps.iter().enumerate() {
+        push_gap_segments(&mut segments, gap, state);
+        if gap_idx < file.chunks.len() {
+            segments.push(Segment::Hunk(gap_idx));
         }
     }
 
-    merged
+    assemble_merged_chunks(file, state, &segments)
 }
 
-fn expanded_count_in(
-    state: &FileExpandedState,
-    chunk_index: usize,
-    direction: ExpandDirection,
-) -> u32 {
-    state
-        .expanded_ranges
-        .iter()
-        .find(|r| r.chunk_index == chunk_index && r.direction == direction)
-        .map_or(0, |r| r.count)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileGap {
+    gap_index: usize,
+    old_start: u32,
+    new_start: u32,
+    len: Option<u32>,
 }
 
-fn supports_expansion(file: &DiffFile) -> bool {
-    file.path != "Commit Message"
-        && file.status != FileStatus::Added
-        && file.status != FileStatus::Deleted
+enum Segment {
+    Hunk(usize),
+    Context {
+        gap: FileGap,
+        start_offset: u32,
+        end_offset: u32,
+    },
+    Hidden(HiddenGap),
+    UnknownTrailing,
 }
 
 fn use_new_anchor(file: &DiffFile) -> bool {
     file.status != FileStatus::Deleted
 }
 
-fn hidden_lines_before(
-    file: &DiffFile,
-    chunk: &DiffChunk,
-    chunk_index: usize,
-    state: Option<&FileExpandedState>,
-) -> u32 {
-    if !supports_expansion(file) {
-        return 0;
+const fn chunk_old_end(chunk: &DiffChunk) -> u32 {
+    if chunk.old_lines == 0 {
+        chunk.old_start
+    } else {
+        chunk
+            .old_start
+            .saturating_add(chunk.old_lines)
+            .saturating_sub(1)
     }
+}
 
-    let raw_hidden = if let Some(prev) = chunk_index.checked_sub(1).and_then(|p| file.chunks.get(p))
-    {
-        if use_new_anchor(file) {
-            chunk
-                .new_start
-                .saturating_sub(prev.new_start.saturating_add(prev.new_lines))
-        } else {
-            chunk
-                .old_start
-                .saturating_sub(prev.old_start.saturating_add(prev.old_lines))
-        }
-    } else if use_new_anchor(file) {
-        chunk.new_start.saturating_sub(1)
+const fn chunk_new_end(chunk: &DiffChunk) -> u32 {
+    if chunk.new_lines == 0 {
+        chunk.new_start
+    } else {
+        chunk
+            .new_start
+            .saturating_add(chunk.new_lines)
+            .saturating_sub(1)
+    }
+}
+
+const fn chunk_old_before(chunk: &DiffChunk) -> u32 {
+    if chunk.old_lines == 0 {
+        chunk.old_start
     } else {
         chunk.old_start.saturating_sub(1)
-    };
-
-    let Some(st) = state else {
-        return raw_hidden;
-    };
-    let expanded_up = expanded_count_in(st, chunk_index, ExpandDirection::Up);
-    let expanded_prev_down = if chunk_index > 0 {
-        expanded_count_in(st, chunk_index - 1, ExpandDirection::Down)
-    } else {
-        0
-    };
-
-    raw_hidden.saturating_sub(expanded_up.saturating_add(expanded_prev_down))
+    }
 }
 
-fn hidden_lines_after(
-    file: &DiffFile,
-    chunk: &DiffChunk,
-    chunk_index: usize,
-    state: Option<&FileExpandedState>,
-) -> Option<u32> {
+const fn chunk_new_before(chunk: &DiffChunk) -> u32 {
+    if chunk.new_lines == 0 {
+        chunk.new_start
+    } else {
+        chunk.new_start.saturating_sub(1)
+    }
+}
+
+fn compute_file_gaps(file: &DiffFile, state: Option<&FileExpandedState>) -> Vec<FileGap> {
     if !supports_expansion(file) {
-        return Some(0);
-    }
-    if chunk_index + 1 < file.chunks.len() {
-        return Some(0);
+        return Vec::new();
     }
 
-    let st = state?;
-    let total = if use_new_anchor(file) {
-        st.new_total_lines.or(st.old_total_lines)?
+    let k = file.chunks.len();
+    if k == 0 {
+        let total = state.and_then(|st| {
+            if use_new_anchor(file) {
+                st.new_total_lines.or(st.old_total_lines)
+            } else {
+                st.old_total_lines.or(st.new_total_lines)
+            }
+        });
+        return alloc::vec![FileGap {
+            gap_index: 0,
+            old_start: 1,
+            new_start: 1,
+            len: total,
+        }];
+    }
+
+    let mut gaps = Vec::with_capacity(k + 1);
+    let first = &file.chunks[0];
+    let first_len = if use_new_anchor(file) {
+        chunk_new_before(first)
     } else {
-        st.old_total_lines.or(st.new_total_lines)?
+        chunk_old_before(first)
     };
-    let chunk_end = if use_new_anchor(file) {
-        chunk
-            .new_start
-            .saturating_add(chunk.new_lines)
-            .saturating_sub(1)
-    } else {
-        chunk
-            .old_start
-            .saturating_add(chunk.old_lines)
-            .saturating_sub(1)
-    };
-    let expanded_down = expanded_count_in(st, chunk_index, ExpandDirection::Down);
-    Some(
-        total
-            .saturating_sub(chunk_end)
-            .saturating_sub(expanded_down),
-    )
+    gaps.push(FileGap {
+        gap_index: 0,
+        old_start: 1,
+        new_start: 1,
+        len: Some(first_len),
+    });
+
+    for idx in 1..k {
+        let prev = &file.chunks[idx - 1];
+        let curr = &file.chunks[idx];
+        let prev_old_end = chunk_old_end(prev);
+        let prev_new_end = chunk_new_end(prev);
+        let len = if use_new_anchor(file) {
+            chunk_new_before(curr).saturating_sub(prev_new_end)
+        } else {
+            chunk_old_before(curr).saturating_sub(prev_old_end)
+        };
+        gaps.push(FileGap {
+            gap_index: idx,
+            old_start: prev_old_end.saturating_add(1),
+            new_start: prev_new_end.saturating_add(1),
+            len: Some(len),
+        });
+    }
+
+    let last = &file.chunks[k - 1];
+    let last_old_end = chunk_old_end(last);
+    let last_new_end = chunk_new_end(last);
+    let trailing_len = state.and_then(|st| {
+        if use_new_anchor(file) {
+            st.new_total_lines
+                .map(|t| t.saturating_sub(last_new_end))
+                .or_else(|| st.old_total_lines.map(|t| t.saturating_sub(last_old_end)))
+        } else {
+            st.old_total_lines
+                .map(|t| t.saturating_sub(last_old_end))
+                .or_else(|| st.new_total_lines.map(|t| t.saturating_sub(last_new_end)))
+        }
+    });
+    gaps.push(FileGap {
+        gap_index: k,
+        old_start: last_old_end.saturating_add(1),
+        new_start: last_new_end.saturating_add(1),
+        len: trailing_len,
+    });
+
+    gaps
 }
 
-fn expand_single_chunk(
-    file: &DiffFile,
-    chunk: &DiffChunk,
-    chunk_index: usize,
+fn push_gap_segments(segments: &mut Vec<Segment>, gap: FileGap, state: Option<&FileExpandedState>) {
+    let Some(len) = gap.len else {
+        segments.push(Segment::UnknownTrailing);
+        return;
+    };
+    if len == 0 {
+        return;
+    }
+
+    let intervals = revealed_intervals_for_gap(gap.gap_index, len, state);
+    let mut cursor = 0u32;
+    for (start, end) in intervals {
+        if start > cursor {
+            segments.push(Segment::Hidden(make_hidden_gap(gap, cursor, start)));
+        }
+        segments.push(Segment::Context {
+            gap,
+            start_offset: start,
+            end_offset: end,
+        });
+        cursor = end;
+    }
+    if cursor < len {
+        segments.push(Segment::Hidden(make_hidden_gap(gap, cursor, len)));
+    }
+}
+
+fn revealed_intervals_for_gap(
+    gap_index: usize,
+    len: u32,
     state: Option<&FileExpandedState>,
-) -> ExpandedChunkLines {
-    let orig_refs = |count: usize| -> Vec<ChunkLineRef> {
-        (0..count)
-            .map(|li| ChunkLineRef::Original(chunk_index, li))
-            .collect()
-    };
-
+) -> Vec<(u32, u32)> {
     let Some(st) = state else {
-        return ExpandedChunkLines {
-            lines: orig_refs(chunk.lines.len()),
-            old_start: chunk.old_start,
-            new_start: chunk.new_start,
-        };
+        return Vec::new();
     };
-
-    let expanded_up = expanded_count_in(st, chunk_index, ExpandDirection::Up);
-    let expanded_down = expanded_count_in(st, chunk_index, ExpandDirection::Down);
-    if expanded_up == 0 && expanded_down == 0 {
-        return ExpandedChunkLines {
-            lines: orig_refs(chunk.lines.len()),
-            old_start: chunk.old_start,
-            new_start: chunk.new_start,
-        };
+    if st.expand_entire_file {
+        return alloc::vec![(0, len)];
     }
 
-    let old_content = st.old_content.as_deref().unwrap_or(&[]);
-    let new_content = st.new_content.as_deref().unwrap_or(&[]);
+    let mut raw: Vec<(u32, u32)> = Vec::new();
+    for slice in st.manual_slices.iter().chain(st.auto_slices.iter()) {
+        if slice.gap_index != gap_index {
+            continue;
+        }
+        let s = slice.start_offset.min(len);
+        let e = slice.end_offset.min(len);
+        if s < e {
+            raw.push((s, e));
+        }
+    }
+    if raw.is_empty() {
+        return raw;
+    }
 
-    let mut out_lines =
-        Vec::with_capacity(chunk.lines.len() + expanded_up as usize + expanded_down as usize);
-
-    if expanded_up > 0 {
-        let prev = chunk_index.checked_sub(1).and_then(|p| file.chunks.get(p));
-        // Skip gap lines already appended below the preceding hunk.
-        let prev_down = if chunk_index > 0 {
-            expanded_count_in(st, chunk_index - 1, ExpandDirection::Down)
+    raw.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(raw.len());
+    for (s, e) in raw {
+        if let Some(last) = merged.last_mut()
+            && s <= last.1
+        {
+            last.1 = last.1.max(e);
         } else {
-            0
-        };
-        let end_new = chunk.new_start.saturating_sub(1);
-        let end_old = chunk.old_start.saturating_sub(1);
-        let min_new = prev
-            .map_or(0, |p| {
-                p.new_start.saturating_add(p.new_lines).saturating_sub(1)
-            })
-            .saturating_add(prev_down)
-            .min(end_new);
-        let min_old = prev
-            .map_or(0, |p| {
-                p.old_start.saturating_add(p.old_lines).saturating_sub(1)
-            })
-            .saturating_add(prev_down)
-            .min(end_old);
+            merged.push((s, e));
+        }
+    }
+    merged
+}
 
-        let avail = if use_new_anchor(file) {
-            end_new.saturating_sub(min_new)
+fn coalesce_gap_slices(slices: &mut Vec<GapSlice>) {
+    slices.retain(|s| s.end_offset > s.start_offset);
+    if slices.len() <= 1 {
+        return;
+    }
+    slices.sort_unstable_by_key(|s| (s.gap_index, s.start_offset, s.end_offset));
+    let mut out: Vec<GapSlice> = Vec::with_capacity(slices.len());
+    for slice in slices.drain(..) {
+        if let Some(last) = out.last_mut()
+            && last.gap_index == slice.gap_index
+            && slice.start_offset <= last.end_offset
+        {
+            last.end_offset = last.end_offset.max(slice.end_offset);
         } else {
-            end_old.saturating_sub(min_old)
-        };
-        let to_show = expanded_up.min(avail);
-        let start_new_zero = end_new.saturating_sub(to_show);
-        let start_old_zero = end_old.saturating_sub(to_show);
+            out.push(slice);
+        }
+    }
+    *slices = out;
+}
 
-        for offset in 0..to_show {
-            let old_num = start_old_zero + offset + 1;
-            let new_num = start_new_zero + offset + 1;
-            let content = pick_context_line(file, old_content, new_content, old_num, new_num);
-            out_lines.push(ChunkLineRef::Expanded(Arc::new(DiffLine {
-                kind: DiffLineKind::Context,
-                content,
-                old_line_number: Some(old_num),
-                new_line_number: Some(new_num),
-                syntax_spans: Vec::new(),
-                word_diff: Vec::new(),
-            })));
+const fn make_hidden_gap(gap: FileGap, start_offset: u32, end_offset: u32) -> HiddenGap {
+    HiddenGap {
+        gap_index: gap.gap_index,
+        start_offset,
+        end_offset,
+        old_start_line: gap.old_start.saturating_add(start_offset),
+        new_start_line: gap.new_start.saturating_add(start_offset),
+    }
+}
+
+fn assemble_merged_chunks(
+    file: &Arc<DiffFile>,
+    state: Option<&FileExpandedState>,
+    segments: &[Segment],
+) -> Vec<MergedChunk> {
+    let mut merged: Vec<MergedChunk> = Vec::new();
+    let mut pending_before: Option<HiddenGap> = None;
+    let mut current: Option<MergedChunk> = None;
+    let mut saw_unknown_trailing = false;
+
+    for seg in segments {
+        match *seg {
+            Segment::Hidden(hg) => {
+                if let Some(ch) = current.take() {
+                    merged.push(ch);
+                }
+                pending_before = Some(hg);
+            }
+            Segment::UnknownTrailing => {
+                saw_unknown_trailing = true;
+                if let Some(ch) = current.take() {
+                    merged.push(ch);
+                }
+            }
+            Segment::Hunk(ci) => {
+                let orig_chunk = &file.chunks[ci];
+                let line_refs =
+                    (0..orig_chunk.lines.len()).map(|li| ChunkLineRef::Original(ci, li));
+                if let Some(ch) = current.as_mut() {
+                    ch.lines.extend(line_refs);
+                    ch.original_indices.push(ci);
+                    if ch.original_indices.len() == 1 {
+                        ch.header.clone_from(&orig_chunk.header);
+                    }
+                    update_merged_spans(ch);
+                } else {
+                    let before_gap = pending_before.take();
+                    let mut ch = MergedChunk {
+                        file: Arc::clone(file),
+                        old_start: orig_chunk.old_start,
+                        old_lines: orig_chunk.old_lines,
+                        new_start: orig_chunk.new_start,
+                        new_lines: orig_chunk.new_lines,
+                        header: orig_chunk.header.clone(),
+                        lines: line_refs.collect(),
+                        original_indices: alloc::vec![ci],
+                        hidden_lines_before: before_gap.as_ref().map_or(0, HiddenGap::line_count),
+                        before_gap,
+                        hidden_lines_after: Some(0),
+                        after_gap: None,
+                    };
+                    update_merged_spans(&mut ch);
+                    current = Some(ch);
+                }
+            }
+            Segment::Context {
+                gap,
+                start_offset,
+                end_offset,
+            } => {
+                let ctx_lines = build_context_lines(file, state, gap, start_offset, end_offset);
+                if let Some(ch) = current.as_mut() {
+                    ch.lines.extend(ctx_lines);
+                    update_merged_spans(ch);
+                } else {
+                    let count = end_offset.saturating_sub(start_offset);
+                    let old_start = gap.old_start.saturating_add(start_offset);
+                    let new_start = gap.new_start.saturating_add(start_offset);
+                    let before_gap = pending_before.take();
+                    let mut ch = MergedChunk {
+                        file: Arc::clone(file),
+                        old_start,
+                        old_lines: count,
+                        new_start,
+                        new_lines: count,
+                        header: alloc::format!("@@ -{old_start},{count} +{new_start},{count} @@"),
+                        lines: ctx_lines,
+                        original_indices: Vec::new(),
+                        hidden_lines_before: before_gap.as_ref().map_or(0, HiddenGap::line_count),
+                        before_gap,
+                        hidden_lines_after: Some(0),
+                        after_gap: None,
+                    };
+                    update_merged_spans(&mut ch);
+                    current = Some(ch);
+                }
+            }
         }
     }
 
-    for li in 0..chunk.lines.len() {
-        out_lines.push(ChunkLineRef::Original(chunk_index, li));
+    if let Some(ch) = current.take() {
+        merged.push(ch);
     }
 
-    if expanded_down > 0 {
-        let chunk_end_old = chunk
-            .old_start
-            .saturating_add(chunk.old_lines)
-            .saturating_sub(1);
-        let chunk_end_new = chunk
-            .new_start
-            .saturating_add(chunk.new_lines)
-            .saturating_sub(1);
-        let next = file.chunks.get(chunk_index + 1);
-        let max_new = next.map_or_else(
-            || st.new_total_lines.unwrap_or(chunk_end_new),
-            |n| n.new_start.saturating_sub(1),
-        );
-        let max_old = next.map_or_else(
-            || st.old_total_lines.unwrap_or(chunk_end_old),
-            |n| n.old_start.saturating_sub(1),
-        );
-
-        let avail = if use_new_anchor(file) {
-            max_new.saturating_sub(chunk_end_new)
-        } else {
-            max_old.saturating_sub(chunk_end_old)
-        };
-        let to_show = expanded_down.min(avail);
-
-        for offset in 0..to_show {
-            let old_num = chunk_end_old + offset + 1;
-            let new_num = chunk_end_new + offset + 1;
-            let content = pick_context_line(file, old_content, new_content, old_num, new_num);
-            out_lines.push(ChunkLineRef::Expanded(Arc::new(DiffLine {
-                kind: DiffLineKind::Context,
-                content,
-                old_line_number: Some(old_num),
-                new_line_number: Some(new_num),
-                syntax_spans: Vec::new(),
-                word_diff: Vec::new(),
-            })));
+    if let Some(last) = merged.last_mut() {
+        if saw_unknown_trailing {
+            last.hidden_lines_after = None;
+            last.after_gap = None;
+        } else if let Some(trailing) = pending_before.take() {
+            last.hidden_lines_after = Some(trailing.line_count());
+            last.after_gap = Some(trailing);
         }
     }
 
-    let first_line = out_lines.first().and_then(|r| match r {
-        ChunkLineRef::Original(ci, li) => file.chunks.get(*ci)?.lines.get(*li),
-        ChunkLineRef::Expanded(l) => Some(l.as_ref()),
-    });
-    let first_old = first_line
-        .and_then(|l| l.old_line_number)
-        .unwrap_or(chunk.old_start);
-    let first_new = first_line
-        .and_then(|l| l.new_line_number)
-        .unwrap_or(chunk.new_start);
+    merged
+}
 
-    ExpandedChunkLines {
-        lines: out_lines,
-        old_start: first_old,
-        new_start: first_new,
+fn build_context_lines(
+    file: &DiffFile,
+    state: Option<&FileExpandedState>,
+    gap: FileGap,
+    start_offset: u32,
+    end_offset: u32,
+) -> Vec<ChunkLineRef> {
+    let count = usize::try_from(end_offset.saturating_sub(start_offset)).unwrap_or(0);
+    let mut out = Vec::with_capacity(count);
+    for offset in start_offset..end_offset {
+        let old_num = gap.old_start.saturating_add(offset);
+        let new_num = gap.new_start.saturating_add(offset);
+        let (content, syntax_spans) = pick_context_line(file, state, old_num, new_num);
+        out.push(ChunkLineRef::Expanded(Arc::new(DiffLine {
+            kind: DiffLineKind::Context,
+            content,
+            old_line_number: Some(old_num),
+            new_line_number: Some(new_num),
+            syntax_spans,
+            word_diff: Vec::new(),
+        })));
     }
+    out
 }
 
 fn pick_context_line(
     file: &DiffFile,
-    old_content: &[String],
-    new_content: &[String],
+    state: Option<&FileExpandedState>,
     old_num: u32,
     new_num: u32,
-) -> String {
-    let from_new = usize::try_from(new_num)
-        .ok()
-        .and_then(|n| n.checked_sub(1))
-        .and_then(|idx| new_content.get(idx))
-        .cloned();
-    let from_old = usize::try_from(old_num)
-        .ok()
-        .and_then(|n| n.checked_sub(1))
-        .and_then(|idx| old_content.get(idx))
-        .cloned();
-
-    if use_new_anchor(file) {
-        from_new.or(from_old).unwrap_or_default()
+) -> (String, Vec<tellit_types::SyntaxSpan>) {
+    let Some(st) = state else {
+        return (String::new(), Vec::new());
+    };
+    let picked = if use_new_anchor(file) {
+        st.new_lines
+            .get(new_num)
+            .or_else(|| st.old_lines.get(old_num))
     } else {
-        from_old.or(from_new).unwrap_or_default()
+        st.old_lines
+            .get(old_num)
+            .or_else(|| st.new_lines.get(new_num))
+    };
+    match picked {
+        Some(hl) => (hl.content.clone(), hl.syntax_spans.clone()),
+        None => (String::new(), Vec::new()),
     }
+}
+
+fn collect_merged_line_keys(merged_chunks: &[MergedChunk]) -> HashSet<(CommentSide, u32)> {
+    let mut keys = HashSet::new();
+    for mc in merged_chunks {
+        for line in mc.iter_lines() {
+            match line.kind {
+                DiffLineKind::Delete => {
+                    if let Some(old_n) = line.old_line_number {
+                        keys.insert((CommentSide::Old, old_n));
+                    }
+                }
+                DiffLineKind::Add => {
+                    if let Some(new_n) = line.new_line_number {
+                        keys.insert((CommentSide::New, new_n));
+                    }
+                }
+                DiffLineKind::Context => {
+                    if let Some(old_n) = line.old_line_number {
+                        keys.insert((CommentSide::Old, old_n));
+                    }
+                    if let Some(new_n) = line.new_line_number {
+                        keys.insert((CommentSide::New, new_n));
+                    }
+                }
+            }
+        }
+    }
+    keys
 }
 
 fn update_merged_spans(chunk: &mut MergedChunk) {
@@ -566,6 +1055,7 @@ fn update_merged_spans(chunk: &mut MergedChunk) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tellit_types::{LineRangeSpec, SyntaxSpan};
 
     fn sample_line(
         kind: DiffLineKind,
@@ -583,8 +1073,47 @@ mod tests {
         }
     }
 
+    fn full_state(count: u32) -> FileExpandedState {
+        let lines: Vec<HighlightedLine> = (1..=count)
+            .map(|n| HighlightedLine {
+                content: alloc::format!("line {n}"),
+                syntax_spans: alloc::vec![SyntaxSpan { len: 4, style: 14 }],
+            })
+            .collect();
+        FileExpandedState {
+            old_lines: SharedCachedLines::from_full_lines(lines.clone()),
+            new_lines: SharedCachedLines::from_full_lines(lines),
+            old_total_lines: Some(count),
+            new_total_lines: Some(count),
+            manual_slices: Vec::new(),
+            auto_slices: Vec::new(),
+            attempted_auto_expands: HashSet::new(),
+            expand_entire_file: false,
+        }
+    }
+
+    fn sample_thread(
+        id: &str,
+        file_path: &str,
+        side: CommentSide,
+        start: u32,
+        end: u32,
+        resolved: bool,
+    ) -> JjCommentThread {
+        JjCommentThread {
+            id: String::from(id),
+            commit_id: String::from("0123456789abcdef0123456789abcdef01234567"),
+            change_id: String::from("klyvutpsqrvz"),
+            file_path: String::from(file_path),
+            side,
+            line_range: Some(LineRangeSpec { start, end }),
+            resolved,
+            comments: Vec::new(),
+        }
+    }
+
     #[test]
-    fn expands_and_merges_two_chunks_when_gap_closes() {
+    fn expands_and_merges_two_chunks_preserving_syntax_spans() {
         let file = Arc::new(DiffFile {
             path: String::from("src/lib.rs"),
             old_path: None,
@@ -619,16 +1148,7 @@ mod tests {
         });
 
         let mut map = ExpandedLinesMap::new();
-        map.insert(
-            String::from("src/lib.rs"),
-            FileExpandedState {
-                old_content: Some((1..=8).map(|n| alloc::format!("line {n}")).collect()),
-                new_content: Some((1..=8).map(|n| alloc::format!("line {n}")).collect()),
-                old_total_lines: Some(8),
-                new_total_lines: Some(8),
-                expanded_ranges: Vec::new(),
-            },
-        );
+        map.insert(String::from("src/lib.rs"), full_state(8));
 
         let before = merge_chunks_for_file(&file, map.get("src/lib.rs"));
         assert_eq!(before.len(), 2);
@@ -636,16 +1156,23 @@ mod tests {
         assert_eq!(before[1].hidden_lines_before, 3);
         assert_eq!(before[1].hidden_lines_after, Some(2));
 
-        record_expand_all_before(&mut map, "src/lib.rs", 1, before[1].hidden_lines_before);
+        let req = before[1].before_gap.unwrap().as_full_slice();
+        assert_eq!(req.new_line_range, (3, 5));
+        record_manual_slice(&mut map, "src/lib.rs", req.slice);
+
         let after = merge_chunks_for_file(&file, map.get("src/lib.rs"));
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].lines.len(), 5);
         assert_eq!(after[0].line(1).unwrap().content, "line 3");
+        assert_eq!(
+            after[0].line(1).unwrap().syntax_spans,
+            alloc::vec![SyntaxSpan { len: 4, style: 14 }]
+        );
         assert_eq!(after[0].line(3).unwrap().content, "line 5");
         let expanded_flags: Vec<bool> = (0..after[0].lines.len())
             .map(|i| after[0].is_line_expanded(i))
             .collect();
-        assert_eq!(expanded_flags, vec![false, true, true, true, false]);
+        assert_eq!(expanded_flags, alloc::vec![false, true, true, true, false]);
     }
 
     #[test]
@@ -684,24 +1211,186 @@ mod tests {
         });
 
         let mut map = ExpandedLinesMap::new();
-        map.insert(
-            String::from("src/lib.rs"),
-            FileExpandedState {
-                old_content: Some((1..=30).map(|n| alloc::format!("line {n}")).collect()),
-                new_content: Some((1..=30).map(|n| alloc::format!("line {n}")).collect()),
-                old_total_lines: Some(30),
-                new_total_lines: Some(30),
-                expanded_ranges: Vec::new(),
-            },
-        );
+        map.insert(String::from("src/lib.rs"), full_state(30));
 
-        record_line_expansion(&mut map, "src/lib.rs", 0, ExpandDirection::Down, 20);
-        record_line_expansion(&mut map, "src/lib.rs", 1, ExpandDirection::Up, 20);
+        let initial = merge_chunks_for_file(&file, map.get("src/lib.rs"));
+        let gap = initial[1].before_gap.unwrap();
+        record_manual_slice(&mut map, "src/lib.rs", gap.take_from_start(20).slice);
+        record_manual_slice(&mut map, "src/lib.rs", gap.take_from_end(20).slice);
 
         let merged = merge_chunks_for_file(&file, map.get("src/lib.rs"));
         assert_eq!(merged.len(), 1);
         let contents: Vec<&str> = merged[0].iter_lines().map(|l| l.content.as_str()).collect();
         let expected: Vec<String> = (2..=28).map(|n| alloc::format!("line {n}")).collect();
         assert_eq!(contents, expected);
+    }
+
+    #[test]
+    fn auto_expand_places_unresolved_old_and_new_comments_with_line_drift() {
+        // Hunk 0 adds 10 lines (old 10..=11 -> new 10..=21, so gap 1 has old_start=12, new_start=22).
+        let mut hunk0_lines = alloc::vec![sample_line(
+            DiffLineKind::Context,
+            Some(10),
+            Some(10),
+            "line 10"
+        )];
+        for n in 11..=20 {
+            hunk0_lines.push(sample_line(
+                DiffLineKind::Add,
+                None,
+                Some(n),
+                &alloc::format!("added {n}"),
+            ));
+        }
+        hunk0_lines.push(sample_line(
+            DiffLineKind::Context,
+            Some(11),
+            Some(21),
+            "line 21",
+        ));
+
+        let file = Arc::new(DiffFile {
+            path: String::from("src/drift.rs"),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 10,
+            deletions: 0,
+            is_generated: false,
+            chunks: alloc::vec![
+                DiffChunk {
+                    old_start: 10,
+                    old_lines: 2,
+                    new_start: 10,
+                    new_lines: 12,
+                    header: String::from("@@ -10,2 +10,12 @@"),
+                    lines: hunk0_lines,
+                },
+                DiffChunk {
+                    old_start: 100,
+                    old_lines: 2,
+                    new_start: 110,
+                    new_lines: 2,
+                    header: String::from("@@ -100,2 +110,2 @@"),
+                    lines: alloc::vec![
+                        sample_line(DiffLineKind::Context, Some(100), Some(110), "line 110"),
+                        sample_line(DiffLineKind::Context, Some(101), Some(111), "line 111"),
+                    ],
+                },
+            ],
+            chunks_loaded: true,
+        });
+
+        let mut map = ExpandedLinesMap::new();
+        map.insert(String::from("src/drift.rs"), full_state(150));
+
+        let threads = alloc::vec![
+            // Unresolved Old-side comment at old line 50 (corresponds to new line 60 in gap 1).
+            sample_thread("t-old", "src/drift.rs", CommentSide::Old, 50, 50, false),
+            // Unresolved New-side comment at trailing new line 130 (old line 120 in gap 2).
+            sample_thread("t-new", "src/drift.rs", CommentSide::New, 130, 132, false),
+            // Resolved comment outside hunks must NOT trigger auto-expand.
+            sample_thread("t-res", "src/drift.rs", CommentSide::New, 80, 80, true),
+            // Unresolved comment already inside hunk 0 must NOT trigger auto-expand.
+            sample_thread("t-in", "src/drift.rs", CommentSide::New, 15, 15, false),
+        ];
+
+        let initial = merge_chunks_for_file(&file, map.get("src/drift.rs"));
+        let plan = compute_auto_expand_plan(&file, &initial, map.get("src/drift.rs"), &threads)
+            .expect("should plan auto-expand for unresolved Old and New comments");
+
+        assert_eq!(plan.attempt_keys.len(), 2);
+        // Old 45..=55 maps to new 55..=65; New 125..=137 maps to old 115..=127.
+        assert_eq!(plan.new_line_range, (55, 137));
+        assert_eq!(plan.old_line_range, (45, 127));
+
+        record_auto_expand_attempts(&mut map, "src/drift.rs", &plan.attempt_keys);
+        // While fetch is in flight (before auto_slices are applied), planner deduplicates attempts.
+        assert!(
+            compute_auto_expand_plan(&file, &initial, map.get("src/drift.rs"), &threads).is_none()
+        );
+
+        record_auto_slices(&mut map, "src/drift.rs", &plan.slices);
+        let after = merge_chunks_for_file(&file, map.get("src/drift.rs"));
+        let keys = collect_merged_line_keys(&after);
+        assert!(keys.contains(&(CommentSide::Old, 50)));
+        assert!(keys.contains(&(CommentSide::New, 60)));
+        assert!(keys.contains(&(CommentSide::New, 132)));
+        assert!(keys.contains(&(CommentSide::Old, 122)));
+        // Resolved comment at new 80 was not expanded.
+        assert!(!keys.contains(&(CommentSide::New, 80)));
+
+        // Re-running planner now returns None because both unresolved threads are placed.
+        assert!(
+            compute_auto_expand_plan(&file, &after, map.get("src/drift.rs"), &threads).is_none()
+        );
+
+        // Clearing expanded_lines (as Refresh / ignore_rebase toggle does) resets attempts so
+        // unresolved threads re-plan and re-expand cleanly on the same commit pair.
+        map.clear();
+        let after_reset = merge_chunks_for_file(&file, map.get("src/drift.rs"));
+        let replanned =
+            compute_auto_expand_plan(&file, &after_reset, map.get("src/drift.rs"), &threads)
+                .expect("clearing expanded_lines must allow auto-expand to re-plan");
+        assert_eq!(replanned.attempt_keys.len(), 2);
+    }
+
+    #[test]
+    fn expand_entire_file_and_collapse_preserves_auto_comment_context() {
+        let file = Arc::new(DiffFile {
+            path: String::from("src/app.rs"),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 0,
+            is_generated: false,
+            chunks: alloc::vec![DiffChunk {
+                old_start: 10,
+                old_lines: 1,
+                new_start: 10,
+                new_lines: 1,
+                header: String::from("@@ -10,1 +10,1 @@"),
+                lines: alloc::vec![sample_line(
+                    DiffLineKind::Context,
+                    Some(10),
+                    Some(10),
+                    "line 10"
+                )],
+            }],
+            chunks_loaded: true,
+        });
+
+        let mut map = ExpandedLinesMap::new();
+        map.insert(String::from("src/app.rs"), full_state(40));
+        record_auto_slices(
+            &mut map,
+            "src/app.rs",
+            &[GapSlice {
+                gap_index: 1,
+                start_offset: 14,
+                end_offset: 25,
+            }],
+        );
+
+        let before = merge_chunks_for_file(&file, map.get("src/app.rs"));
+        assert!(has_hidden_context(&file, &before, map.get("src/app.rs")));
+        assert!(!map["src/app.rs"].has_manual_expansion());
+
+        record_expand_entire_file(&mut map, "src/app.rs");
+        let expanded = merge_chunks_for_file(&file, map.get("src/app.rs"));
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].lines.len(), 40);
+        assert_eq!(expanded[0].hidden_lines_before, 0);
+        assert_eq!(expanded[0].hidden_lines_after, Some(0));
+        assert!(!has_hidden_context(&file, &expanded, map.get("src/app.rs")));
+        assert!(map["src/app.rs"].has_manual_expansion());
+
+        collapse_manual_expansions(&mut map, "src/app.rs");
+        let collapsed = merge_chunks_for_file(&file, map.get("src/app.rs"));
+        assert!(has_hidden_context(&file, &collapsed, map.get("src/app.rs")));
+        assert!(!map["src/app.rs"].has_manual_expansion());
+        // Auto-expanded comment context (lines 25..=35) remains intact.
+        let keys = collect_merged_line_keys(&collapsed);
+        assert!(keys.contains(&(CommentSide::New, 30)));
+        assert!(!keys.contains(&(CommentSide::New, 1)));
     }
 }

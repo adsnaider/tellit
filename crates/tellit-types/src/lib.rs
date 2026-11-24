@@ -890,6 +890,29 @@ pub struct LineCountResponse {
     pub new_line_count: Option<usize>,
 }
 
+/// Single source line returned by `GET /api/lines/{*path}` with optional syntax highlighting spans.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HighlightedLine {
+    /// Line text without a trailing newline or carriage return.
+    pub content: String,
+    /// Compact syntax highlighting spans matching `.syn-1`..`.syn-19` palette classes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub syntax_spans: Vec<SyntaxSpan>,
+}
+
+/// Highlighted source lines returned by `GET /api/lines/{*path}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HighlightedLinesResponse {
+    /// Total number of lines in the file at the requested revision.
+    pub total_lines: u32,
+    /// 1-based line number of `lines[0]` (`1` when `lines` is empty).
+    pub start_line: u32,
+    /// Ordered highlighted lines for the requested inclusive range.
+    pub lines: Vec<HighlightedLine>,
+}
+
 /// Special editor preset identifier representing disabled editor launching.
 pub const NONE_EDITOR_ID: &str = "none";
 
@@ -1247,5 +1270,28 @@ mod tests {
         let normalized = partial.normalized();
         assert_eq!(normalized.font_size, 20);
         assert_eq!(normalized.theme, ThemePreference::Dark);
+    }
+
+    #[test]
+    fn highlighted_lines_response_roundtrips_and_omits_empty_spans() {
+        let resp = HighlightedLinesResponse {
+            total_lines: 10,
+            start_line: 3,
+            lines: alloc::vec![
+                HighlightedLine {
+                    content: String::from("plain"),
+                    syntax_spans: Vec::new(),
+                },
+                HighlightedLine {
+                    content: String::from("let x = 1;"),
+                    syntax_spans: alloc::vec![SyntaxSpan { len: 3, style: 14 }],
+                },
+            ],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#"{"content":"plain"}"#));
+        assert!(json.contains(r#"[3,14]"#));
+        let decoded: HighlightedLinesResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, resp);
     }
 }

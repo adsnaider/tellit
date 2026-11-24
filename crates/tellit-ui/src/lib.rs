@@ -61,11 +61,12 @@ pub use components::revision_tree::{
 use components::settings_modal::SettingsModal;
 use components::single_file_view::{SingleFileNavTarget, SingleFileView, resolve_single_file_step};
 use components::text_diff::expanded::{
-    ExpandedLinesMap, record_expand_all_before, record_line_expansion, split_blob_lines,
+    ExpandedLinesMap, collapse_manual_expansions, record_auto_expand_attempts, record_auto_slices,
+    record_expand_entire_file, record_manual_slice,
 };
 use components::text_diff::word_highlight;
 use components::text_diff::{
-    ActiveComposer, CHUNK_WINDOW_STEP_LINES, CreateThreadEvent, ExpandLinesEvent,
+    ActiveComposer, CHUNK_WINDOW_STEP_LINES, CreateThreadEvent, ExpandAction, ExpandLinesEvent,
     LineSelectionDrag, extract_snippet_for_file, parse_comment_side,
 };
 use route::{AppRoute, RouteQuery};
@@ -73,6 +74,9 @@ pub use state::{ConnectionState, DiffViewMode, RepoStatusState, ResolvedTheme};
 
 const MAX_CONCURRENT_FILE_FETCHES: usize = 4;
 const VIEWPORT_OBSERVER_ROOT_MARGIN: &str = "1500px 0px";
+/// Files up to this line count fetch all highlighted lines in one request on first expand so
+/// subsequent gap clicks and "Expand file" toggles complete without extra round-trips.
+const FULL_FILE_HIGHLIGHT_PREFETCH_LIMIT: u32 = 1_500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LoadedDiff {
@@ -258,6 +262,7 @@ struct AppCtx {
     pending_thread_scroll: StoredValue<Option<(u64, String, String)>, LocalStorage>,
     pending_cursor_scroll_block: StoredValue<Option<ScrollLogicalPosition>, LocalStorage>,
     prefetched_line_counts: StoredValue<HashSet<String>, LocalStorage>,
+    expand_in_flight: StoredValue<usize, LocalStorage>,
     pending_initial_target: StoredValue<Option<String>, LocalStorage>,
     pending_initial_base: StoredValue<Option<String>, LocalStorage>,
 }
@@ -326,6 +331,7 @@ impl AppCtx {
             pending_thread_scroll: StoredValue::new_local(None),
             pending_cursor_scroll_block: StoredValue::new_local(None),
             prefetched_line_counts: StoredValue::new_local(HashSet::new()),
+            expand_in_flight: StoredValue::new_local(0),
             pending_initial_target: StoredValue::new_local(None),
             pending_initial_base: StoredValue::new_local(None),
         }
@@ -952,6 +958,7 @@ fn load_diff_and_comments(ctx: AppCtx, target: String, base: Option<String>, ign
                 ctx.expanded_lines.set(HashMap::new());
                 ctx.prefetched_line_counts.update_value(HashSet::clear);
                 ctx.highlighted_word.set(None);
+                ctx.expand_in_flight.set_value(0);
                 ctx.expand_loading.set(false);
                 ctx.active_cursor.set(None);
 
@@ -1660,66 +1667,144 @@ fn prefetch_line_count_for_file(ctx: AppCtx, file: Arc<DiffFile>) {
     });
 }
 
+fn apply_expand_action(map: &mut ExpandedLinesMap, path: &str, action: &ExpandAction) {
+    match action {
+        ExpandAction::RevealGapSlice { slice, .. } => record_manual_slice(map, path, *slice),
+        ExpandAction::AutoCommentContext { slices, .. } => record_auto_slices(map, path, slices),
+        ExpandAction::ExpandEntireFile => record_expand_entire_file(map, path),
+        ExpandAction::CollapseManualContext => collapse_manual_expansions(map, path),
+    }
+}
+
 fn expand_lines_for_file(ctx: AppCtx, req: ExpandLinesEvent) {
+    let path = req.file.path.clone();
+    if matches!(req.action, ExpandAction::CollapseManualContext) {
+        ctx.expanded_lines.update(|map| {
+            collapse_manual_expansions(map, &path);
+        });
+        return;
+    }
+
     let Some(diff) = ctx.current_diff() else {
         return;
     };
+
+    let (already_cached, fetch_full_file, new_range, old_range) =
+        ctx.expanded_lines.with_untracked(|map| {
+            let existing = map.get(&path);
+            let known_total = existing.and_then(|e| e.new_total_lines.or(e.old_total_lines));
+            match &req.action {
+                ExpandAction::ExpandEntireFile => (
+                    existing.is_some_and(|e| e.has_complete_lines(req.file.status)),
+                    true,
+                    None,
+                    None,
+                ),
+                ExpandAction::RevealGapSlice {
+                    new_line_range,
+                    old_line_range,
+                    ..
+                }
+                | ExpandAction::AutoCommentContext {
+                    new_line_range,
+                    old_line_range,
+                    ..
+                } => {
+                    let cached = existing.is_some_and(|e| {
+                        e.has_line_range(req.file.status, *new_line_range, *old_line_range)
+                    });
+                    let full = known_total
+                        .is_some_and(|total| total <= FULL_FILE_HIGHLIGHT_PREFETCH_LIMIT);
+                    (
+                        cached,
+                        full,
+                        (!full).then_some(*new_line_range),
+                        (!full).then_some(*old_line_range),
+                    )
+                }
+                ExpandAction::CollapseManualContext => (true, false, None, None),
+            }
+        });
+
+    if already_cached {
+        ctx.expanded_lines.update(|map| {
+            if let ExpandAction::AutoCommentContext { attempt_keys, .. } = &req.action {
+                record_auto_expand_attempts(map, &path, attempt_keys);
+            }
+            apply_expand_action(map, &path, &req.action);
+        });
+        return;
+    }
+
+    if let ExpandAction::AutoCommentContext { attempt_keys, .. } = &req.action {
+        ctx.expanded_lines.update(|map| {
+            record_auto_expand_attempts(map, &path, attempt_keys);
+        });
+    }
+
     let generation = ctx.diff_generation.get_value();
+    ctx.expand_in_flight.update_value(|n| *n += 1);
     ctx.expand_loading.set(true);
 
     spawn_local(async move {
-        let path = req.file.path.clone();
         let old_path = req.file.old_path.as_deref().unwrap_or(&path).to_owned();
+        let (new_start, new_end) = match new_range {
+            Some((s, e)) => (Some(s), Some(e)),
+            None => (None, None),
+        };
+        let (old_start, old_end) = match old_range {
+            Some((s, e)) => (Some(s), Some(e)),
+            None => (None, None),
+        };
 
-        let (need_old, need_new) = ctx.expanded_lines.with_untracked(|map| {
-            let existing = map.get(&path);
-            (
-                req.file.status != FileStatus::Added
-                    && existing.is_none_or(|e| e.old_content.is_none()),
-                req.file.status != FileStatus::Deleted
-                    && existing.is_none_or(|e| e.new_content.is_none()),
-            )
+        let mut fetched_new = None;
+        let mut fetched_old = None;
+
+        if req.file.status != FileStatus::Deleted {
+            if let Ok(resp) =
+                api::fetch_highlighted_lines(&path, &diff.commit, new_start, new_end).await
+            {
+                fetched_new = Some(resp);
+            } else if req.file.status != FileStatus::Added
+                && let Ok(resp) =
+                    api::fetch_highlighted_lines(&old_path, &diff.base_commit, old_start, old_end)
+                        .await
+            {
+                fetched_old = Some(resp);
+            }
+        } else if let Ok(resp) =
+            api::fetch_highlighted_lines(&old_path, &diff.base_commit, old_start, old_end).await
+        {
+            fetched_old = Some(resp);
+        }
+
+        let mut remaining = 0usize;
+        ctx.expand_in_flight.update_value(|n| {
+            *n = n.saturating_sub(1);
+            remaining = *n;
         });
 
-        let old_lines = if need_old {
-            match api::fetch_blob_text(&old_path, &diff.base_commit).await {
-                Ok(text) => Some(split_blob_lines(&text)),
-                Err(_) => Some(Vec::new()),
-            }
-        } else {
-            None
-        };
-
-        let new_lines = if need_new {
-            match api::fetch_blob_text(&path, &diff.commit).await {
-                Ok(text) => Some(split_blob_lines(&text)),
-                Err(_) => Some(Vec::new()),
-            }
-        } else {
-            None
-        };
-
         if ctx.diff_generation.get_value() != generation {
-            ctx.expand_loading.set(false);
+            ctx.expand_loading.set(remaining > 0);
             return;
         }
 
         ctx.expanded_lines.update(|map| {
             let entry = map.entry(path.clone()).or_default();
-            if let Some(lines) = old_lines {
-                entry.old_total_lines = Some(u32::try_from(lines.len()).unwrap_or(u32::MAX));
-                entry.old_content = Some(lines);
+            let got_any = fetched_new.is_some() || fetched_old.is_some();
+            if let Some(resp) = fetched_new {
+                entry.new_total_lines = Some(resp.total_lines);
+                entry.new_lines.insert_response(resp, fetch_full_file);
             }
-            if let Some(lines) = new_lines {
-                entry.new_total_lines = Some(u32::try_from(lines.len()).unwrap_or(u32::MAX));
-                entry.new_content = Some(lines);
+            if let Some(resp) = fetched_old {
+                entry.old_total_lines = Some(resp.total_lines);
+                entry.old_lines.insert_response(resp, fetch_full_file);
             }
-            match req.direction {
-                Some(dir) => record_line_expansion(map, &path, req.chunk_index, dir, req.count),
-                None => record_expand_all_before(map, &path, req.chunk_index, req.count),
+            if got_any {
+                apply_expand_action(map, &path, &req.action);
             }
         });
-        ctx.expand_loading.set(false);
+        ctx.expand_loading.set(remaining > 0);
     });
 }
 

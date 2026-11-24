@@ -11,9 +11,10 @@ use serde::de::DeserializeOwned;
 use tellit_types::{
     ApiErrorResponse, AppearanceSettings, ApproveCommitRequest, ApproveCommitResponse,
     CreateCommentRequest, CreateCommentResponse, DiffFile, EditorSpecRequest, HeartbeatEvent,
-    JjChangesResponse, JjCommentsResponse, JjCommitsResponse, JjDiffResponse, JjStatusResponse,
-    LineCountResponse, OpenInEditorRequest, OpenInEditorResponse, ReplyCommentRequest,
-    ReplyCommentResponse, ResolveCommentRequest, ResolveCommentResponse, WatchEvent,
+    HighlightedLinesResponse, JjChangesResponse, JjCommentsResponse, JjCommitsResponse,
+    JjDiffResponse, JjStatusResponse, LineCountResponse, OpenInEditorRequest, OpenInEditorResponse,
+    ReplyCommentRequest, ReplyCommentResponse, ResolveCommentRequest, ResolveCommentResponse,
+    WatchEvent,
 };
 use thiserror::Error;
 use wasm_bindgen::JsCast;
@@ -360,6 +361,43 @@ pub fn blob_url(file_path: &str, rev: &str) -> String {
 pub async fn fetch_blob_text(file_path: &str, rev: &str) -> Result<String, ApiError> {
     let url = blob_url(file_path, rev);
     send_text_request(&url, None).await
+}
+
+/// Builds the `/api/lines/{*path}` URL for syntax-highlighted source lines at `rev`.
+#[must_use]
+pub fn highlighted_lines_url(
+    file_path: &str,
+    rev: &str,
+    start: Option<u32>,
+    end: Option<u32>,
+) -> String {
+    let mut url = alloc::format!(
+        "/api/lines/{}?ref={}",
+        encode_uri_path(file_path),
+        encode_uri_component(rev),
+    );
+    if let Some(s) = start {
+        url.push_str(&alloc::format!("&start={s}"));
+    }
+    if let Some(e) = end {
+        url.push_str(&alloc::format!("&end={e}"));
+    }
+    url
+}
+
+/// Fetches syntax-highlighted lines for `file_path` at `rev` via `GET /api/lines/{*path}`.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if the HTTP request fails or the JSON payload is invalid.
+pub async fn fetch_highlighted_lines(
+    file_path: &str,
+    rev: &str,
+    start: Option<u32>,
+    end: Option<u32>,
+) -> Result<HighlightedLinesResponse, ApiError> {
+    let url = highlighted_lines_url(file_path, rev, start, end);
+    fetch_json(&url).await
 }
 
 /// Fetches a blob resource's byte length via `HEAD` and `Content-Length` without downloading the body.

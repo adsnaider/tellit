@@ -633,6 +633,14 @@ struct BlobQuery {
 }
 
 #[derive(Deserialize)]
+struct HighlightedLinesQuery {
+    #[serde(rename = "ref")]
+    rev: Option<String>,
+    start: Option<u32>,
+    end: Option<u32>,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LineCountQuery {
     old_ref: Option<String>,
@@ -913,6 +921,73 @@ async fn get_blob(
     Ok(response)
 }
 
+fn validate_highlighted_line_range(
+    start: Option<u32>,
+    end: Option<u32>,
+) -> Result<(), JujutsuError> {
+    if start == Some(0) || end == Some(0) {
+        return Err(JujutsuError::InvalidInput(String::from(
+            "invalid line range: start and end must be 1-based",
+        )));
+    }
+    if let (Some(s), Some(e)) = (start, end)
+        && s > e
+    {
+        return Err(JujutsuError::InvalidInput(String::from(
+            "invalid line range: start must be <= end",
+        )));
+    }
+    Ok(())
+}
+
+fn is_binary_blob(bytes: &[u8]) -> bool {
+    bytes[..bytes.len().min(8192)].contains(&0)
+}
+
+async fn get_highlighted_lines(
+    State(state): State<Arc<AppState>>,
+    AxumPath(path): AxumPath<String>,
+    Query(query): Query<HighlightedLinesQuery>,
+) -> Result<Response, ApiError> {
+    validate_highlighted_line_range(query.start, query.end)?;
+    let blob = state
+        .jj
+        .get_blob_content(&path, query.rev.as_deref())
+        .await?;
+    if is_binary_blob(&blob.bytes) {
+        return Err(ApiError::from(JujutsuError::InvalidInput(String::from(
+            "cannot return highlighted lines for binary file",
+        ))));
+    }
+    let cache_control = if query.rev.as_deref().is_some_and(is_immutable_commit_oid) {
+        IMMUTABLE_PRIVATE_CACHE
+    } else {
+        API_NO_STORE_CACHE
+    };
+    let start = query.start;
+    let end = query.end;
+    let body = tokio::task::spawn_blocking(move || {
+        let text = String::from_utf8_lossy(&blob.bytes);
+        let highlighted = diff_parser::highlight_file_lines(&path, &text, start, end);
+        serde_json::to_vec(&highlighted)
+    })
+    .await
+    .map_err(|err| JujutsuError::Io(io::Error::other(err)))?
+    .map_err(|err| JujutsuError::Io(io::Error::other(err)))?;
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
+    );
+    Ok(response)
+}
+
 async fn get_line_count(
     State(state): State<Arc<AppState>>,
     AxumPath(path): AxumPath<String>,
@@ -1122,6 +1197,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/jj/approve", post(post_jj_approve))
         .route("/api/blob/{*path}", get(get_blob))
+        .route("/api/lines/{*path}", get(get_highlighted_lines))
         .route("/api/line-count/{*path}", get(get_line_count))
         .route("/api/open-in-editor", post(post_open_in_editor))
         .route(
@@ -1348,5 +1424,23 @@ mod tests {
         assert!(!is_immutable_line_count_query(Some(""), Some("")));
         assert!(!is_immutable_line_count_query(Some("@-"), Some(oid2)));
         assert!(!is_immutable_line_count_query(Some(oid1), Some("working")));
+    }
+
+    #[test]
+    fn highlighted_line_range_validation_rejects_zero_and_inverted_bounds() {
+        assert!(validate_highlighted_line_range(None, None).is_ok());
+        assert!(validate_highlighted_line_range(Some(1), None).is_ok());
+        assert!(validate_highlighted_line_range(None, Some(20)).is_ok());
+        assert!(validate_highlighted_line_range(Some(5), Some(5)).is_ok());
+        assert!(validate_highlighted_line_range(Some(5), Some(20)).is_ok());
+        assert!(validate_highlighted_line_range(Some(0), Some(10)).is_err());
+        assert!(validate_highlighted_line_range(Some(1), Some(0)).is_err());
+        assert!(validate_highlighted_line_range(Some(12), Some(5)).is_err());
+
+        assert!(!is_binary_blob(b"fn main() {}\n"));
+        assert!(is_binary_blob(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"));
+        let mut nul_after_prefix = alloc::vec![b'a'; 8192];
+        nul_after_prefix.push(0);
+        assert!(!is_binary_blob(&nul_after_prefix));
     }
 }

@@ -141,7 +141,9 @@ mod tests {
             ],
             original_indices: alloc::vec![0],
             hidden_lines_before: 0,
+            before_gap: None,
             hidden_lines_after: Some(0),
+            after_gap: None,
         };
         let paired = pair_side_by_side_rows(&chunk);
 
@@ -196,7 +198,9 @@ mod tests {
             lines: line_refs,
             original_indices: alloc::vec![0],
             hidden_lines_before: 0,
+            before_gap: None,
             hidden_lines_after: Some(0),
+            after_gap: None,
         };
 
         let all_paired = pair_side_by_side_rows(&chunk);

@@ -16,8 +16,8 @@ use syntect::highlighting::{
 };
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 use tellit_types::{
-    DiffChunk, DiffLine, DiffLineKind, FileStatus, MAX_HIGHLIGHT_LINE_BYTES, SyntaxSpan,
-    WordDiffSegment,
+    DiffChunk, DiffLine, DiffLineKind, FileStatus, HighlightedLine, HighlightedLinesResponse,
+    MAX_HIGHLIGHT_LINE_BYTES, SyntaxSpan, WordDiffSegment,
 };
 
 /// Virtual file path representing the commit description in a Jujutsu diff.
@@ -873,6 +873,105 @@ fn parse_file_block(block: &str) -> Option<tellit_types::DiffFile> {
     })
 }
 
+/// Splits file text into lines matching `count_blob_lines` without a trailing empty line.
+fn split_source_lines(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<&str> = text
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    if text.ends_with('\n') {
+        lines.pop();
+    }
+    lines
+}
+
+/// Highlights an inclusive 1-based line range of `text` for `path`, advancing the syntax state
+/// from line 1 so multi-line comments and strings stay accurate at `start_line..=end_line`.
+///
+/// Omits syntax spans for generated files, unrecognized extensions, and lines exceeding
+/// [`MAX_HIGHLIGHT_LINE_BYTES`].
+#[must_use]
+pub fn highlight_file_lines(
+    path: &str,
+    text: &str,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+) -> HighlightedLinesResponse {
+    let raw_lines = split_source_lines(text);
+    let total_lines = u32::try_from(raw_lines.len()).unwrap_or(u32::MAX);
+    let start = start_line.unwrap_or(1).max(1);
+    if raw_lines.is_empty() {
+        return HighlightedLinesResponse {
+            total_lines: 0,
+            start_line: start,
+            lines: Vec::new(),
+        };
+    }
+
+    let end = end_line.unwrap_or(total_lines).min(total_lines);
+    if start > end {
+        return HighlightedLinesResponse {
+            total_lines,
+            start_line: start,
+            lines: Vec::new(),
+        };
+    }
+
+    let start_idx = usize::try_from(start - 1).unwrap_or(raw_lines.len());
+    let end_idx = usize::try_from(end)
+        .unwrap_or(raw_lines.len())
+        .min(raw_lines.len());
+    let header_sample = &raw_lines[..raw_lines.len().min(20)];
+    let engine = highlight_engine();
+    let syntax = if is_generated_file(path, header_sample) {
+        None
+    } else {
+        find_syntax(&engine.syntax_set, path)
+    };
+
+    let Some(syntax) = syntax else {
+        let lines = raw_lines[start_idx..end_idx]
+            .iter()
+            .map(|&content| HighlightedLine {
+                content: String::from(content),
+                syntax_spans: Vec::new(),
+            })
+            .collect();
+        return HighlightedLinesResponse {
+            total_lines,
+            start_line: start,
+            lines,
+        };
+    };
+
+    let default_fg = engine.theme.settings.foreground;
+    let mut highlighter = LineHighlighter::new(syntax, &engine.theme);
+    let mut line_buf = String::with_capacity(256);
+
+    for &prefix_line in &raw_lines[..start_idx] {
+        highlighter.advance_without_spans(&engine.syntax_set, prefix_line, &mut line_buf);
+    }
+
+    let mut lines = Vec::with_capacity(end_idx.saturating_sub(start_idx));
+    for &content in &raw_lines[start_idx..end_idx] {
+        let syntax_spans =
+            highlighter.highlight_line(&engine.syntax_set, default_fg, content, &mut line_buf);
+        lines.push(HighlightedLine {
+            content: String::from(content),
+            syntax_spans,
+        });
+    }
+
+    HighlightedLinesResponse {
+        total_lines,
+        start_line: start,
+        lines,
+    }
+}
+
 /// Parses and highlights a single `diff --git ...` file block into a [`tellit_types::DiffFile`].
 #[must_use]
 pub fn parse_single_file_block(block: &str) -> Option<tellit_types::DiffFile> {
@@ -1555,5 +1654,59 @@ deleted file mode 100644
         assert_eq!(summary.files[2].status, FileStatus::Deleted);
         assert!(extract_file_block_by_path(raw, "src/new.rs").is_some());
         assert!(extract_file_block_by_path(raw, "missing.rs").is_none());
+    }
+
+    #[test]
+    fn highlight_file_lines_preserves_multiline_block_comment_state() {
+        let source = "\
+/* start block comment
+still inside comment
+fn not_a_keyword() {}
+end comment */
+pub fn real_fn() -> u32 { 42 }
+";
+        let resp = highlight_file_lines("src/demo.rs", source, Some(3), Some(5));
+        assert_eq!(resp.total_lines, 5);
+        assert_eq!(resp.start_line, 3);
+        assert_eq!(resp.lines.len(), 3);
+        // Line 3 is inside the block comment opened on line 1 (comment palette style 4).
+        assert_eq!(resp.lines[0].content, "fn not_a_keyword() {}");
+        assert_eq!(
+            resp.lines[0].syntax_spans,
+            alloc::vec![SyntaxSpan {
+                len: u32::try_from("fn not_a_keyword() {}".len()).unwrap(),
+                style: 4,
+            }]
+        );
+        // Line 5 is outside the block comment and should highlight Rust keywords/types/numbers.
+        assert_eq!(resp.lines[2].content, "pub fn real_fn() -> u32 { 42 }");
+        assert!(resp.lines[2].syntax_spans.len() > 1);
+        assert!(resp.lines[2].syntax_spans.iter().any(|s| s.style != 4));
+    }
+
+    #[test]
+    fn highlight_file_lines_respects_generated_files_long_lines_and_clamping() {
+        let generated = "// DO NOT EDIT - generated by tool\npub fn ignored() {}\n";
+        let gen_resp = highlight_file_lines("src/gen.rs", generated, None, None);
+        assert_eq!(gen_resp.total_lines, 2);
+        assert_eq!(gen_resp.start_line, 1);
+        assert!(gen_resp.lines.iter().all(|l| l.syntax_spans.is_empty()));
+
+        let long_line = alloc::format!("let s = \"{}\";", "a".repeat(MAX_HIGHLIGHT_LINE_BYTES));
+        let with_long = alloc::format!("{long_line}\npub fn after_long() {{}}\n");
+        let long_resp = highlight_file_lines("src/long.rs", &with_long, Some(1), Some(99));
+        assert_eq!(long_resp.total_lines, 2);
+        assert_eq!(long_resp.lines.len(), 2);
+        assert!(long_resp.lines[0].syntax_spans.is_empty());
+        assert!(!long_resp.lines[1].syntax_spans.is_empty());
+
+        let oob = highlight_file_lines("src/long.rs", &with_long, Some(10), Some(20));
+        assert_eq!(oob.total_lines, 2);
+        assert_eq!(oob.start_line, 10);
+        assert!(oob.lines.is_empty());
+
+        let empty = highlight_file_lines("src/empty.rs", "", None, None);
+        assert_eq!(empty.total_lines, 0);
+        assert!(empty.lines.is_empty());
     }
 }

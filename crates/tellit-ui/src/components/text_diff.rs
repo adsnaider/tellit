@@ -34,8 +34,8 @@ use crate::components::markdown_diff::{MarkdownPreviewBody, MarkdownTab};
 use crate::state::{self, AutoCollapseReason, DiffViewMode};
 
 use expanded::{
-    DEFAULT_EXPAND_COUNT, ExpandDirection, ExpandedLinesMap, FileExpandedState, MergedChunk,
-    merge_chunks_for_file,
+    DEFAULT_EXPAND_COUNT, ExpandedLinesMap, FileExpandedState, GapSlice, MergedChunk,
+    compute_auto_expand_plan, has_hidden_context, merge_chunks_for_file, supports_expansion,
 };
 use split::{SideBySideRow, pair_side_by_side_rows};
 use word_highlight::render_code_line;
@@ -114,17 +114,42 @@ pub struct CreateThreadEvent {
     pub on_done: Callback<Result<(), String>>,
 }
 
-/// Request emitted to expand hidden context lines around an original hunk index.
+/// Specific hidden-context expansion or collapse operation requested for a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpandAction {
+    /// Manually reveal a concrete gap slice from an `ExpandBar` button click.
+    RevealGapSlice {
+        /// Gap slice to mark revealed in [`FileExpandedState`].
+        slice: GapSlice,
+        /// Inclusive 1-based target-file line range needed to render `slice`.
+        new_line_range: (u32, u32),
+        /// Inclusive 1-based base-file line range needed as fallback.
+        old_line_range: (u32, u32),
+    },
+    /// Automatically reveal context around unresolved inline comments outside visible diff hunks.
+    AutoCommentContext {
+        /// Coalesced gap slices covering unresolved comments and surrounding context.
+        slices: Vec<GapSlice>,
+        /// Bounding inclusive 1-based target-file line range needed across `slices`.
+        new_line_range: (u32, u32),
+        /// Bounding inclusive 1-based base-file line range needed across `slices`.
+        old_line_range: (u32, u32),
+        /// Unresolved thread keys `(side, start, end)` recorded as attempted to prevent duplicate fetches.
+        attempt_keys: Vec<(CommentSide, u32, u32)>,
+    },
+    /// Reveal every hidden context gap in the file in a single highlighted fetch.
+    ExpandEntireFile,
+    /// Collapse all manually expanded context back to diff hunks (preserving auto-expanded comments).
+    CollapseManualContext,
+}
+
+/// Request emitted to expand or collapse hidden context lines on a diff file.
 #[derive(Clone)]
 pub struct ExpandLinesEvent {
-    /// Diff file descriptor needing context lines.
+    /// Diff file descriptor needing context changes.
     pub file: Arc<DiffFile>,
-    /// Original index inside `file.chunks`.
-    pub chunk_index: usize,
-    /// Direction (`Up` or `Down`), or `None` when expanding an entire gap before `chunk_index`.
-    pub direction: Option<ExpandDirection>,
-    /// Number of lines to reveal (or full hidden gap when `direction` is `None`).
-    pub count: u32,
+    /// Expansion or collapse operation to apply.
+    pub action: ExpandAction,
 }
 
 /// Active line-range drag state for one diff card.
@@ -176,6 +201,160 @@ enum ExpandBarPosition {
     Top,
     Middle,
     Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpandFileButtonState {
+    Hidden,
+    ExpandFile,
+    CollapseContext,
+}
+
+const MAX_AUTO_EXPAND_WINDOW_LIMIT: usize = 2_000;
+
+fn required_window_limit_for_side_line(
+    merged_chunks: &[MergedChunk],
+    mode: DiffViewMode,
+    current_limit: usize,
+    side: CommentSide,
+    target_line: u32,
+) -> Option<usize> {
+    let total_merged_lines: usize = merged_chunks.iter().map(|mc| mc.lines.len()).sum();
+    if total_merged_lines <= LARGE_FILE_WINDOW_THRESHOLD {
+        return None;
+    }
+
+    let mut rows_before = 0usize;
+    for mc in merged_chunks {
+        match mode {
+            DiffViewMode::Unified => {
+                for (idx, line) in mc.iter_lines().enumerate() {
+                    let matches = match side {
+                        CommentSide::Old => {
+                            line.kind != DiffLineKind::Add
+                                && line.old_line_number == Some(target_line)
+                        }
+                        CommentSide::New => {
+                            line.kind != DiffLineKind::Delete
+                                && line.new_line_number == Some(target_line)
+                        }
+                    };
+                    if matches {
+                        let needed = rows_before.saturating_add(idx + 1);
+                        return (needed > current_limit)
+                            .then(|| needed.saturating_add(CHUNK_WINDOW_STEP_LINES));
+                    }
+                }
+                rows_before = rows_before.saturating_add(mc.lines.len());
+            }
+            DiffViewMode::Split => {
+                let rows = pair_side_by_side_rows(mc);
+                for (idx, row) in rows.iter().enumerate() {
+                    let matches = match side {
+                        CommentSide::Old => {
+                            row.old_line_idx
+                                .and_then(|i| mc.line(i))
+                                .and_then(|l| l.old_line_number)
+                                == Some(target_line)
+                        }
+                        CommentSide::New => {
+                            row.new_line_idx
+                                .and_then(|i| mc.line(i))
+                                .and_then(|l| l.new_line_number)
+                                == Some(target_line)
+                        }
+                    };
+                    if matches {
+                        let needed = rows_before.saturating_add(idx + 1);
+                        return (needed > current_limit)
+                            .then(|| needed.saturating_add(CHUNK_WINDOW_STEP_LINES));
+                    }
+                }
+                rows_before = rows_before.saturating_add(rows.len());
+            }
+        }
+    }
+    None
+}
+
+fn auto_window_floor_for_threads(
+    merged_chunks: &[MergedChunk],
+    mode: DiffViewMode,
+    threads: &[JjCommentThread],
+) -> usize {
+    let total_merged_lines: usize = merged_chunks.iter().map(|mc| mc.lines.len()).sum();
+    if total_merged_lines <= LARGE_FILE_WINDOW_THRESHOLD {
+        return CHUNK_WINDOW_STEP_LINES;
+    }
+    let mut floor = CHUNK_WINDOW_STEP_LINES;
+    for thread in threads {
+        if thread.resolved {
+            continue;
+        }
+        let Some(lr) = thread.line_range else {
+            continue;
+        };
+        if let Some(needed) =
+            required_window_limit_for_side_line(merged_chunks, mode, floor, thread.side, lr.end)
+            && needed <= MAX_AUTO_EXPAND_WINDOW_LIMIT
+        {
+            floor = floor.max(needed);
+        }
+    }
+    floor
+}
+
+fn next_window_limit_after_gap_expand(
+    prev_total_merged: usize,
+    prev_shown_rows: usize,
+    current_limit: usize,
+    revealed_count: usize,
+) -> Option<usize> {
+    let next_total_merged = prev_total_merged.saturating_add(revealed_count);
+    if next_total_merged <= LARGE_FILE_WINDOW_THRESHOLD {
+        return None;
+    }
+    let min_limit = prev_shown_rows.saturating_add(revealed_count);
+    (min_limit > current_limit).then_some(min_limit)
+}
+
+fn compute_expand_file_button_state(
+    file: &DiffFile,
+    merged_chunks: &[MergedChunk],
+    exp_state: Option<&FileExpandedState>,
+    mode: DiffViewMode,
+    current_window_limit: usize,
+    auto_window_floor: usize,
+) -> ExpandFileButtonState {
+    if !file.chunks_loaded {
+        return ExpandFileButtonState::Hidden;
+    }
+    let total_merged_lines: usize = merged_chunks.iter().map(|mc| mc.lines.len()).sum();
+    let total_rows = if total_merged_lines <= LARGE_FILE_WINDOW_THRESHOLD {
+        total_merged_lines
+    } else if mode == DiffViewMode::Split {
+        merged_chunks
+            .iter()
+            .map(|mc| pair_side_by_side_rows(mc).len())
+            .sum()
+    } else {
+        total_merged_lines
+    };
+    let is_window_truncated =
+        total_merged_lines > LARGE_FILE_WINDOW_THRESHOLD && current_window_limit < total_rows;
+    let has_hidden_gaps =
+        supports_expansion(file) && has_hidden_context(file, merged_chunks, exp_state);
+    if has_hidden_gaps || is_window_truncated {
+        return ExpandFileButtonState::ExpandFile;
+    }
+    let has_manual_gaps = exp_state.is_some_and(FileExpandedState::has_manual_expansion);
+    let has_manual_window = total_merged_lines > LARGE_FILE_WINDOW_THRESHOLD
+        && current_window_limit > auto_window_floor;
+    if has_manual_gaps || has_manual_window {
+        ExpandFileButtonState::CollapseContext
+    } else {
+        ExpandFileButtonState::Hidden
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,6 +550,7 @@ pub fn TextDiffCard(
     let is_commit_msg = path == COMMIT_MESSAGE_PATH;
     let is_md = !is_commit_msg && state::is_markdown_file(&path);
     let is_img = !is_commit_msg && state::is_image_file(&path);
+    let is_single_file = single_file_header.is_some();
     let path_for_id = state::file_element_id(&path);
     let path_attr = path.clone();
     let path_toggle_collapse = path.clone();
@@ -496,17 +676,11 @@ pub fn TextDiffCard(
 
     // Defer `/api/line-count` until the card is uncollapsed, near the viewport, and hydrated.
     Effect::new(move |_| {
-        if is_collapsed_sig.get() || !is_near_viewport.get() {
+        if is_collapsed_sig.get() || (!is_single_file && !is_near_viewport.get()) {
             return;
         }
-        let can_expand = file.with(|f| {
-            !is_commit_msg
-                && !is_img
-                && f.chunks_loaded
-                && f.status != FileStatus::Added
-                && f.status != FileStatus::Deleted
-                && !f.chunks.is_empty()
-        });
+        let can_expand =
+            file.with(|f| !is_commit_msg && !is_img && f.chunks_loaded && supports_expansion(f));
         let has_line_counts = file_exp_memo.with(|exp| {
             exp.as_ref()
                 .is_some_and(|e| e.old_total_lines.is_some() || e.new_total_lines.is_some())
@@ -613,6 +787,55 @@ pub fn TextDiffCard(
         if changed {
             cancel_pending_restore_raf();
             let _ = pending_md_scroll.try_set(None);
+        }
+    });
+
+    // Auto-expand surrounding context for unresolved inline comments outside visible diff hunks
+    // (both Old and New sides) and widen progressive windows for unresolved inline threads once
+    // the card is uncollapsed, near viewport (or active in single-file view), and hydrated.
+    Effect::new(move |_| {
+        if is_commit_msg || is_img || is_collapsed_sig.get() {
+            return;
+        }
+        if !is_single_file && !is_near_viewport.get() {
+            return;
+        }
+        let file_arc = file.get();
+        if !file_arc.chunks_loaded {
+            return;
+        }
+        let merged = merged_chunks_memo.get();
+        if supports_expansion(&file_arc) {
+            let plan = visible_threads.with(|threads| {
+                file_exp_memo
+                    .with(|exp| compute_auto_expand_plan(&file_arc, &merged, exp.as_ref(), threads))
+            });
+            if let Some(plan) = plan {
+                on_expand_lines.run(ExpandLinesEvent {
+                    file: file_arc,
+                    action: ExpandAction::AutoCommentContext {
+                        slices: plan.slices,
+                        new_line_range: plan.new_line_range,
+                        old_line_range: plan.old_line_range,
+                        attempt_keys: plan.attempt_keys,
+                    },
+                });
+                return;
+            }
+        }
+
+        // If any unresolved inline comment (in-hunk or auto-expanded) falls past the progressive
+        // window on a moderately large file, widen the window enough so it renders inline.
+        let total_merged_lines: usize = merged.iter().map(|mc| mc.lines.len()).sum();
+        if total_merged_lines > LARGE_FILE_WINDOW_THRESHOLD {
+            let mode = diff_mode.get();
+            let current_limit = visible_line_limit.get();
+            let target_limit = visible_threads
+                .with(|threads| auto_window_floor_for_threads(&merged, mode, threads));
+            if target_limit > current_limit {
+                visible_line_limit.set(target_limit);
+                on_window_expanded.run(());
+            }
         }
     });
 
@@ -733,7 +956,29 @@ pub fn TextDiffCard(
             None => path_for_title.clone(),
         })
     });
-    let is_single_file = single_file_header.is_some();
+    let expand_file_btn_state = Memo::new(move |_| {
+        if is_commit_msg || is_img || is_collapsed_sig.get() || !show_code.get() {
+            return ExpandFileButtonState::Hidden;
+        }
+        let mode = diff_mode.get();
+        let current_limit = visible_line_limit.get();
+        merged_chunks_memo.with(|chunks| {
+            let auto_floor = visible_threads
+                .with(|threads| auto_window_floor_for_threads(chunks, mode, threads));
+            file.with(|f| {
+                file_exp_memo.with(|exp| {
+                    compute_expand_file_button_state(
+                        f,
+                        chunks,
+                        exp.as_ref(),
+                        mode,
+                        current_limit,
+                        auto_floor,
+                    )
+                })
+            })
+        })
+    });
 
     view! {
         <article
@@ -858,6 +1103,55 @@ pub fn TextDiffCard(
                             </button>
                         </div>
                     })}
+                    {move || match expand_file_btn_state.get() {
+                        ExpandFileButtonState::Hidden => ().into_any(),
+                        ExpandFileButtonState::ExpandFile => view! {
+                            <button
+                                type="button"
+                                class="btn btn--ghost btn--xs"
+                                data-action="expand-entire-file"
+                                title="Expand all hidden context lines in this file"
+                                aria-label="Expand entire file"
+                                prop:disabled=move || expand_loading.get()
+                                on:click=move |_| {
+                                    let f = file.get_untracked();
+                                    visible_line_limit.set(usize::MAX);
+                                    on_window_expanded.run(());
+                                    if supports_expansion(&f) {
+                                        on_expand_lines.run(ExpandLinesEvent {
+                                            file: f,
+                                            action: ExpandAction::ExpandEntireFile,
+                                        });
+                                    }
+                                }
+                            >
+                                "Expand file"
+                            </button>
+                        }
+                        .into_any(),
+                        ExpandFileButtonState::CollapseContext => view! {
+                            <button
+                                type="button"
+                                class="btn btn--ghost btn--xs"
+                                data-action="collapse-context"
+                                title="Collapse manually expanded context back to diff hunks"
+                                aria-label="Collapse expanded context"
+                                on:click=move |_| {
+                                    let f = file.get_untracked();
+                                    visible_line_limit.set(CHUNK_WINDOW_STEP_LINES);
+                                    if supports_expansion(&f) {
+                                        on_expand_lines.run(ExpandLinesEvent {
+                                            file: f,
+                                            action: ExpandAction::CollapseManualContext,
+                                        });
+                                    }
+                                }
+                            >
+                                "Collapse context"
+                            </button>
+                        }
+                        .into_any(),
+                    }}
                     <button
                         type="button"
                         class="btn btn--ghost btn--xs"
@@ -1178,6 +1472,31 @@ pub fn TextDiffCard(
                                         let remaining_lines = window_plan.remaining_lines;
                                         let shown_lines = window_plan.shown_lines;
                                         let total_lines = window_plan.total_lines;
+                                        let emit_gap_expand = move |f: Arc<DiffFile>, req: expanded::GapSliceRequest| {
+                                            let revealed = usize::try_from(
+                                                req.slice
+                                                    .end_offset
+                                                    .saturating_sub(req.slice.start_offset),
+                                            )
+                                            .unwrap_or(0);
+                                            if let Some(next_limit) = next_window_limit_after_gap_expand(
+                                                total_merged_lines,
+                                                shown_lines,
+                                                visible_line_limit.get_untracked(),
+                                                revealed,
+                                            ) {
+                                                visible_line_limit.set(next_limit);
+                                                on_window_expanded.run(());
+                                            }
+                                            on_expand_lines.run(ExpandLinesEvent {
+                                                file: f,
+                                                action: ExpandAction::RevealGapSlice {
+                                                    slice: req.slice,
+                                                    new_line_range: req.new_line_range,
+                                                    old_line_range: req.old_line_range,
+                                                },
+                                            });
+                                        };
 
                                         view! {
                                             <>
@@ -1202,20 +1521,23 @@ pub fn TextDiffCard(
                                                             if chunk_limit == 0 {
                                                                 return None;
                                                             }
-                                                            let first_orig = *mc.original_indices.first().unwrap_or(&0);
-                                                            let last_orig = *mc.original_indices.last().unwrap_or(&0);
                                                             let is_first = merged_idx == 0;
                                                             let is_last = merged_idx + 1 == chunk_count
                                                                 && remaining_lines == 0;
                                                             let hidden_before = mc.hidden_lines_before;
                                                             let hidden_after = mc.hidden_lines_after.unwrap_or(0);
+                                                            let before_gap = mc.before_gap;
+                                                            let after_gap = mc.after_gap;
                                                             let file_top = Arc::clone(&file_snapshot);
                                                             let file_mid = Arc::clone(&file_snapshot);
                                                             let file_bot = Arc::clone(&file_snapshot);
 
                                                             Some(view! {
                                                                 <div class="diff-chunk-wrapper">
-                                                                    {(is_first && hidden_before > 0).then(|| view! {
+                                                                    {(is_first && hidden_before > 0)
+                                                                        .then_some(before_gap)
+                                                                        .flatten()
+                                                                        .map(|gap| view! {
                                                                         <ExpandBar
                                                                             position=ExpandBarPosition::Top
                                                                             hidden_lines=hidden_before
@@ -1223,56 +1545,34 @@ pub fn TextDiffCard(
                                                                             on_expand_up=Callback::new(|()| {})
                                                                             on_expand_down=Callback::new({
                                                                                 let f = Arc::clone(&file_top);
-                                                                                move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                                    file: Arc::clone(&f),
-                                                                                    chunk_index: first_orig,
-                                                                                    direction: Some(ExpandDirection::Up),
-                                                                                    count: DEFAULT_EXPAND_COUNT,
-                                                                                })
+                                                                                move |()| emit_gap_expand(Arc::clone(&f), gap.take_from_end(DEFAULT_EXPAND_COUNT))
                                                                             })
                                                                             on_expand_all=Callback::new({
                                                                                 let f = Arc::clone(&file_top);
-                                                                                move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                                    file: Arc::clone(&f),
-                                                                                    chunk_index: first_orig,
-                                                                                    direction: None,
-                                                                                    count: hidden_before,
-                                                                                })
+                                                                                move |()| emit_gap_expand(Arc::clone(&f), gap.as_full_slice())
                                                                             })
                                                                         />
                                                                     })}
 
-                                                                    {(!is_first && hidden_before > 0).then(|| view! {
+                                                                    {(!is_first && hidden_before > 0)
+                                                                        .then_some(before_gap)
+                                                                        .flatten()
+                                                                        .map(|gap| view! {
                                                                         <ExpandBar
                                                                             position=ExpandBarPosition::Middle
                                                                             hidden_lines=hidden_before
                                                                             is_loading=expand_loading
                                                                             on_expand_up=Callback::new({
                                                                                 let f = Arc::clone(&file_mid);
-                                                                                move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                                    file: Arc::clone(&f),
-                                                                                    chunk_index: first_orig.saturating_sub(1),
-                                                                                    direction: Some(ExpandDirection::Down),
-                                                                                    count: DEFAULT_EXPAND_COUNT,
-                                                                                })
+                                                                                move |()| emit_gap_expand(Arc::clone(&f), gap.take_from_start(DEFAULT_EXPAND_COUNT))
                                                                             })
                                                                             on_expand_down=Callback::new({
                                                                                 let f = Arc::clone(&file_mid);
-                                                                                move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                                    file: Arc::clone(&f),
-                                                                                    chunk_index: first_orig,
-                                                                                    direction: Some(ExpandDirection::Up),
-                                                                                    count: DEFAULT_EXPAND_COUNT,
-                                                                                })
+                                                                                move |()| emit_gap_expand(Arc::clone(&f), gap.take_from_end(DEFAULT_EXPAND_COUNT))
                                                                             })
                                                                             on_expand_all=Callback::new({
                                                                                 let f = Arc::clone(&file_mid);
-                                                                                move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                                    file: Arc::clone(&f),
-                                                                                    chunk_index: first_orig,
-                                                                                    direction: None,
-                                                                                    count: hidden_before,
-                                                                                })
+                                                                                move |()| emit_gap_expand(Arc::clone(&f), gap.as_full_slice())
                                                                             })
                                                                         />
                                                                     })}
@@ -1301,29 +1601,22 @@ pub fn TextDiffCard(
                                                                         ).into_any()
                                                                     }}
 
-                                                                    {(is_last && hidden_after > 0).then(|| view! {
+                                                                    {(is_last && hidden_after > 0)
+                                                                        .then_some(after_gap)
+                                                                        .flatten()
+                                                                        .map(|gap| view! {
                                                                         <ExpandBar
                                                                             position=ExpandBarPosition::Bottom
                                                                             hidden_lines=hidden_after
                                                                             is_loading=expand_loading
                                                                             on_expand_up=Callback::new({
                                                                                 let f = Arc::clone(&file_bot);
-                                                                                move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                                    file: Arc::clone(&f),
-                                                                                    chunk_index: last_orig,
-                                                                                    direction: Some(ExpandDirection::Down),
-                                                                                    count: DEFAULT_EXPAND_COUNT,
-                                                                                })
+                                                                                move |()| emit_gap_expand(Arc::clone(&f), gap.take_from_start(DEFAULT_EXPAND_COUNT))
                                                                             })
                                                                             on_expand_down=Callback::new(|()| {})
                                                                             on_expand_all=Callback::new({
                                                                                 let f = Arc::clone(&file_bot);
-                                                                                move |()| on_expand_lines.run(ExpandLinesEvent {
-                                                                                    file: Arc::clone(&f),
-                                                                                    chunk_index: last_orig,
-                                                                                    direction: Some(ExpandDirection::Down),
-                                                                                    count: hidden_after,
-                                                                                })
+                                                                                move |()| emit_gap_expand(Arc::clone(&f), gap.as_full_slice())
                                                                             })
                                                                         />
                                                                     })}
@@ -2505,5 +2798,148 @@ mod tests {
         assert_eq!(split_window.shown_lines, 150);
         assert_eq!(split_window.remaining_lines, 150);
         assert_eq!(split_window.chunk_limits, alloc::vec![150]);
+    }
+
+    #[test]
+    fn gap_expand_window_limit_never_hides_visible_rows() {
+        // Staying under the 500-line threshold requires no limit change.
+        assert_eq!(
+            next_window_limit_after_gap_expand(400, 400, CHUNK_WINDOW_STEP_LINES, 20),
+            None
+        );
+        // Crossing the 500-line threshold keeps all 490 visible rows plus the 20 newly revealed rows.
+        assert_eq!(
+            next_window_limit_after_gap_expand(490, 490, CHUNK_WINDOW_STEP_LINES, 20),
+            Some(510)
+        );
+        // Expanding an upper gap on an already-windowed diff grows the budget by the revealed count.
+        assert_eq!(
+            next_window_limit_after_gap_expand(800, 150, CHUNK_WINDOW_STEP_LINES, 20),
+            Some(170)
+        );
+        // Already fully expanded (usize::MAX) stays untouched.
+        assert_eq!(
+            next_window_limit_after_gap_expand(800, 800, usize::MAX, 20),
+            None
+        );
+    }
+
+    #[test]
+    fn expand_file_button_and_auto_window_floor_handle_large_added_and_modified_files() {
+        // Large Added file (>500 lines): no hidden gaps, but progressive window truncates rows.
+        let added_lines: Vec<tellit_types::DiffLine> = (1..=650u32)
+            .map(|n| mk_line(DiffLineKind::Add, None, Some(n), "added"))
+            .collect();
+        let added_file = Arc::new(DiffFile {
+            path: String::from("src/new_big.rs"),
+            old_path: None,
+            status: FileStatus::Added,
+            additions: 650,
+            deletions: 0,
+            is_generated: false,
+            chunks: alloc::vec![DiffChunk {
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 650,
+                header: String::from("@@ -0,0 +1,650 @@"),
+                lines: added_lines,
+            }],
+            chunks_loaded: true,
+        });
+        let added_merged = merge_chunks_for_file(&added_file, None);
+
+        // Unresolved in-hunk comment at line 400 widens the auto window floor even with no auto_slices.
+        let threads = alloc::vec![JjCommentThread {
+            id: String::from("t-in-hunk"),
+            change_id: String::from("chg"),
+            commit_id: String::from("cid"),
+            file_path: String::from("src/new_big.rs"),
+            side: CommentSide::New,
+            line_range: Some(LineRangeSpec {
+                start: 400,
+                end: 400
+            }),
+            comments: alloc::vec![String::from("check")],
+            resolved: false,
+        }];
+        let floor = auto_window_floor_for_threads(&added_merged, DiffViewMode::Unified, &threads);
+        assert_eq!(floor, 400 + CHUNK_WINDOW_STEP_LINES);
+
+        // Truncated at floor (550 < 650) shows "Expand file".
+        assert_eq!(
+            compute_expand_file_button_state(
+                &added_file,
+                &added_merged,
+                None,
+                DiffViewMode::Unified,
+                floor,
+                floor,
+            ),
+            ExpandFileButtonState::ExpandFile
+        );
+        // Expanding the window to usize::MAX flips to "Collapse context".
+        assert_eq!(
+            compute_expand_file_button_state(
+                &added_file,
+                &added_merged,
+                None,
+                DiffViewMode::Unified,
+                usize::MAX,
+                floor,
+            ),
+            ExpandFileButtonState::CollapseContext
+        );
+
+        // Large Modified file expanded across all gaps: stays ExpandFile if still window-truncated,
+        // and flips to CollapseContext once visible_line_limit reveals all rows.
+        let mod_lines: Vec<tellit_types::DiffLine> = (1..=600u32)
+            .map(|n| mk_line(DiffLineKind::Context, Some(n), Some(n), "ctx"))
+            .collect();
+        let mod_file = Arc::new(DiffFile {
+            path: String::from("src/big.rs"),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 0,
+            is_generated: false,
+            chunks: alloc::vec![DiffChunk {
+                old_start: 1,
+                old_lines: 600,
+                new_start: 1,
+                new_lines: 600,
+                header: String::from("@@ -1,600 +1,600 @@"),
+                lines: mod_lines,
+            }],
+            chunks_loaded: true,
+        });
+        let exp = FileExpandedState {
+            new_total_lines: Some(600),
+            expand_entire_file: true,
+            ..FileExpandedState::default()
+        };
+        let mod_merged = merge_chunks_for_file(&mod_file, Some(&exp));
+        assert_eq!(
+            compute_expand_file_button_state(
+                &mod_file,
+                &mod_merged,
+                Some(&exp),
+                DiffViewMode::Unified,
+                CHUNK_WINDOW_STEP_LINES,
+                CHUNK_WINDOW_STEP_LINES,
+            ),
+            ExpandFileButtonState::ExpandFile
+        );
+        assert_eq!(
+            compute_expand_file_button_state(
+                &mod_file,
+                &mod_merged,
+                Some(&exp),
+                DiffViewMode::Unified,
+                usize::MAX,
+                CHUNK_WINDOW_STEP_LINES,
+            ),
+            ExpandFileButtonState::CollapseContext
+        );
     }
 }

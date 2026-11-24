@@ -59,7 +59,7 @@ pub use components::revision_tree::{
     GraphCellLayout, GraphNodeKind, GraphRowLayout, compute_graph_layout,
 };
 use components::settings_modal::SettingsModal;
-use components::single_file_view::SingleFileView;
+use components::single_file_view::{SingleFileNavTarget, SingleFileView, resolve_single_file_step};
 use components::text_diff::expanded::{
     ExpandedLinesMap, record_expand_all_before, record_line_expansion, split_blob_lines,
 };
@@ -1328,7 +1328,9 @@ fn reload_changes_and_commits(ctx: AppCtx, reload_diff: bool) {
         let Ok(mut resp) = api::fetch_jj_changes(None).await else {
             if ctx.changes_req_id.get_value() == changes_id {
                 ctx.reloading.set(false);
-                ctx.loading_changes.set(false);
+                if ctx.loading_changes.get_untracked() {
+                    ctx.loading_changes.set(false);
+                }
             }
             return;
         };
@@ -1366,6 +1368,21 @@ fn reload_changes_and_commits(ctx: AppCtx, reload_diff: bool) {
             return;
         }
 
+        // Preserve an explicitly inspected change outside the default `jj log` graph so
+        // comment refreshes and watch reloads do not drop the revision summary banner.
+        if !initial_selected.is_empty()
+            && !resp.changes.iter().any(|c| c.change_id == initial_selected)
+            && let Ok(extra) = api::fetch_jj_changes(Some(&initial_selected)).await
+        {
+            if ctx.changes_req_id.get_value() != changes_id {
+                return;
+            }
+            if let Some(found) = extra.changes.into_iter().next() {
+                resp.graph_rows.insert(0, JjGraphRow::standalone(&found));
+                resp.changes.insert(0, found);
+            }
+        }
+
         let new_head_commit = resp
             .changes
             .iter()
@@ -1374,7 +1391,9 @@ fn reload_changes_and_commits(ctx: AppCtx, reload_diff: bool) {
 
         ctx.changes.set(resp.changes);
         ctx.graph_rows.set(resp.graph_rows);
-        ctx.loading_changes.set(false);
+        if ctx.loading_changes.get_untracked() {
+            ctx.loading_changes.set(false);
+        }
         ctx.reloading.set(false);
 
         // If the user switched to a different change while `fetch_jj_changes` was in flight,
@@ -2346,6 +2365,16 @@ pub fn App() -> impl IntoView {
         })
     });
 
+    let has_active_change = Memo::new(move |_| active_change.with(Option::is_some));
+    let active_change_review_status = Memo::new(move |_| {
+        active_change.with(|opt| {
+            opt.as_ref()
+                .map_or(tellit_types::ReviewStatus::None, JjChange::review_status)
+        })
+    });
+    let show_initial_changes_loading =
+        Memo::new(move |_| ctx.loading_changes.get() && ctx.diff_data.with(Option::is_none));
+
     view! {
         <div class="app-shell">
             <header class="topbar">
@@ -2689,9 +2718,7 @@ pub fn App() -> impl IntoView {
                             </section>
                         }.into_any(),
                         RepoStatusState::Loaded(_) => {
-                            if ctx.loading_changes.get()
-                                && ctx.diff_data.with(|d| d.is_none())
-                            {
+                            if show_initial_changes_loading.get() {
                                 return view! {
                                     <div class="center-message">"Loading Jujutsu revisions..."</div>
                                 }.into_any();
@@ -2699,60 +2726,77 @@ pub fn App() -> impl IntoView {
 
                             view! {
                                 <div class="diff-workspace">
-                                    {move || {
-                                        let change_opt = active_change.get();
-                                        let total_threads = ctx.comments.with(Vec::len);
-                                        let unresolved_threads = ctx
-                                            .comments
-                                            .with(|list| list.iter().filter(|t| !t.resolved).count());
-                                        change_opt.map(|change| {
-                                            let review = change.review_status();
-                                            let status = Signal::derive(move || review);
-                                            view! {
-                                                <section class="revision-summary">
-                                                    <div class="revision-summary__title-row">
-                                                        <span class="jj-change-id jj-change-id--lg">
-                                                            {change.short_change_id}
-                                                        </span>
-                                                        <span class="muted-mono">{change.short_commit_id}</span>
-                                                        <ReviewDot
-                                                            status=status
-                                                            comment_count=change.comment_count
-                                                            unresolved_count=change.unresolved_comment_count
-                                                        />
-                                                        <h1 class="revision-summary__desc">{change.description}</h1>
-                                                    </div>
-                                                    <div class="revision-summary__meta">
-                                                        <span>{change.author}</span>
-                                                        <span>{change.timestamp}</span>
-                                                        {(total_threads > 0).then(|| view! {
-                                                            <span class={if unresolved_threads > 0 {
-                                                                "pill-tag pill-tag--warn"
+                                    {move || has_active_change.get().then(|| view! {
+                                        <section class="revision-summary">
+                                            <div class="revision-summary__title-row">
+                                                <span class="jj-change-id jj-change-id--lg">
+                                                    {move || active_change.with(|opt| {
+                                                        opt.as_ref().map_or_else(String::new, |c| c.short_change_id.clone())
+                                                    })}
+                                                </span>
+                                                <span class="muted-mono">
+                                                    {move || active_change.with(|opt| {
+                                                        opt.as_ref().map_or_else(String::new, |c| c.short_commit_id.clone())
+                                                    })}
+                                                </span>
+                                                {move || active_change.with(|opt| {
+                                                    opt.as_ref().map(|c| (c.comment_count, c.unresolved_comment_count))
+                                                }).map(|(comment_count, unresolved_count)| view! {
+                                                    <ReviewDot
+                                                        status=active_change_review_status
+                                                        comment_count=comment_count
+                                                        unresolved_count=unresolved_count
+                                                    />
+                                                })}
+                                                <h1 class="revision-summary__desc">
+                                                    {move || active_change.with(|opt| {
+                                                        opt.as_ref().map_or_else(String::new, |c| c.description.clone())
+                                                    })}
+                                                </h1>
+                                            </div>
+                                            <div class="revision-summary__meta">
+                                                <span>
+                                                    {move || active_change.with(|opt| {
+                                                        opt.as_ref().map_or_else(String::new, |c| c.author.clone())
+                                                    })}
+                                                </span>
+                                                <span>
+                                                    {move || active_change.with(|opt| {
+                                                        opt.as_ref().map_or_else(String::new, |c| c.timestamp.clone())
+                                                    })}
+                                                </span>
+                                                {move || {
+                                                    let total_threads = ctx.comments.with(Vec::len);
+                                                    let unresolved_threads = ctx
+                                                        .comments
+                                                        .with(|list| list.iter().filter(|t| !t.resolved).count());
+                                                    (total_threads > 0).then(|| view! {
+                                                        <span class={if unresolved_threads > 0 {
+                                                            "pill-tag pill-tag--warn"
+                                                        } else {
+                                                            "pill-tag pill-tag--ok"
+                                                        }}>
+                                                            {if unresolved_threads > 0 {
+                                                                alloc::format!("{unresolved_threads} unresolved / {total_threads} threads")
                                                             } else {
-                                                                "pill-tag pill-tag--ok"
-                                                            }}>
-                                                                {if unresolved_threads > 0 {
-                                                                    alloc::format!("{unresolved_threads} unresolved / {total_threads} threads")
-                                                                } else {
-                                                                    alloc::format!("{total_threads} resolved")
-                                                                }}
-                                                            </span>
-                                                        })}
-                                                        {move || ctx.highlighted_word.get().map(|w| view! {
-                                                            <button
-                                                                type="button"
-                                                                class="pill-tag pill-tag--info"
-                                                                title="Click to clear highlighted identifier"
-                                                                on:click=move |_| ctx.highlighted_word.set(None)
-                                                            >
-                                                                {alloc::format!("token: {w} ×")}
-                                                            </button>
-                                                        })}
-                                                    </div>
-                                                </section>
-                                            }
-                                        })
-                                    }}
+                                                                alloc::format!("{total_threads} resolved")
+                                                            }}
+                                                        </span>
+                                                    })
+                                                }}
+                                                {move || ctx.highlighted_word.get().map(|w| view! {
+                                                    <button
+                                                        type="button"
+                                                        class="pill-tag pill-tag--info"
+                                                        title="Click to clear highlighted identifier"
+                                                        on:click=move |_| ctx.highlighted_word.set(None)
+                                                    >
+                                                        {alloc::format!("token: {w} ×")}
+                                                    </button>
+                                                })}
+                                            </div>
+                                        </section>
+                                    })}
 
                                     {move || match diff_pane_state.get() {
                                         DiffPaneState::Loading => view! {
@@ -3165,14 +3209,10 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
                 .route
                 .with_untracked(|r| r.file_path().map(String::from))
             {
-                if let Some(cur_idx) = files.iter().position(|f| f.path == active_path)
-                    && let Some(next_idx) = keyboard::adjacent_file_index(
-                        cur_idx,
-                        files.len(),
-                        NavigationDirection::Next,
-                    )
-                {
-                    navigate_to_file(ctx, files[next_idx].path.clone(), true);
+                let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+                match resolve_single_file_step(&paths, &active_path, NavigationDirection::Next) {
+                    SingleFileNavTarget::File(path) => navigate_to_file(ctx, path, true),
+                    SingleFileNavTarget::Overview => navigate_to_overview(ctx),
                 }
             } else {
                 let next_idx = ctx
@@ -3192,14 +3232,10 @@ fn handle_global_keydown(ctx: AppCtx, ev: &KeyboardEvent) {
                 .route
                 .with_untracked(|r| r.file_path().map(String::from))
             {
-                if let Some(cur_idx) = files.iter().position(|f| f.path == active_path)
-                    && let Some(prev_idx) = keyboard::adjacent_file_index(
-                        cur_idx,
-                        files.len(),
-                        NavigationDirection::Prev,
-                    )
-                {
-                    navigate_to_file(ctx, files[prev_idx].path.clone(), true);
+                let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+                match resolve_single_file_step(&paths, &active_path, NavigationDirection::Prev) {
+                    SingleFileNavTarget::File(path) => navigate_to_file(ctx, path, true),
+                    SingleFileNavTarget::Overview => navigate_to_overview(ctx),
                 }
             } else {
                 let prev_idx = ctx

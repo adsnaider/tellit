@@ -1821,8 +1821,7 @@ tr:hover .diff-gutter--actions .diff-line-actions,
 }
 
 .thread-card__meta,
-.thread-card__controls,
-.confirm-inline {
+.thread-card__controls {
   display: flex;
   align-items: center;
   gap: 6px;

@@ -62,8 +62,8 @@ pub fn HelpModal(#[prop(into)] is_open: Signal<bool>, on_close: Callback<()>) ->
                         <section class="help-section">
                             <h3 class="help-section__title">"File & View Navigation"</h3>
                             <ShortcutRow keys=&["u"] label="Return to change overview" />
-                            <ShortcutRow keys=&["]"] label="Next file" />
-                            <ShortcutRow keys=&["["] label="Previous file" />
+                            <ShortcutRow keys=&["]"] label="Next file (or overview)" />
+                            <ShortcutRow keys=&["["] label="Previous file (or overview)" />
                             <ShortcutRow keys=&["{"] label="First file" />
                             <ShortcutRow keys=&["}"] label="Last file" />
                         </section>

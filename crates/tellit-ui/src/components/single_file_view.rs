@@ -11,11 +11,21 @@ use tellit_types::JjCommentThread;
 use web_sys::MouseEvent;
 
 use crate::components::is_plain_primary_click;
+use crate::components::keyboard::{NavigationDirection, adjacent_file_index};
 use crate::components::text_diff::expanded::ExpandedLinesMap;
 use crate::components::text_diff::{SingleFileHeaderProps, TextDiffCard};
 use crate::route::{AppRoute, RouteQuery};
 use crate::state::DiffViewMode;
 use crate::{DiffCardCallbacks, FileCardSlot};
+
+/// Destination of a single-file `Prev` (`[`) or `Next` (`]`) step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SingleFileNavTarget {
+    /// Open an adjacent file path in diff order.
+    File(String),
+    /// Return to Change Overview when stepping past the first or last file.
+    Overview,
+}
 
 /// Position and adjacent file targets for the active single-file diff view.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +49,19 @@ impl SingleFileNavState {
             None => alloc::format!("— / {}", self.total),
         }
     }
+
+    /// Returns the navigation target when stepping in `dir`, returning to Overview at boundaries.
+    #[must_use]
+    pub fn step_target(&self, dir: NavigationDirection) -> SingleFileNavTarget {
+        let path = match dir {
+            NavigationDirection::Prev => self.prev_path.as_ref(),
+            NavigationDirection::Next => self.next_path.as_ref(),
+        };
+        match path {
+            Some(p) => SingleFileNavTarget::File(p.clone()),
+            None => SingleFileNavTarget::Overview,
+        }
+    }
 }
 
 /// Computes position and adjacent file paths for `target_path` inside an ordered list of paths.
@@ -50,10 +73,10 @@ pub fn compute_single_file_nav<S: AsRef<str>>(
     let total = paths.len();
     let position = paths.iter().position(|p| p.as_ref() == target_path);
     let prev_path = position
-        .and_then(|i| i.checked_sub(1))
+        .and_then(|i| adjacent_file_index(i, total, NavigationDirection::Prev))
         .map(|i| String::from(paths[i].as_ref()));
     let next_path = position
-        .and_then(|i| (i + 1 < total).then_some(i + 1))
+        .and_then(|i| adjacent_file_index(i, total, NavigationDirection::Next))
         .map(|i| String::from(paths[i].as_ref()));
     SingleFileNavState {
         position,
@@ -61,6 +84,16 @@ pub fn compute_single_file_nav<S: AsRef<str>>(
         prev_path,
         next_path,
     }
+}
+
+/// Resolves the target for a single-file `Prev` (`[`) or `Next` (`]`) navigation action.
+#[must_use]
+pub fn resolve_single_file_step<S: AsRef<str>>(
+    paths: &[S],
+    target_path: &str,
+    dir: NavigationDirection,
+) -> SingleFileNavTarget {
+    compute_single_file_nav(paths, target_path).step_target(dir)
 }
 
 /// Focused single-file diff page (`/c/<change_id>/file/<encoded_path>`).
@@ -230,24 +263,82 @@ mod tests {
         assert_eq!(first.prev_path, None);
         assert_eq!(first.next_path.as_deref(), Some("src/a.rs"));
         assert_eq!(first.position_label(), "1 / 3");
+        assert_eq!(
+            first.step_target(NavigationDirection::Prev),
+            SingleFileNavTarget::Overview
+        );
+        assert_eq!(
+            first.step_target(NavigationDirection::Next),
+            SingleFileNavTarget::File(String::from("src/a.rs"))
+        );
 
         let middle = compute_single_file_nav(&files, "src/a.rs");
         assert_eq!(middle.position, Some(1));
         assert_eq!(middle.prev_path.as_deref(), Some("Commit Message"));
         assert_eq!(middle.next_path.as_deref(), Some("src/b.rs"));
         assert_eq!(middle.position_label(), "2 / 3");
+        assert_eq!(
+            middle.step_target(NavigationDirection::Prev),
+            SingleFileNavTarget::File(String::from("Commit Message"))
+        );
+        assert_eq!(
+            middle.step_target(NavigationDirection::Next),
+            SingleFileNavTarget::File(String::from("src/b.rs"))
+        );
 
         let last = compute_single_file_nav(&files, "src/b.rs");
         assert_eq!(last.position, Some(2));
         assert_eq!(last.prev_path.as_deref(), Some("src/a.rs"));
         assert_eq!(last.next_path, None);
         assert_eq!(last.position_label(), "3 / 3");
+        assert_eq!(
+            last.step_target(NavigationDirection::Prev),
+            SingleFileNavTarget::File(String::from("src/a.rs"))
+        );
+        assert_eq!(
+            last.step_target(NavigationDirection::Next),
+            SingleFileNavTarget::Overview
+        );
 
         let single = compute_single_file_nav(&["only.rs"], "only.rs");
         assert_eq!(single.position, Some(0));
         assert_eq!(single.prev_path, None);
         assert_eq!(single.next_path, None);
         assert_eq!(single.position_label(), "1 / 1");
+        assert_eq!(
+            resolve_single_file_step(&["only.rs"], "only.rs", NavigationDirection::Prev),
+            SingleFileNavTarget::Overview
+        );
+        assert_eq!(
+            resolve_single_file_step(&["only.rs"], "only.rs", NavigationDirection::Next),
+            SingleFileNavTarget::Overview
+        );
+    }
+
+    #[test]
+    fn resolves_boundary_steps_to_overview_and_interior_steps_to_adjacent_files() {
+        let files = ["Commit Message", "src/a.rs", "src/b.rs"];
+
+        assert_eq!(
+            resolve_single_file_step(&files, "Commit Message", NavigationDirection::Prev),
+            SingleFileNavTarget::Overview
+        );
+        assert_eq!(
+            resolve_single_file_step(&files, "Commit Message", NavigationDirection::Next),
+            SingleFileNavTarget::File(String::from("src/a.rs"))
+        );
+        assert_eq!(
+            resolve_single_file_step(&files, "src/b.rs", NavigationDirection::Prev),
+            SingleFileNavTarget::File(String::from("src/a.rs"))
+        );
+        assert_eq!(
+            resolve_single_file_step(&files, "src/b.rs", NavigationDirection::Next),
+            SingleFileNavTarget::Overview
+        );
+        assert_eq!(
+            resolve_single_file_step(&files, "src/missing.rs", NavigationDirection::Next),
+            SingleFileNavTarget::Overview
+        );
     }
 
     #[test]

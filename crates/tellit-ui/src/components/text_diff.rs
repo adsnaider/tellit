@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use tellit_types::{
-    CommentSide, DiffFile, DiffLine, DiffLineKind, FileStatus, JjCommentThread, LineRangeSpec,
+    CommentSide, DiffFile, DiffLineKind, FileStatus, JjCommentThread, LineRangeSpec,
 };
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
@@ -186,7 +186,7 @@ enum SplitAlign {
 }
 
 /// Pre-indexed inline review threads for `O(1)` per-row placement lookup.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct ThreadIndex {
     by_side_and_end_line: HashMap<(CommentSide, u32), Vec<JjCommentThread>>,
 }
@@ -218,33 +218,54 @@ impl ThreadIndex {
             .map_or(&[], Vec::as_slice)
     }
 
-    fn unified_line_threads<'a>(&'a self, line: &DiffLine) -> Vec<&'a JjCommentThread> {
+    /// Returns all `(side, end_line)` keys whose thread lists differ between `self` and `other`.
+    fn diff_keys(&self, other: &Self) -> Vec<(CommentSide, u32)> {
+        let mut changed = Vec::new();
+        for (key, threads) in &self.by_side_and_end_line {
+            if other.by_side_and_end_line.get(key) != Some(threads) {
+                changed.push(*key);
+            }
+        }
+        for key in other.by_side_and_end_line.keys() {
+            if !self.by_side_and_end_line.contains_key(key) {
+                changed.push(*key);
+            }
+        }
+        changed
+    }
+
+    fn unified_line_threads_for(
+        &self,
+        kind: DiffLineKind,
+        old_line_number: Option<u32>,
+        new_line_number: Option<u32>,
+    ) -> Vec<JjCommentThread> {
         if self.is_empty() {
             return Vec::new();
         }
         let mut matched = Vec::new();
-        let mut seen_ids: HashSet<&'a str> = HashSet::new();
+        let mut seen_ids: HashSet<&str> = HashSet::new();
 
-        let (primary_num, primary_side) = if line.kind == DiffLineKind::Delete {
-            (line.old_line_number, CommentSide::Old)
+        let (primary_num, primary_side) = if kind == DiffLineKind::Delete {
+            (old_line_number, CommentSide::Old)
         } else {
-            (line.new_line_number, CommentSide::New)
+            (new_line_number, CommentSide::New)
         };
 
         if let Some(num) = primary_num {
             for thread in self.at(primary_side, num) {
                 if seen_ids.insert(thread.id.as_str()) {
-                    matched.push(thread);
+                    matched.push(thread.clone());
                 }
             }
         }
 
-        if line.kind == DiffLineKind::Context
-            && let Some(old_num) = line.old_line_number
+        if kind == DiffLineKind::Context
+            && let Some(old_num) = old_line_number
         {
             for thread in self.at(CommentSide::Old, old_num) {
                 if seen_ids.insert(thread.id.as_str()) {
-                    matched.push(thread);
+                    matched.push(thread.clone());
                 }
             }
         }
@@ -253,11 +274,39 @@ impl ThreadIndex {
     }
 }
 
+/// Per-`(side, end_line)` reactive notifier that wakes only inline thread slots whose threads changed.
+#[derive(Default)]
+struct ThreadSlotNotifier {
+    triggers: HashMap<(CommentSide, u32), ArcTrigger>,
+}
+
+impl ThreadSlotNotifier {
+    fn track(&mut self, side: CommentSide, line: u32) {
+        let trigger = self.triggers.entry((side, line)).or_default();
+        trigger.track();
+    }
+
+    fn notify_changed(&self, changed: &[(CommentSide, u32)]) {
+        for key in changed {
+            if let Some(trigger) = self.triggers.get(key) {
+                trigger.notify();
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.triggers.clear();
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ChunkRenderCtx {
     is_commit_msg: bool,
     composer_selector: StoredValue<Selector<Option<(CommentSide, u32)>>, LocalStorage>,
     active_composer: RwSignal<Option<ActiveComposer>>,
+    thread_index: Memo<Arc<ThreadIndex>>,
+    thread_notifier: StoredValue<ThreadSlotNotifier, LocalStorage>,
+    merged_chunks: Memo<Arc<Vec<MergedChunk>>>,
     on_create_thread: Callback<CreateThreadEvent>,
     on_reply: Callback<CommentReplyEvent>,
     on_toggle_resolve: Callback<(String, bool)>,
@@ -428,6 +477,22 @@ pub fn TextDiffCard(
     let composer_selector = StoredValue::new_local(Selector::new(move || {
         active_composer.with(|c| c.as_ref().map(|c| (c.side, c.range.end)))
     }));
+    let thread_index_memo = Memo::new(move |_| {
+        visible_threads.with(|active_threads| Arc::new(ThreadIndex::from_threads(active_threads)))
+    });
+    let thread_notifier = StoredValue::new_local(ThreadSlotNotifier::default());
+    let prev_thread_index = StoredValue::new_local(thread_index_memo.get_untracked());
+
+    // Wake only the specific `(side, end_line)` inline slots whose threads changed so resolving,
+    // reopening, replying, or adding comments never remounts `.diff-chunk-wrapper` tables.
+    Effect::new(move |_| {
+        let next_index = thread_index_memo.get();
+        let changed = prev_thread_index.with_value(|prev| prev.diff_keys(&next_index));
+        prev_thread_index.set_value(next_index);
+        if !changed.is_empty() {
+            thread_notifier.with_value(|n| n.notify_changed(&changed));
+        }
+    });
 
     // Defer `/api/line-count` until the card is uncollapsed, near the viewport, and hydrated.
     Effect::new(move |_| {
@@ -527,6 +592,9 @@ pub fn TextDiffCard(
         is_commit_msg,
         composer_selector,
         active_composer,
+        thread_index: thread_index_memo,
+        thread_notifier,
+        merged_chunks: merged_chunks_memo,
         on_create_thread,
         on_reply,
         on_toggle_resolve,
@@ -829,12 +897,16 @@ pub fn TextDiffCard(
                             <button
                                 type="button"
                                 class="btn btn--ghost btn--xs"
-                                title="Previous file ([)"
-                                disabled=move || nav.prev_path.with(Option::is_none)
-                                on:click=move |_| {
-                                    if let Some(prev) = nav.prev_path.get_untracked() {
-                                        nav.on_open_file.run(prev);
+                                title=move || {
+                                    if nav.prev_path.with(Option::is_some) {
+                                        "Previous file ([)"
+                                    } else {
+                                        "Return to overview ([)"
                                     }
+                                }
+                                on:click=move |_| match nav.prev_path.get_untracked() {
+                                    Some(prev) => nav.on_open_file.run(prev),
+                                    None => nav.on_back_to_overview.run(()),
                                 }
                             >
                                 "← Prev"
@@ -842,12 +914,16 @@ pub fn TextDiffCard(
                             <button
                                 type="button"
                                 class="btn btn--ghost btn--xs"
-                                title="Next file (])"
-                                disabled=move || nav.next_path.with(Option::is_none)
-                                on:click=move |_| {
-                                    if let Some(next) = nav.next_path.get_untracked() {
-                                        nav.on_open_file.run(next);
+                                title=move || {
+                                    if nav.next_path.with(Option::is_some) {
+                                        "Next file (])"
+                                    } else {
+                                        "Return to overview (])"
                                     }
+                                }
+                                on:click=move |_| match nav.next_path.get_untracked() {
+                                    Some(next) => nav.on_open_file.run(next),
+                                    None => nav.on_back_to_overview.run(()),
                                 }
                             >
                                 "Next →"
@@ -1005,12 +1081,14 @@ pub fn TextDiffCard(
                                     {move || {
                                         if !show_code.get() {
                                             composer_selector.with_value(Selector::clear);
+                                            thread_notifier.update_value(ThreadSlotNotifier::clear);
                                             return ().into_any();
                                         }
 
                                         let chunks_loaded = file.with(|f| f.chunks_loaded);
                                         if !chunks_loaded {
                                             composer_selector.with_value(Selector::clear);
+                                            thread_notifier.update_value(ThreadSlotNotifier::clear);
                                             if let Some(err_msg) = load_error.get() {
                                                 let retry_path = path_for_code_retry.clone();
                                                 return view! {
@@ -1036,6 +1114,7 @@ pub fn TextDiffCard(
                                         let file_snapshot = file.get_untracked();
                                         // Evict stale subscriber entries from prior mode or chunk renders.
                                         composer_selector.with_value(Selector::clear);
+                                        thread_notifier.update_value(ThreadSlotNotifier::clear);
 
                                         let total_merged_lines: usize =
                                             merged_chunks.iter().map(|mc| mc.lines.len()).sum();
@@ -1071,48 +1150,27 @@ pub fn TextDiffCard(
                                             limit,
                                         );
 
-                                        let (thread_index, unplaced) = visible_threads.with(|active_threads| {
-                                            let idx = ThreadIndex::from_threads(active_threads);
-                                            if active_threads.is_empty() {
-                                                return (idx, Vec::new());
-                                            }
-                                            let mut placed_ids = HashSet::new();
-                                            if !idx.is_empty() {
-                                                for (merged_idx, (mc, &chunk_limit)) in merged_chunks
+                                        // Compute rendered `(side, line)` keys once per diff/window render
+                                        // so `unplaced_threads` updates reactively without tearing down the
+                                        // `.diff-chunk-wrapper` tables below it.
+                                        let placed_keys = Arc::new(collect_rendered_code_keys(
+                                            &merged_chunks,
+                                            &split_chunks,
+                                            &window_plan.chunk_limits,
+                                            mode,
+                                        ));
+                                        let unplaced_threads = Memo::new(move |_| {
+                                            visible_threads.with(|active_threads| {
+                                                active_threads
                                                     .iter()
-                                                    .zip(window_plan.chunk_limits.iter())
-                                                    .enumerate()
-                                                {
-                                                    if chunk_limit == 0 {
-                                                        continue;
-                                                    }
-                                                    if mode == DiffViewMode::Split {
-                                                        let visible_rows = &split_chunks[merged_idx]
-                                                            [..chunk_limit.min(
-                                                                split_chunks[merged_idx].len(),
-                                                            )];
-                                                        collect_placed_split_thread_ids(
-                                                            mc,
-                                                            visible_rows,
-                                                            &idx,
-                                                            &mut placed_ids,
-                                                        );
-                                                    } else {
-                                                        collect_placed_unified_thread_ids(
-                                                            mc,
-                                                            chunk_limit,
-                                                            &idx,
-                                                            &mut placed_ids,
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            let unplaced = active_threads
-                                                .iter()
-                                                .filter(|t| !placed_ids.contains(t.id.as_str()))
-                                                .cloned()
-                                                .collect::<Vec<_>>();
-                                            (idx, unplaced)
+                                                    .filter(|t| {
+                                                        t.line_range.is_none_or(|lr| {
+                                                            !placed_keys.contains(&(t.side, lr.end))
+                                                        })
+                                                    })
+                                                    .cloned()
+                                                    .collect::<Vec<_>>()
+                                            })
                                         });
 
                                         let chunk_count = merged_chunks.len();
@@ -1123,7 +1181,7 @@ pub fn TextDiffCard(
 
                                         view! {
                                             <>
-                                                {render_file_threads_section(unplaced, on_reply, on_toggle_resolve)}
+                                                {move || render_file_threads_section(unplaced_threads.get(), on_reply, on_toggle_resolve)}
 
                                                 {if merged_chunks.is_empty() {
                                                     view! {
@@ -1230,7 +1288,6 @@ pub fn TextDiffCard(
                                                                             mc,
                                                                             visible_rows,
                                                                             &path_clone,
-                                                                            &thread_index,
                                                                             &path_for_line_submit,
                                                                             chunk_ctx,
                                                                         ).into_any()
@@ -1239,7 +1296,6 @@ pub fn TextDiffCard(
                                                                             mc,
                                                                             chunk_limit,
                                                                             &path_clone,
-                                                                            &thread_index,
                                                                             &path_for_line_submit,
                                                                             chunk_ctx,
                                                                         ).into_any()
@@ -1577,7 +1633,6 @@ fn render_unified_chunk(
     mc: &MergedChunk,
     line_limit: usize,
     file_path: &str,
-    thread_index: &ThreadIndex,
     submit_file_path: &str,
     ctx: ChunkRenderCtx,
 ) -> impl IntoView {
@@ -1604,7 +1659,6 @@ fn render_unified_chunk(
                         CommentSide::New => line.new_line_number.or(line.old_line_number),
                     };
 
-                    let line_threads = thread_index.unified_line_threads(line);
                     let editor_line = (!ctx.is_commit_msg && line.kind != DiffLineKind::Delete)
                         .then(|| line.new_line_number.or(line.old_line_number))
                         .flatten();
@@ -1647,28 +1701,59 @@ fn render_unified_chunk(
                     };
                     let submit_path = String::from(submit_file_path);
 
-                    let thread_views = line_threads
-                        .into_iter()
-                        .map(|thread| {
-                            let snippet = thread.line_range.map(|lr| {
-                                extract_chunk_line_range_snippet(mc, thread.side, lr)
-                            });
-                            view! {
-                                <tr class="diff-inline-slot">
-                                    <td colspan=3 class="diff-inline-cell">
-                                        <div class="diff-inline-inner">
-                                            <CommentThreadCard
-                                                thread=thread.clone()
-                                                code_snippet=snippet
-                                                on_reply=ctx.on_reply
-                                                on_toggle_resolve=ctx.on_toggle_resolve
-                                            />
-                                        </div>
-                                    </td>
-                                </tr>
+                    let thread_views = move || {
+                        let _ = ctx.thread_notifier.try_update_value(|reg| {
+                            if kind == DiffLineKind::Delete {
+                                if let Some(n) = old_num {
+                                    reg.track(CommentSide::Old, n);
+                                }
+                            } else {
+                                if let Some(n) = new_num {
+                                    reg.track(CommentSide::New, n);
+                                }
+                                if kind == DiffLineKind::Context
+                                    && let Some(n) = old_num
+                                {
+                                    reg.track(CommentSide::Old, n);
+                                }
                             }
-                        })
-                        .collect_view();
+                        });
+                        let threads = ctx
+                            .thread_index
+                            .try_with_untracked(|idx| {
+                                idx.unified_line_threads_for(kind, old_num, new_num)
+                            })
+                            .unwrap_or_default();
+                        if threads.is_empty() {
+                            return None;
+                        }
+                        Some(
+                            threads
+                                .into_iter()
+                                .map(|thread| {
+                                    let snippet = thread.line_range.and_then(|lr| {
+                                        ctx.merged_chunks.try_with_untracked(|chunks| {
+                                            extract_snippet_across_merged(chunks, thread.side, lr)
+                                        })
+                                    });
+                                    view! {
+                                        <tr class="diff-inline-slot">
+                                            <td colspan=3 class="diff-inline-cell">
+                                                <div class="diff-inline-inner">
+                                                    <CommentThreadCard
+                                                        thread=thread
+                                                        code_snippet=snippet
+                                                        on_reply=ctx.on_reply
+                                                        on_toggle_resolve=ctx.on_toggle_resolve
+                                                    />
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    }
+                                })
+                                .collect_view(),
+                        )
+                    };
 
                     Some(view! {
                         <>
@@ -1757,7 +1842,6 @@ fn render_split_chunk(
     mc: &MergedChunk,
     rows: &[SideBySideRow],
     file_path: &str,
-    thread_index: &ThreadIndex,
     submit_file_path: &str,
     ctx: ChunkRenderCtx,
 ) -> impl IntoView {
@@ -1789,11 +1873,6 @@ fn render_split_chunk(
                         Some(l) => split_cell_class(l.kind, new_is_expanded),
                         None => "diff-cell--blank",
                     };
-
-                    let old_threads = old_num
-                        .map_or(&[][..], |ln| thread_index.at(CommentSide::Old, ln));
-                    let new_threads = new_num
-                        .map_or(&[][..], |ln| thread_index.at(CommentSide::New, ln));
 
                     let is_context_pair = old_line.is_some_and(|l| l.kind == DiffLineKind::Context)
                         && new_line.is_some_and(|l| l.kind == DiffLineKind::Context);
@@ -1831,27 +1910,73 @@ fn render_split_chunk(
                     let new_gutter_cls = alloc::format!("{new_class_base} diff-gutter diff-gutter--num diff-gutter--actions");
                     let new_code_cls = alloc::format!("{new_class_base} diff-code-cell diff-code-cell--split");
 
-                    let old_thread_views = old_threads
-                        .iter()
-                        .map(|thread| {
-                            let align = if is_context_pair { SplitAlign::Full } else { SplitAlign::Left };
-                            let snippet = thread.line_range.map(|lr| {
-                                extract_chunk_line_range_snippet(mc, CommentSide::Old, lr)
-                            });
-                            render_split_thread_row(thread.clone(), snippet, align, ctx.on_reply, ctx.on_toggle_resolve)
-                        })
-                        .collect_view();
+                    let old_thread_views = move || {
+                        let ln = old_num?;
+                        let _ = ctx
+                            .thread_notifier
+                            .try_update_value(|reg| reg.track(CommentSide::Old, ln));
+                        let threads = ctx
+                            .thread_index
+                            .try_with_untracked(|idx| idx.at(CommentSide::Old, ln).to_vec())
+                            .unwrap_or_default();
+                        if threads.is_empty() {
+                            return None;
+                        }
+                        let align = if is_context_pair { SplitAlign::Full } else { SplitAlign::Left };
+                        Some(
+                            threads
+                                .into_iter()
+                                .map(|thread| {
+                                    let snippet = thread.line_range.and_then(|lr| {
+                                        ctx.merged_chunks.try_with_untracked(|chunks| {
+                                            extract_snippet_across_merged(chunks, CommentSide::Old, lr)
+                                        })
+                                    });
+                                    render_split_thread_row(
+                                        thread,
+                                        snippet,
+                                        align,
+                                        ctx.on_reply,
+                                        ctx.on_toggle_resolve,
+                                    )
+                                })
+                                .collect_view(),
+                        )
+                    };
 
-                    let new_thread_views = new_threads
-                        .iter()
-                        .map(|thread| {
-                            let align = if is_context_pair { SplitAlign::Full } else { SplitAlign::Right };
-                            let snippet = thread.line_range.map(|lr| {
-                                extract_chunk_line_range_snippet(mc, CommentSide::New, lr)
-                            });
-                            render_split_thread_row(thread.clone(), snippet, align, ctx.on_reply, ctx.on_toggle_resolve)
-                        })
-                        .collect_view();
+                    let new_thread_views = move || {
+                        let ln = new_num?;
+                        let _ = ctx
+                            .thread_notifier
+                            .try_update_value(|reg| reg.track(CommentSide::New, ln));
+                        let threads = ctx
+                            .thread_index
+                            .try_with_untracked(|idx| idx.at(CommentSide::New, ln).to_vec())
+                            .unwrap_or_default();
+                        if threads.is_empty() {
+                            return None;
+                        }
+                        let align = if is_context_pair { SplitAlign::Full } else { SplitAlign::Right };
+                        Some(
+                            threads
+                                .into_iter()
+                                .map(|thread| {
+                                    let snippet = thread.line_range.and_then(|lr| {
+                                        ctx.merged_chunks.try_with_untracked(|chunks| {
+                                            extract_snippet_across_merged(chunks, CommentSide::New, lr)
+                                        })
+                                    });
+                                    render_split_thread_row(
+                                        thread,
+                                        snippet,
+                                        align,
+                                        ctx.on_reply,
+                                        ctx.on_toggle_resolve,
+                                    )
+                                })
+                                .collect_view(),
+                        )
+                    };
 
                     view! {
                         <>
@@ -2014,49 +2139,64 @@ fn render_split_composer_row(
     }
 }
 
-fn collect_placed_unified_thread_ids<'a>(
-    mc: &MergedChunk,
-    line_limit: usize,
-    thread_index: &'a ThreadIndex,
-    placed: &mut HashSet<&'a str>,
-) {
-    let limit = mc.lines.len().min(line_limit);
-    for idx in 0..limit {
-        let Some(line) = mc.line(idx) else {
+fn collect_rendered_code_keys(
+    merged_chunks: &[MergedChunk],
+    split_chunks: &[Vec<SideBySideRow>],
+    chunk_limits: &[usize],
+    mode: DiffViewMode,
+) -> HashSet<(CommentSide, u32)> {
+    let mut keys = HashSet::new();
+    for (merged_idx, (mc, &chunk_limit)) in
+        merged_chunks.iter().zip(chunk_limits.iter()).enumerate()
+    {
+        if chunk_limit == 0 {
             continue;
-        };
-        for t in thread_index.unified_line_threads(line) {
-            placed.insert(t.id.as_str());
         }
-    }
-}
-
-fn collect_placed_split_thread_ids<'a>(
-    mc: &MergedChunk,
-    visible_rows: &[SideBySideRow],
-    thread_index: &'a ThreadIndex,
-    placed: &mut HashSet<&'a str>,
-) {
-    for row in visible_rows {
-        if let Some(old_n) = row
-            .old_line_idx
-            .and_then(|i| mc.line(i))
-            .and_then(|l| l.old_line_number)
-        {
-            for t in thread_index.at(CommentSide::Old, old_n) {
-                placed.insert(t.id.as_str());
+        if mode == DiffViewMode::Split {
+            let Some(rows) = split_chunks.get(merged_idx) else {
+                continue;
+            };
+            let visible_rows = &rows[..chunk_limit.min(rows.len())];
+            for row in visible_rows {
+                if let Some(old_n) = row
+                    .old_line_idx
+                    .and_then(|i| mc.line(i))
+                    .and_then(|l| l.old_line_number)
+                {
+                    keys.insert((CommentSide::Old, old_n));
+                }
+                if let Some(new_n) = row
+                    .new_line_idx
+                    .and_then(|i| mc.line(i))
+                    .and_then(|l| l.new_line_number)
+                {
+                    keys.insert((CommentSide::New, new_n));
+                }
+            }
+        } else {
+            let limit = mc.lines.len().min(chunk_limit);
+            for idx in 0..limit {
+                let Some(line) = mc.line(idx) else {
+                    continue;
+                };
+                if line.kind == DiffLineKind::Delete {
+                    if let Some(old_n) = line.old_line_number {
+                        keys.insert((CommentSide::Old, old_n));
+                    }
+                } else {
+                    if let Some(new_n) = line.new_line_number {
+                        keys.insert((CommentSide::New, new_n));
+                    }
+                    if line.kind == DiffLineKind::Context
+                        && let Some(old_n) = line.old_line_number
+                    {
+                        keys.insert((CommentSide::Old, old_n));
+                    }
+                }
             }
         }
-        if let Some(new_n) = row
-            .new_line_idx
-            .and_then(|i| mc.line(i))
-            .and_then(|l| l.new_line_number)
-        {
-            for t in thread_index.at(CommentSide::New, new_n) {
-                placed.insert(t.id.as_str());
-            }
-        }
     }
+    keys
 }
 
 fn extract_chunk_line_range_snippet(
@@ -2181,7 +2321,7 @@ fn line_sigil_class(kind: DiffLineKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tellit_types::DiffChunk;
+    use tellit_types::{DiffChunk, DiffLine};
 
     fn mk_line(kind: DiffLineKind, old_n: Option<u32>, new_n: Option<u32>, text: &str) -> DiffLine {
         DiffLine {
@@ -2259,15 +2399,76 @@ mod tests {
         let idx = ThreadIndex::from_threads(&threads);
 
         let ctx_line = mk_line(DiffLineKind::Context, Some(2), Some(2), "ctx");
-        let unified_ids: Vec<&str> = idx
-            .unified_line_threads(&ctx_line)
+        let unified_ids: Vec<String> = idx
+            .unified_line_threads_for(
+                ctx_line.kind,
+                ctx_line.old_line_number,
+                ctx_line.new_line_number,
+            )
             .into_iter()
-            .map(|t| t.id.as_str())
+            .map(|t| t.id)
             .collect();
         assert_eq!(unified_ids, alloc::vec!["t-new-2", "t-old-2"]);
         assert_eq!(idx.at(CommentSide::Old, 2).len(), 1);
         assert_eq!(idx.at(CommentSide::New, 2).len(), 1);
         assert!(idx.at(CommentSide::New, 99).is_empty());
+
+        // Resolving one thread only reports that line's key as changed.
+        let mut resolved_threads = threads.clone();
+        resolved_threads[0].resolved = true;
+        let next_idx = ThreadIndex::from_threads(&resolved_threads);
+        assert_eq!(idx.diff_keys(&next_idx), alloc::vec![(CommentSide::New, 2)]);
+        assert!(next_idx.diff_keys(&next_idx).is_empty());
+
+        // Hiding a resolved thread reports only its removed key, leaving other lines untouched.
+        let filtered_idx = ThreadIndex::from_threads(&threads[1..]);
+        assert_eq!(
+            idx.diff_keys(&filtered_idx),
+            alloc::vec![(CommentSide::New, 2)]
+        );
+    }
+
+    #[test]
+    fn collects_rendered_code_keys_for_unified_and_split_windows() {
+        let file = Arc::new(DiffFile {
+            path: String::from("src/lib.rs"),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 1,
+            is_generated: false,
+            chunks: alloc::vec![DiffChunk {
+                old_start: 10,
+                old_lines: 2,
+                new_start: 10,
+                new_lines: 2,
+                header: String::from("@@ -10,2 +10,2 @@"),
+                lines: alloc::vec![
+                    mk_line(DiffLineKind::Context, Some(10), Some(10), "ctx"),
+                    mk_line(DiffLineKind::Delete, Some(11), None, "old"),
+                    mk_line(DiffLineKind::Add, None, Some(11), "new"),
+                ],
+            }],
+            chunks_loaded: true,
+        });
+        let merged = merge_chunks_for_file(&file, None);
+
+        // Unified window limited to first 2 lines excludes the added line 11.
+        let unified_partial = collect_rendered_code_keys(&merged, &[], &[2], DiffViewMode::Unified);
+        assert!(unified_partial.contains(&(CommentSide::Old, 10)));
+        assert!(unified_partial.contains(&(CommentSide::New, 10)));
+        assert!(unified_partial.contains(&(CommentSide::Old, 11)));
+        assert!(!unified_partial.contains(&(CommentSide::New, 11)));
+
+        // Split mode pairs Delete 11 + Add 11 onto row index 1, so limit 2 includes both sides.
+        let split_chunks: Vec<Vec<SideBySideRow>> =
+            merged.iter().map(pair_side_by_side_rows).collect();
+        let split_all =
+            collect_rendered_code_keys(&merged, &split_chunks, &[2], DiffViewMode::Split);
+        assert!(split_all.contains(&(CommentSide::Old, 10)));
+        assert!(split_all.contains(&(CommentSide::New, 10)));
+        assert!(split_all.contains(&(CommentSide::Old, 11)));
+        assert!(split_all.contains(&(CommentSide::New, 11)));
     }
 
     #[test]

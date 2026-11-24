@@ -248,14 +248,12 @@ pub fn CommentComposer(
 pub fn CommentThreadCard(
     thread: JjCommentThread,
     #[prop(default = None)] code_snippet: Option<String>,
-    #[prop(default = true)] confirm_resolve: bool,
     on_reply: Callback<CommentReplyEvent>,
     on_toggle_resolve: Callback<(String, bool)>,
     #[prop(default = None)] on_jump: Option<Callback<JjCommentThread>>,
 ) -> impl IntoView {
     let collapsed = RwSignal::new(false);
     let replying = RwSignal::new(false);
-    let confirming_resolve = RwSignal::new(false);
     let copied = RwSignal::new(false);
 
     let thread_id = thread.id.clone();
@@ -351,55 +349,21 @@ pub fn CommentThreadCard(
                         {move || if copied.get() { "Copied!" } else { "Copy Prompt" }}
                     </button>
 
-                    {move || if confirming_resolve.get() {
-                        let tid = tid_resolve.clone();
-                        view! {
-                            <span class="confirm-inline">
-                                <span class="muted-label">
-                                    {if is_resolved { "Unresolve?" } else { "Resolve?" }}
-                                </span>
-                                <button
-                                    type="button"
-                                    class="btn btn--xs"
-                                    on:click=move |_| {
-                                        confirming_resolve.set(false);
-                                        on_toggle_resolve.run((tid.clone(), is_resolved));
-                                    }
-                                >
-                                    "Confirm"
-                                </button>
-                                <button
-                                    type="button"
-                                    class="btn btn--ghost btn--xs"
-                                    on:click=move |_| confirming_resolve.set(false)
-                                >
-                                    "Cancel"
-                                </button>
-                            </span>
-                        }.into_any()
-                    } else {
-                        let tid = tid_resolve.clone();
-                        view! {
-                            <button
-                                type="button"
-                                class={if is_resolved {
-                                    "btn btn--ghost btn--xs"
-                                } else {
-                                    "btn btn--xs"
-                                }}
-                                title={if is_resolved { "Reopen thread" } else { "Resolve thread" }}
-                                on:click=move |_| {
-                                    if confirm_resolve {
-                                        confirming_resolve.set(true);
-                                    } else {
-                                        on_toggle_resolve.run((tid.clone(), is_resolved));
-                                    }
-                                }
-                            >
-                                {if is_resolved { "Reopen" } else { "Resolve" }}
-                            </button>
-                        }.into_any()
-                    }}
+                    <button
+                        type="button"
+                        class={if is_resolved {
+                            "btn btn--ghost btn--xs"
+                        } else {
+                            "btn btn--xs"
+                        }}
+                        title={if is_resolved { "Reopen thread" } else { "Resolve thread" }}
+                        on:click=move |ev| {
+                            ev.stop_propagation();
+                            on_toggle_resolve.run((tid_resolve.clone(), is_resolved));
+                        }
+                    >
+                        {if is_resolved { "Reopen" } else { "Resolve" }}
+                    </button>
                 </div>
             </div>
 
@@ -630,7 +594,6 @@ pub fn CommentsDrawer(
                                 view! {
                                     <CommentThreadCard
                                         thread=thread
-                                        confirm_resolve=false
                                         on_reply=on_reply
                                         on_toggle_resolve=on_toggle_resolve
                                         on_jump=Some(on_jump_to_thread)

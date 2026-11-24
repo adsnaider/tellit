@@ -28,14 +28,16 @@ use crate::components::image_diff::ImageDiffBody;
 use crate::components::is_plain_primary_click;
 use crate::components::markdown_diff::scroll_anchor::{
     TabScrollAnchor, clear_chunk_content_visibility_overrides, finish_code_scroll_restore,
-    required_window_limit_for_line, restore_tab_scroll_anchor, switch_markdown_tab,
+    force_chunks_content_visibility_visible, required_window_limit_for_line,
+    restore_tab_scroll_anchor, switch_markdown_tab,
 };
 use crate::components::markdown_diff::{MarkdownPreviewBody, MarkdownTab};
 use crate::state::{self, AutoCollapseReason, DiffViewMode};
 
 use expanded::{
-    DEFAULT_EXPAND_COUNT, ExpandedLinesMap, FileExpandedState, GapSlice, MergedChunk,
-    compute_auto_expand_plan, has_hidden_context, merge_chunks_for_file, supports_expansion,
+    DEFAULT_EXPAND_COUNT, ExpandEdge, ExpandedLinesMap, FileExpandedState, GapBounds, GapSlice,
+    HiddenGap, MergedChunk, compute_auto_expand_plan, has_hidden_context, matches_surviving_gap,
+    merge_chunks_for_file, supports_expansion,
 };
 use split::{SideBySideRow, pair_side_by_side_rows};
 use word_highlight::render_code_line;
@@ -201,6 +203,323 @@ enum ExpandBarPosition {
     Top,
     Middle,
     Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreRafKind {
+    MarkdownTab,
+    ExpandBar,
+}
+
+/// Scroll anchor captured from a clicked `ExpandBar` before a partial context expansion.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ExpandBarScrollAnchor {
+    /// Expected inclusive 1-based line bounds of the surviving hidden gap after expansion.
+    expected_gap: GapBounds,
+    /// Edge from which lines were revealed, used as a fallback selector if the far end splits.
+    edge: ExpandEdge,
+    /// Target vertical offset of the `ExpandBar` top edge relative to `.diff-main`'s top edge.
+    viewport_offset: f64,
+}
+
+/// Computes the clamped viewport offset of a clicked `ExpandBar` relative to `.diff-main`'s top.
+///
+/// Preserves the exact clicked position whenever the bar's top edge lies below `.diff-card__header`
+/// and inside `.diff-main`, clamps below the sticky header if tucked behind it, and brings a
+/// bar completely below `.diff-main` into view. Returns `None` when `bar_height <= 0.0`.
+#[must_use]
+fn compute_expand_bar_viewport_offset(
+    bar_top: f64,
+    bar_height: f64,
+    main_top: f64,
+    main_bottom: f64,
+    header_bottom: f64,
+) -> Option<f64> {
+    if bar_height <= 0.0 {
+        return None;
+    }
+    let visible_top = main_top.max(header_bottom);
+    let clamped_top = if bar_top < visible_top {
+        visible_top
+    } else if bar_top >= main_bottom {
+        (main_bottom - bar_height).max(visible_top)
+    } else {
+        bar_top
+    };
+    Some(clamped_top - main_top)
+}
+
+/// Computes the updated `.diff-main.scroll_top` that returns `bar_top` to
+/// `main_top + viewport_offset`, or `None` when already within `tolerance_px`.
+#[must_use]
+fn compute_expand_bar_target_scroll_top(
+    current_scroll_top: f64,
+    bar_top: f64,
+    main_top: f64,
+    viewport_offset: f64,
+    tolerance_px: f64,
+) -> Option<f64> {
+    let desired_top = main_top + viewport_offset;
+    let delta = bar_top - desired_top;
+    if delta.abs() <= tolerance_px {
+        return None;
+    }
+    Some((current_scroll_top + delta).max(0.0))
+}
+
+fn merged_chunks_has_surviving_gap(
+    merged_chunks: &[MergedChunk],
+    use_old: bool,
+    anchor: ExpandBarScrollAnchor,
+) -> bool {
+    merged_chunks.iter().any(|mc| {
+        mc.before_gap
+            .and_then(|g| g.line_bounds(use_old))
+            .is_some_and(|b| matches_surviving_gap(b, anchor.expected_gap, anchor.edge))
+            || mc
+                .after_gap
+                .and_then(|g| g.line_bounds(use_old))
+                .is_some_and(|b| matches_surviving_gap(b, anchor.expected_gap, anchor.edge))
+    })
+}
+
+fn capture_expand_bar_scroll_anchor(
+    card_el: &web_sys::Element,
+    bar_el: &web_sys::Element,
+    expected_gap: GapBounds,
+    edge: ExpandEdge,
+) -> Option<ExpandBarScrollAnchor> {
+    let main_el = card_el.closest(".diff-main").ok().flatten()?;
+    let main_rect = main_el.get_bounding_client_rect();
+    let bar_rect = bar_el.get_bounding_client_rect();
+    let header_bottom = card_el
+        .query_selector(".diff-card__header")
+        .ok()
+        .flatten()
+        .map_or(main_rect.top(), |h| h.get_bounding_client_rect().bottom());
+    let viewport_offset = compute_expand_bar_viewport_offset(
+        bar_rect.top(),
+        bar_rect.height(),
+        main_rect.top(),
+        main_rect.bottom(),
+        header_bottom,
+    )?;
+    Some(ExpandBarScrollAnchor {
+        expected_gap,
+        edge,
+        viewport_offset,
+    })
+}
+
+fn find_surviving_expand_bar(
+    card_el: &web_sys::Element,
+    anchor: ExpandBarScrollAnchor,
+) -> Option<web_sys::Element> {
+    let exact_selector = alloc::format!(
+        ".expand-bar[data-gap-start=\"{}\"][data-gap-end=\"{}\"]",
+        anchor.expected_gap.start,
+        anchor.expected_gap.end,
+    );
+    if let Ok(Some(el)) = card_el.query_selector(&exact_selector) {
+        return Some(el);
+    }
+    let fallback_selector = match anchor.edge {
+        ExpandEdge::FromStart => {
+            alloc::format!(
+                ".expand-bar[data-gap-start=\"{}\"]",
+                anchor.expected_gap.start
+            )
+        }
+        ExpandEdge::FromEnd => {
+            alloc::format!(".expand-bar[data-gap-end=\"{}\"]", anchor.expected_gap.end)
+        }
+    };
+    card_el.query_selector(&fallback_selector).ok().flatten()
+}
+
+fn align_expand_bar(
+    main_el: &web_sys::Element,
+    bar_el: &web_sys::Element,
+    anchor: ExpandBarScrollAnchor,
+) {
+    if !bar_el.is_connected() {
+        return;
+    }
+    let bar_rect = bar_el.get_bounding_client_rect();
+    if bar_rect.height() <= 0.0 {
+        return;
+    }
+    let main_top = main_el.get_bounding_client_rect().top();
+    if let Some(target) = compute_expand_bar_target_scroll_top(
+        f64::from(main_el.scroll_top()),
+        bar_rect.top(),
+        main_top,
+        anchor.viewport_offset,
+        0.5,
+    ) {
+        main_el.set_scroll_top(target.round() as i32);
+    }
+}
+
+/// Restores `.diff-main.scroll_top` so the surviving `ExpandBar` matching `anchor` stays pinned
+/// at its pre-click offset.
+///
+/// Returns `true` when `.diff-chunk-wrapper` elements had `content-visibility: auto` temporarily
+/// overridden so the caller can release the override and run a 1-frame residual correction pass.
+fn restore_expand_bar_scroll(card_el: &web_sys::Element, anchor: ExpandBarScrollAnchor) -> bool {
+    let forced_chunks = force_chunks_content_visibility_visible(card_el);
+    let Ok(Some(main_el)) = card_el.closest(".diff-main") else {
+        if forced_chunks {
+            clear_chunk_content_visibility_overrides(card_el);
+        }
+        return false;
+    };
+    let Some(bar_el) = find_surviving_expand_bar(card_el, anchor) else {
+        if forced_chunks {
+            clear_chunk_content_visibility_overrides(card_el);
+        }
+        return false;
+    };
+
+    align_expand_bar(&main_el, &bar_el, anchor);
+    // Re-check immediately in case setting `scroll_top` changed scrollbar/layout metrics.
+    align_expand_bar(&main_el, &bar_el, anchor);
+
+    forced_chunks
+}
+
+/// Releases temporary `.diff-chunk-wrapper` `content-visibility` overrides after the restore
+/// frame paints and corrects any residual `ExpandBar` drift.
+fn finish_expand_bar_scroll_restore(card_el: &web_sys::Element, anchor: ExpandBarScrollAnchor) {
+    clear_chunk_content_visibility_overrides(card_el);
+    let Ok(Some(main_el)) = card_el.closest(".diff-main") else {
+        return;
+    };
+    if let Some(bar_el) = find_surviving_expand_bar(card_el, anchor) {
+        align_expand_bar(&main_el, &bar_el, anchor);
+    }
+}
+
+/// Tracks an active two-frame scroll restoration `requestAnimationFrame` chain on a diff card,
+/// ensuring temporary `content-visibility: visible` overrides are always released on completion,
+/// cancellation, or unmount.
+#[derive(Clone, Copy)]
+struct ScrollRestoreState {
+    card_ref: NodeRef<leptos::html::Article>,
+    raf_id: StoredValue<Option<i32>, LocalStorage>,
+    raf_kind: StoredValue<Option<RestoreRafKind>, LocalStorage>,
+    raf_cb: StoredValue<Option<Closure<dyn FnMut()>>, LocalStorage>,
+    chunks_cv_overridden: StoredValue<bool, LocalStorage>,
+}
+
+impl ScrollRestoreState {
+    fn new(card_ref: NodeRef<leptos::html::Article>) -> Self {
+        Self {
+            card_ref,
+            raf_id: StoredValue::new_local(None),
+            raf_kind: StoredValue::new_local(None),
+            raf_cb: StoredValue::new_local(None),
+            chunks_cv_overridden: StoredValue::new_local(false),
+        }
+    }
+
+    fn cancel(self) {
+        let mut prev_id = None;
+        let _ = self.raf_id.try_update_value(|slot| {
+            prev_id = slot.take();
+        });
+        let _ = self.raf_kind.try_set_value(None);
+        if let Some(id) = prev_id
+            && let Some(window) = web_sys::window()
+        {
+            let _ = window.cancel_animation_frame(id);
+        }
+        let _ = self.raf_cb.try_set_value(None);
+        if self.chunks_cv_overridden.try_get_value().unwrap_or(false) {
+            let _ = self.chunks_cv_overridden.try_set_value(false);
+            if let Some(article) = self.card_ref.try_get_untracked().flatten() {
+                let el: &web_sys::Element = article.as_ref();
+                if el.is_connected() {
+                    clear_chunk_content_visibility_overrides(el);
+                }
+            }
+        }
+    }
+
+    fn cancel_if(self, kind: RestoreRafKind) {
+        if self.raf_kind.try_get_value().flatten() == Some(kind) {
+            self.cancel();
+        }
+    }
+
+    fn schedule<T: 'static>(
+        self,
+        kind: RestoreRafKind,
+        restore: impl FnOnce(&web_sys::Element) -> Option<T> + 'static,
+        finish: impl FnOnce(&web_sys::Element, T) + 'static,
+    ) {
+        self.cancel();
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let mut restore_slot = Some(restore);
+        let mut finish_slot = Some(finish);
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            let _ = self.raf_id.try_set_value(None);
+            let _ = self.raf_kind.try_set_value(None);
+            let _current_cb = self.raf_cb.try_update_value(Option::take);
+            let Some(restore_fn) = restore_slot.take() else {
+                return;
+            };
+            let Some(article) = self.card_ref.try_get_untracked().flatten() else {
+                return;
+            };
+            let el: &web_sys::Element = article.as_ref();
+            if !el.is_connected() {
+                return;
+            }
+            let Some(follow_up) = restore_fn(el) else {
+                return;
+            };
+            let _ = self.chunks_cv_overridden.try_set_value(true);
+            let Some(win) = web_sys::window() else {
+                let _ = self.chunks_cv_overridden.try_set_value(false);
+                clear_chunk_content_visibility_overrides(el);
+                return;
+            };
+            let mut finish_fn_slot = finish_slot.take();
+            let mut follow_up_slot = Some(follow_up);
+            let finish_cb = Closure::<dyn FnMut()>::new(move || {
+                let _ = self.raf_id.try_set_value(None);
+                let _ = self.raf_kind.try_set_value(None);
+                let _finish_self = self.raf_cb.try_update_value(Option::take);
+                let _ = self.chunks_cv_overridden.try_set_value(false);
+                if let (Some(finish_fn), Some(state), Some(art)) = (
+                    finish_fn_slot.take(),
+                    follow_up_slot.take(),
+                    self.card_ref.try_get_untracked().flatten(),
+                ) {
+                    let card: &web_sys::Element = art.as_ref();
+                    if card.is_connected() {
+                        finish_fn(card, state);
+                    }
+                }
+            });
+            if let Ok(follow_id) = win.request_animation_frame(finish_cb.as_ref().unchecked_ref()) {
+                let _ = self.raf_id.try_set_value(Some(follow_id));
+                let _ = self.raf_kind.try_set_value(Some(kind));
+                let _ = self.raf_cb.try_set_value(Some(finish_cb));
+            } else {
+                let _ = self.chunks_cv_overridden.try_set_value(false);
+                clear_chunk_content_visibility_overrides(el);
+            }
+        });
+        if let Ok(id) = window.request_animation_frame(cb.as_ref().unchecked_ref()) {
+            self.raf_id.set_value(Some(id));
+            self.raf_kind.set_value(Some(kind));
+            self.raf_cb.set_value(Some(cb));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -574,36 +893,13 @@ pub fn TextDiffCard(
 
     let whole_file_composing = RwSignal::new(false);
     let md_full_ready = RwSignal::new(false);
+    let pending_expand_scroll = RwSignal::new(Option::<ExpandBarScrollAnchor>::None);
     let card_ref = NodeRef::<leptos::html::Article>::new();
     let observed_el = StoredValue::new_local(Option::<web_sys::Element>::None);
     let marked_selection_els = StoredValue::new_local(Vec::<web_sys::Element>::new());
     let selection_sync_pending = StoredValue::new_local(false);
-    let restore_raf_id = StoredValue::new_local(Option::<i32>::None);
-    let restore_raf_cb = StoredValue::new_local(Option::<Closure<dyn FnMut()>>::None);
-    let chunks_cv_overridden = StoredValue::new_local(false);
+    let scroll_restore = ScrollRestoreState::new(card_ref);
     let last_commits = StoredValue::new_local(Option::<(String, String)>::None);
-
-    let cancel_pending_restore_raf = move || {
-        let mut prev_id = None;
-        let _ = restore_raf_id.try_update_value(|slot| {
-            prev_id = slot.take();
-        });
-        if let Some(id) = prev_id
-            && let Some(window) = web_sys::window()
-        {
-            let _ = window.cancel_animation_frame(id);
-        }
-        let _ = restore_raf_cb.try_set_value(None);
-        if chunks_cv_overridden.try_get_value().unwrap_or(false) {
-            let _ = chunks_cv_overridden.try_set_value(false);
-            if let Some(article) = card_ref.try_get_untracked().flatten() {
-                let el: &web_sys::Element = article.as_ref();
-                if el.is_connected() {
-                    clear_chunk_content_visibility_overrides(el);
-                }
-            }
-        }
-    };
 
     Effect::new(move |_| {
         if let Some(article) = card_ref.get()
@@ -615,8 +911,9 @@ pub fn TextDiffCard(
         }
     });
     on_cleanup(move || {
-        cancel_pending_restore_raf();
+        scroll_restore.cancel();
         let _ = pending_md_scroll.try_set(None);
+        let _ = pending_expand_scroll.try_set(None);
         let mut prev = None;
         let _ = observed_el.try_update_value(|slot| {
             prev = slot.take();
@@ -776,7 +1073,7 @@ pub fn TextDiffCard(
 
     let show_code = Memo::new(move |_| !is_md || md_tab.get() == MarkdownTab::Code);
 
-    // Clear stale Markdown tab scroll anchors whenever the compared commits change.
+    // Clear stale scroll anchors whenever the compared commits change.
     Effect::new(move |_| {
         let cur_commits = commits.get();
         let changed = last_commits.with_value(|prev| {
@@ -785,8 +1082,9 @@ pub fn TextDiffCard(
         });
         last_commits.set_value(Some(cur_commits));
         if changed {
-            cancel_pending_restore_raf();
+            scroll_restore.cancel();
             let _ = pending_md_scroll.try_set(None);
+            let _ = pending_expand_scroll.try_set(None);
         }
     });
 
@@ -849,7 +1147,7 @@ pub fn TextDiffCard(
         };
         let current_tab = md_tab.get();
         if current_tab != anchor.target_tab || is_collapsed_sig.get() {
-            cancel_pending_restore_raf();
+            scroll_restore.cancel_if(RestoreRafKind::MarkdownTab);
             pending_md_scroll.set(None);
             return;
         }
@@ -898,54 +1196,46 @@ pub fn TextDiffCard(
         }
 
         pending_md_scroll.set(None);
-        cancel_pending_restore_raf();
-        let Some(window) = web_sys::window() else {
+        scroll_restore.schedule(
+            RestoreRafKind::MarkdownTab,
+            move |el| restore_tab_scroll_anchor(el, anchor),
+            move |card, follow_up| finish_code_scroll_restore(card, &follow_up),
+        );
+    });
+
+    // Pin the viewport to the surviving `ExpandBar` once a partial context expansion lands in
+    // `merged_chunks_memo` (handling both synchronous cache hits and async `/api/lines` fetches).
+    Effect::new(move |_| {
+        let Some(anchor) = pending_expand_scroll.get() else {
             return;
         };
-        let cb = Closure::<dyn FnMut()>::new(move || {
-            let _ = restore_raf_id.try_set_value(None);
-            let _current_cb = restore_raf_cb.try_update_value(Option::take);
-            if let Some(article) = card_ref.try_get_untracked().flatten() {
-                let el: &web_sys::Element = article.as_ref();
-                if el.is_connected()
-                    && let Some(follow_up) = restore_tab_scroll_anchor(el, anchor)
-                {
-                    let _ = chunks_cv_overridden.try_set_value(true);
-                    if let Some(win) = web_sys::window() {
-                        let finish_cb = Closure::<dyn FnMut()>::new(move || {
-                            let _ = restore_raf_id.try_set_value(None);
-                            let _finish_self = restore_raf_cb.try_update_value(Option::take);
-                            let _ = chunks_cv_overridden.try_set_value(false);
-                            if let Some(art) = card_ref.try_get_untracked().flatten() {
-                                let card: &web_sys::Element = art.as_ref();
-                                if card.is_connected() {
-                                    finish_code_scroll_restore(card, &follow_up);
-                                }
-                            }
-                        });
-                        if let Ok(follow_id) =
-                            win.request_animation_frame(finish_cb.as_ref().unchecked_ref())
-                        {
-                            let _ = restore_raf_id.try_set_value(Some(follow_id));
-                            let _ = restore_raf_cb.try_set_value(Some(finish_cb));
-                        } else {
-                            let _ = chunks_cv_overridden.try_set_value(false);
-                            clear_chunk_content_visibility_overrides(el);
-                        }
-                    } else {
-                        let _ = chunks_cv_overridden.try_set_value(false);
-                        clear_chunk_content_visibility_overrides(el);
-                    }
-                }
-            }
-        });
-        if let Ok(id) = window.request_animation_frame(cb.as_ref().unchecked_ref()) {
-            restore_raf_id.set_value(Some(id));
-            restore_raf_cb.set_value(Some(cb));
+        if is_collapsed_sig.get() || !show_code.get() {
+            scroll_restore.cancel_if(RestoreRafKind::ExpandBar);
+            pending_expand_scroll.set(None);
+            return;
         }
+        let use_old = file.with(|f| f.status == FileStatus::Deleted);
+        let has_target = merged_chunks_memo
+            .with(|chunks| merged_chunks_has_surviving_gap(chunks, use_old, anchor));
+        if !has_target {
+            if !expand_loading.get() {
+                // Request finished without producing the expected gap (for example a fetch error).
+                pending_expand_scroll.set(None);
+            }
+            return;
+        }
+
+        pending_expand_scroll.set(None);
+        scroll_restore.schedule(
+            RestoreRafKind::ExpandBar,
+            move |el| restore_expand_bar_scroll(el, anchor).then_some(()),
+            move |card, ()| finish_expand_bar_scroll_restore(card, anchor),
+        );
     });
 
     let on_select_md_tab = move |next_tab: MarkdownTab| {
+        scroll_restore.cancel_if(RestoreRafKind::ExpandBar);
+        pending_expand_scroll.set(None);
         let article = card_ref.get_untracked();
         let card_el: Option<&web_sys::Element> = article.as_deref().map(AsRef::as_ref);
         switch_markdown_tab(card_el, md_tab, pending_md_scroll, next_tab);
@@ -1114,6 +1404,8 @@ pub fn TextDiffCard(
                                 aria-label="Expand entire file"
                                 prop:disabled=move || expand_loading.get()
                                 on:click=move |_| {
+                                    scroll_restore.cancel_if(RestoreRafKind::ExpandBar);
+                                    pending_expand_scroll.set(None);
                                     let f = file.get_untracked();
                                     visible_line_limit.set(usize::MAX);
                                     on_window_expanded.run(());
@@ -1137,6 +1429,8 @@ pub fn TextDiffCard(
                                 title="Collapse manually expanded context back to diff hunks"
                                 aria-label="Collapse expanded context"
                                 on:click=move |_| {
+                                    scroll_restore.cancel_if(RestoreRafKind::ExpandBar);
+                                    pending_expand_scroll.set(None);
                                     let f = file.get_untracked();
                                     visible_line_limit.set(CHUNK_WINDOW_STEP_LINES);
                                     if supports_expansion(&f) {
@@ -1469,6 +1763,8 @@ pub fn TextDiffCard(
 
                                         let chunk_count = merged_chunks.len();
                                         let path_clone = file_snapshot.path.clone();
+                                        let use_old_gap_bounds =
+                                            file_snapshot.status == FileStatus::Deleted;
                                         let remaining_lines = window_plan.remaining_lines;
                                         let shown_lines = window_plan.shown_lines;
                                         let total_lines = window_plan.total_lines;
@@ -1496,6 +1792,44 @@ pub fn TextDiffCard(
                                                     old_line_range: req.old_line_range,
                                                 },
                                             });
+                                        };
+                                        let emit_partial_gap_expand = move |f: Arc<DiffFile>,
+                                                                            gap: HiddenGap,
+                                                                            edge: ExpandEdge,
+                                                                            bar_el: Option<web_sys::Element>| {
+                                            let use_old = f.status == FileStatus::Deleted;
+                                            let expected = gap
+                                                .line_bounds(use_old)
+                                                .and_then(|b| {
+                                                    b.surviving_after_partial_expand(
+                                                        edge,
+                                                        DEFAULT_EXPAND_COUNT,
+                                                    )
+                                                });
+                                            let anchor = expected.and_then(|expected_gap| {
+                                                let bar = bar_el?;
+                                                let article = card_ref.get_untracked()?;
+                                                let card: &web_sys::Element = article.as_ref();
+                                                capture_expand_bar_scroll_anchor(
+                                                    card,
+                                                    &bar,
+                                                    expected_gap,
+                                                    edge,
+                                                )
+                                            });
+                                            if anchor.is_none() {
+                                                scroll_restore.cancel_if(RestoreRafKind::ExpandBar);
+                                            }
+                                            pending_expand_scroll.set(anchor);
+                                            emit_gap_expand(
+                                                f,
+                                                gap.take_from_edge(edge, DEFAULT_EXPAND_COUNT),
+                                            );
+                                        };
+                                        let emit_full_gap_expand = move |f: Arc<DiffFile>, gap: HiddenGap| {
+                                            scroll_restore.cancel_if(RestoreRafKind::ExpandBar);
+                                            pending_expand_scroll.set(None);
+                                            emit_gap_expand(f, gap.as_full_slice());
                                         };
 
                                         view! {
@@ -1541,15 +1875,16 @@ pub fn TextDiffCard(
                                                                         <ExpandBar
                                                                             position=ExpandBarPosition::Top
                                                                             hidden_lines=hidden_before
+                                                                            gap_bounds=gap.line_bounds(use_old_gap_bounds)
                                                                             is_loading=expand_loading
-                                                                            on_expand_up=Callback::new(|()| {})
+                                                                            on_expand_up=Callback::new(|_| {})
                                                                             on_expand_down=Callback::new({
                                                                                 let f = Arc::clone(&file_top);
-                                                                                move |()| emit_gap_expand(Arc::clone(&f), gap.take_from_end(DEFAULT_EXPAND_COUNT))
+                                                                                move |bar_el| emit_partial_gap_expand(Arc::clone(&f), gap, ExpandEdge::FromEnd, bar_el)
                                                                             })
                                                                             on_expand_all=Callback::new({
                                                                                 let f = Arc::clone(&file_top);
-                                                                                move |()| emit_gap_expand(Arc::clone(&f), gap.as_full_slice())
+                                                                                move |()| emit_full_gap_expand(Arc::clone(&f), gap)
                                                                             })
                                                                         />
                                                                     })}
@@ -1561,18 +1896,19 @@ pub fn TextDiffCard(
                                                                         <ExpandBar
                                                                             position=ExpandBarPosition::Middle
                                                                             hidden_lines=hidden_before
+                                                                            gap_bounds=gap.line_bounds(use_old_gap_bounds)
                                                                             is_loading=expand_loading
                                                                             on_expand_up=Callback::new({
                                                                                 let f = Arc::clone(&file_mid);
-                                                                                move |()| emit_gap_expand(Arc::clone(&f), gap.take_from_start(DEFAULT_EXPAND_COUNT))
+                                                                                move |bar_el| emit_partial_gap_expand(Arc::clone(&f), gap, ExpandEdge::FromStart, bar_el)
                                                                             })
                                                                             on_expand_down=Callback::new({
                                                                                 let f = Arc::clone(&file_mid);
-                                                                                move |()| emit_gap_expand(Arc::clone(&f), gap.take_from_end(DEFAULT_EXPAND_COUNT))
+                                                                                move |bar_el| emit_partial_gap_expand(Arc::clone(&f), gap, ExpandEdge::FromEnd, bar_el)
                                                                             })
                                                                             on_expand_all=Callback::new({
                                                                                 let f = Arc::clone(&file_mid);
-                                                                                move |()| emit_gap_expand(Arc::clone(&f), gap.as_full_slice())
+                                                                                move |()| emit_full_gap_expand(Arc::clone(&f), gap)
                                                                             })
                                                                         />
                                                                     })}
@@ -1608,15 +1944,16 @@ pub fn TextDiffCard(
                                                                         <ExpandBar
                                                                             position=ExpandBarPosition::Bottom
                                                                             hidden_lines=hidden_after
+                                                                            gap_bounds=gap.line_bounds(use_old_gap_bounds)
                                                                             is_loading=expand_loading
                                                                             on_expand_up=Callback::new({
                                                                                 let f = Arc::clone(&file_bot);
-                                                                                move |()| emit_gap_expand(Arc::clone(&f), gap.take_from_start(DEFAULT_EXPAND_COUNT))
+                                                                                move |bar_el| emit_partial_gap_expand(Arc::clone(&f), gap, ExpandEdge::FromStart, bar_el)
                                                                             })
-                                                                            on_expand_down=Callback::new(|()| {})
+                                                                            on_expand_down=Callback::new(|_| {})
                                                                             on_expand_all=Callback::new({
                                                                                 let f = Arc::clone(&file_bot);
-                                                                                move |()| emit_gap_expand(Arc::clone(&f), gap.as_full_slice())
+                                                                                move |()| emit_full_gap_expand(Arc::clone(&f), gap)
                                                                             })
                                                                         />
                                                                     })}
@@ -1775,9 +2112,10 @@ fn render_file_threads_section(
 fn ExpandBar(
     position: ExpandBarPosition,
     hidden_lines: u32,
+    gap_bounds: Option<GapBounds>,
     #[prop(into)] is_loading: Signal<bool>,
-    on_expand_up: Callback<()>,
-    on_expand_down: Callback<()>,
+    on_expand_up: Callback<Option<web_sys::Element>>,
+    on_expand_down: Callback<Option<web_sys::Element>>,
     on_expand_all: Callback<()>,
 ) -> impl IntoView {
     let label = if hidden_lines == 1 {
@@ -1785,9 +2123,19 @@ fn ExpandBar(
     } else {
         alloc::format!("{hidden_lines} hidden lines")
     };
+    let bar_ref = NodeRef::<leptos::html::Div>::new();
+    let current_bar_el =
+        move || -> Option<web_sys::Element> { bar_ref.get_untracked().map(Into::into) };
+    let data_gap_start = gap_bounds.map(|b| b.start.to_string());
+    let data_gap_end = gap_bounds.map(|b| b.end.to_string());
 
     view! {
-        <div class="expand-bar">
+        <div
+            node_ref=bar_ref
+            class="expand-bar"
+            data-gap-start=data_gap_start
+            data-gap-end=data_gap_end
+        >
             <span class="expand-bar__label">{label}</span>
             <div class="expand-bar__actions">
                 {if hidden_lines <= DEFAULT_EXPAND_COUNT {
@@ -1809,7 +2157,7 @@ fn ExpandBar(
                                     type="button"
                                     class="btn btn--ghost btn--xs"
                                     prop:disabled=move || is_loading.get()
-                                    on:click=move |_| on_expand_down.run(())
+                                    on:click=move |_| on_expand_down.run(current_bar_el())
                                 >
                                     "↓ Expand 20"
                                 </button>
@@ -1829,7 +2177,7 @@ fn ExpandBar(
                                     type="button"
                                     class="btn btn--ghost btn--xs"
                                     prop:disabled=move || is_loading.get()
-                                    on:click=move |_| on_expand_up.run(())
+                                    on:click=move |_| on_expand_up.run(current_bar_el())
                                 >
                                     "↑ 20 above"
                                 </button>
@@ -1837,7 +2185,7 @@ fn ExpandBar(
                                     type="button"
                                     class="btn btn--ghost btn--xs"
                                     prop:disabled=move || is_loading.get()
-                                    on:click=move |_| on_expand_down.run(())
+                                    on:click=move |_| on_expand_down.run(current_bar_el())
                                 >
                                     "↓ 20 below"
                                 </button>
@@ -1857,7 +2205,7 @@ fn ExpandBar(
                                     type="button"
                                     class="btn btn--ghost btn--xs"
                                     prop:disabled=move || is_loading.get()
-                                    on:click=move |_| on_expand_up.run(())
+                                    on:click=move |_| on_expand_up.run(current_bar_el())
                                 >
                                     "↑ Expand 20"
                                 </button>
@@ -2941,5 +3289,96 @@ mod tests {
             ),
             ExpandFileButtonState::CollapseContext
         );
+    }
+
+    #[test]
+    fn expand_bar_scroll_offset_and_delta_pin_surviving_bar() {
+        // Bar cleanly inside visible region keeps its exact clicked offset.
+        let offset = compute_expand_bar_viewport_offset(420.0, 28.0, 50.0, 850.0, 90.0).unwrap();
+        assert!((offset - 370.0).abs() < 1e-6);
+
+        // Bar partially tucked behind sticky header clamps below header_bottom.
+        let clamped_top =
+            compute_expand_bar_viewport_offset(70.0, 28.0, 50.0, 850.0, 90.0).unwrap();
+        assert!((clamped_top - 40.0).abs() < 1e-6);
+
+        // Bar partially visible near the bottom of .diff-main stays pinned at its clicked position.
+        let near_bottom =
+            compute_expand_bar_viewport_offset(840.0, 28.0, 50.0, 850.0, 90.0).unwrap();
+        assert!((near_bottom - (840.0 - 50.0)).abs() < 1e-6);
+
+        // Bar completely off-screen below .diff-main clamps into view.
+        let offscreen_bottom =
+            compute_expand_bar_viewport_offset(900.0, 28.0, 50.0, 850.0, 90.0).unwrap();
+        assert!((offscreen_bottom - (822.0 - 50.0)).abs() < 1e-6);
+
+        // Unlaid-out zero-height bar returns None.
+        assert_eq!(
+            compute_expand_bar_viewport_offset(420.0, 0.0, 50.0, 850.0, 90.0),
+            None
+        );
+
+        // Revealing 20 lines (~400px) above the bar pushes bar_top from 420 to 820 -> scroll_top +400.
+        let pushed_down =
+            compute_expand_bar_target_scroll_top(500.0, 820.0, 50.0, offset, 0.5).unwrap();
+        assert!((pushed_down - 900.0).abs() < 1e-6);
+
+        // Upward shift clamps scroll_top at 0.0.
+        let shifted_up =
+            compute_expand_bar_target_scroll_top(40.0, 300.0, 50.0, offset, 0.5).unwrap();
+        assert!((shifted_up - 0.0).abs() < 1e-6);
+
+        // Already pinned within tolerance returns None.
+        assert_eq!(
+            compute_expand_bar_target_scroll_top(900.0, 420.3, 50.0, offset, 0.5),
+            None
+        );
+    }
+
+    #[test]
+    fn detects_surviving_gap_only_after_expansion_applies() {
+        let file = Arc::new(DiffFile {
+            path: String::from("src/example.rs"),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 0,
+            is_generated: false,
+            chunks: alloc::vec![DiffChunk {
+                old_start: 51,
+                old_lines: 1,
+                new_start: 51,
+                new_lines: 1,
+                header: String::from("@@ -51,1 +51,1 @@"),
+                lines: alloc::vec![mk_line(DiffLineKind::Add, None, Some(51), "added")],
+            }],
+            chunks_loaded: true,
+        });
+        let mut exp = FileExpandedState {
+            new_total_lines: Some(120),
+            ..FileExpandedState::default()
+        };
+
+        let before = merge_chunks_for_file(&file, Some(&exp));
+        let top_gap = before[0].before_gap.unwrap();
+        let expected_top = top_gap
+            .line_bounds(false)
+            .unwrap()
+            .surviving_after_partial_expand(ExpandEdge::FromEnd, 20)
+            .unwrap();
+        let top_anchor = ExpandBarScrollAnchor {
+            expected_gap: expected_top,
+            edge: ExpandEdge::FromEnd,
+            viewport_offset: 100.0,
+        };
+
+        // Pre-expansion chunks (while async fetch is still in flight) must not match.
+        assert!(!merged_chunks_has_surviving_gap(&before, false, top_anchor));
+
+        // Applying the slice makes the surviving top gap appear and match.
+        exp.manual_slices
+            .push(top_gap.take_from_edge(ExpandEdge::FromEnd, 20).slice);
+        let after = merge_chunks_for_file(&file, Some(&exp));
+        assert!(merged_chunks_has_surviving_gap(&after, false, top_anchor));
     }
 }

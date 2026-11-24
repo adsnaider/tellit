@@ -621,7 +621,7 @@ fn collect_code_capture_candidates(
 /// Temporarily overrides `content-visibility: auto` on `.diff-chunk-wrapper` elements inside
 /// `card_el` so newly mounted `Code` chunks lay out to their full height before `scroll_top` is
 /// set, avoiding `contain-intrinsic-size` scroll clamping and skipped zero-height rows.
-fn force_chunks_content_visibility_visible(card_el: &web_sys::Element) -> bool {
+pub fn force_chunks_content_visibility_visible(card_el: &web_sys::Element) -> bool {
     let Ok(wrappers) = card_el.query_selector_all(".diff-chunk-wrapper") else {
         return false;
     };

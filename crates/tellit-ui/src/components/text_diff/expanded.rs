@@ -47,6 +47,76 @@ pub struct HiddenGap {
     pub new_start_line: u32,
 }
 
+/// Edge of a [`HiddenGap`] from which a partial expansion reveals lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpandEdge {
+    /// Reveals lines from the start (top) of the gap, advancing `start` downward.
+    FromStart,
+    /// Reveals lines from the end (bottom) of the gap, pulling `end` upward.
+    FromEnd,
+}
+
+/// Inclusive 1-based line bounds `[start, end]` of a non-empty [`HiddenGap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GapBounds {
+    /// Inclusive 1-based first hidden line number.
+    pub start: u32,
+    /// Inclusive 1-based last hidden line number (`>= start`).
+    pub end: u32,
+}
+
+impl GapBounds {
+    /// Returns the number of hidden lines covered by `[start, end]`.
+    #[must_use]
+    pub const fn line_count(self) -> u32 {
+        if self.end < self.start {
+            0
+        } else {
+            self.end - self.start + 1
+        }
+    }
+
+    /// Computes the remaining hidden gap bounds after revealing `step` lines from `edge`,
+    /// or `None` when `step == 0` or the expansion exhausts the entire gap.
+    #[must_use]
+    pub const fn surviving_after_partial_expand(self, edge: ExpandEdge, step: u32) -> Option<Self> {
+        let len = self.line_count();
+        if step == 0 || len <= step {
+            return None;
+        }
+        match edge {
+            ExpandEdge::FromStart => Some(Self {
+                start: self.start.saturating_add(step),
+                end: self.end,
+            }),
+            ExpandEdge::FromEnd => Some(Self {
+                start: self.start,
+                end: self.end.saturating_sub(step),
+            }),
+        }
+    }
+}
+
+/// Returns `true` when `candidate` is the surviving gap expected after expanding from `edge`.
+///
+/// Exact `(start, end)` equality always matches. If the far end of the gap was split concurrently
+/// (for example by auto-expanded comment context), matching the newly advanced edge still uniquely
+/// identifies the surviving bar because that line lies strictly inside the pre-click hidden range.
+#[must_use]
+pub const fn matches_surviving_gap(
+    candidate: GapBounds,
+    expected: GapBounds,
+    edge: ExpandEdge,
+) -> bool {
+    if candidate.start == expected.start && candidate.end == expected.end {
+        return true;
+    }
+    match edge {
+        ExpandEdge::FromStart => candidate.start == expected.start,
+        ExpandEdge::FromEnd => candidate.end == expected.end,
+    }
+}
+
 /// Concrete expansion request derived from a [`HiddenGap`] click.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GapSliceRequest {
@@ -63,6 +133,34 @@ impl HiddenGap {
     #[must_use]
     pub const fn line_count(&self) -> u32 {
         self.end_offset.saturating_sub(self.start_offset)
+    }
+
+    /// Returns inclusive 1-based line bounds on the primary side (`old` for deleted files, `new`
+    /// otherwise), or `None` when the gap is empty.
+    #[must_use]
+    pub const fn line_bounds(&self, use_old: bool) -> Option<GapBounds> {
+        let len = self.line_count();
+        if len == 0 {
+            return None;
+        }
+        let start = if use_old {
+            self.old_start_line
+        } else {
+            self.new_start_line
+        };
+        Some(GapBounds {
+            start,
+            end: start.saturating_add(len - 1),
+        })
+    }
+
+    /// Builds a request revealing up to `count` lines from `edge`.
+    #[must_use]
+    pub const fn take_from_edge(&self, edge: ExpandEdge, count: u32) -> GapSliceRequest {
+        match edge {
+            ExpandEdge::FromStart => self.take_from_start(count),
+            ExpandEdge::FromEnd => self.take_from_end(count),
+        }
     }
 
     /// Builds a request revealing up to `count` lines from the top of this gap (growing downward).
@@ -1392,5 +1490,175 @@ mod tests {
         let keys = collect_merged_line_keys(&collapsed);
         assert!(keys.contains(&(CommentSide::New, 30)));
         assert!(!keys.contains(&(CommentSide::New, 1)));
+    }
+
+    #[test]
+    fn surviving_gap_bounds_match_merged_chunks_across_partial_and_full_expansions() {
+        let bounds = GapBounds { start: 11, end: 80 };
+        assert_eq!(bounds.line_count(), 70);
+
+        // Partial expand from start advances start downward, keeping end fixed.
+        let after_start = bounds
+            .surviving_after_partial_expand(ExpandEdge::FromStart, 20)
+            .expect("70-line gap leaves 50 hidden lines");
+        assert_eq!(after_start, GapBounds { start: 31, end: 80 });
+        assert!(matches_surviving_gap(
+            after_start,
+            after_start,
+            ExpandEdge::FromStart
+        ));
+        assert!(matches_surviving_gap(
+            GapBounds { start: 31, end: 55 },
+            after_start,
+            ExpandEdge::FromStart
+        ));
+        assert!(!matches_surviving_gap(
+            bounds,
+            after_start,
+            ExpandEdge::FromStart
+        ));
+
+        // Partial expand from end pulls end upward, keeping start fixed.
+        let after_end = after_start
+            .surviving_after_partial_expand(ExpandEdge::FromEnd, 20)
+            .expect("50-line gap leaves 30 hidden lines");
+        assert_eq!(after_end, GapBounds { start: 31, end: 60 });
+        assert!(matches_surviving_gap(
+            after_end,
+            after_end,
+            ExpandEdge::FromEnd
+        ));
+        assert!(matches_surviving_gap(
+            GapBounds { start: 45, end: 60 },
+            after_end,
+            ExpandEdge::FromEnd
+        ));
+        assert!(!matches_surviving_gap(
+            after_start,
+            after_end,
+            ExpandEdge::FromEnd
+        ));
+
+        // Expanding >= remaining lines (or 0 lines) produces no surviving bar.
+        assert_eq!(
+            GapBounds { start: 11, end: 30 }
+                .surviving_after_partial_expand(ExpandEdge::FromStart, 20),
+            None
+        );
+        assert_eq!(
+            GapBounds { start: 11, end: 25 }
+                .surviving_after_partial_expand(ExpandEdge::FromEnd, 20),
+            None
+        );
+        assert_eq!(
+            bounds.surviving_after_partial_expand(ExpandEdge::FromStart, 0),
+            None
+        );
+
+        // End-to-end check against merge_chunks_for_file on top, middle, and bottom gaps.
+        let file = Arc::new(DiffFile {
+            path: String::from("src/scroll.rs"),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 2,
+            deletions: 0,
+            is_generated: false,
+            chunks: alloc::vec![
+                DiffChunk {
+                    old_start: 61,
+                    old_lines: 1,
+                    new_start: 61,
+                    new_lines: 1,
+                    header: String::from("@@ -61,1 +61,1 @@"),
+                    lines: alloc::vec![sample_line(
+                        DiffLineKind::Context,
+                        Some(61),
+                        Some(61),
+                        "line 61"
+                    )],
+                },
+                DiffChunk {
+                    old_start: 132,
+                    old_lines: 1,
+                    new_start: 132,
+                    new_lines: 1,
+                    header: String::from("@@ -132,1 +132,1 @@"),
+                    lines: alloc::vec![sample_line(DiffLineKind::Add, None, Some(132), "line 132")],
+                },
+            ],
+            chunks_loaded: true,
+        });
+        let mut map = ExpandedLinesMap::new();
+        map.insert(String::from("src/scroll.rs"), full_state(200));
+
+        // Top gap [1, 60]: expanding from end reveals lines 41..=60, leaving [1, 40].
+        let c0 = merge_chunks_for_file(&file, map.get("src/scroll.rs"));
+        let top_gap = c0[0].before_gap.unwrap();
+        let top_expected = top_gap
+            .line_bounds(false)
+            .unwrap()
+            .surviving_after_partial_expand(ExpandEdge::FromEnd, 20)
+            .unwrap();
+        record_manual_slice(
+            &mut map,
+            "src/scroll.rs",
+            top_gap.take_from_edge(ExpandEdge::FromEnd, 20).slice,
+        );
+        let c1 = merge_chunks_for_file(&file, map.get("src/scroll.rs"));
+        assert_eq!(
+            c1[0].before_gap.unwrap().line_bounds(false),
+            Some(top_expected)
+        );
+        assert_eq!(top_expected, GapBounds { start: 1, end: 40 });
+
+        // Middle gap [62, 131]: expanding from start reveals lines 62..=81, leaving [82, 131].
+        let mid_gap = c1[1].before_gap.unwrap();
+        let mid_expected = mid_gap
+            .line_bounds(false)
+            .unwrap()
+            .surviving_after_partial_expand(ExpandEdge::FromStart, 20)
+            .unwrap();
+        record_manual_slice(
+            &mut map,
+            "src/scroll.rs",
+            mid_gap.take_from_edge(ExpandEdge::FromStart, 20).slice,
+        );
+        let c2 = merge_chunks_for_file(&file, map.get("src/scroll.rs"));
+        assert_eq!(
+            c2[1].before_gap.unwrap().line_bounds(false),
+            Some(mid_expected)
+        );
+        assert_eq!(
+            mid_expected,
+            GapBounds {
+                start: 82,
+                end: 131
+            }
+        );
+
+        // Bottom gap [133, 200]: expanding from start reveals lines 133..=152, leaving [153, 200].
+        let bot_gap = c2[1].after_gap.unwrap();
+        let bot_expected = bot_gap
+            .line_bounds(false)
+            .unwrap()
+            .surviving_after_partial_expand(ExpandEdge::FromStart, 20)
+            .unwrap();
+        record_manual_slice(
+            &mut map,
+            "src/scroll.rs",
+            bot_gap.take_from_edge(ExpandEdge::FromStart, 20).slice,
+        );
+        let c3 = merge_chunks_for_file(&file, map.get("src/scroll.rs"));
+        assert_eq!(
+            c3[1].after_gap.unwrap().line_bounds(false),
+            Some(bot_expected)
+        );
+        assert_eq!(
+            bot_expected,
+            GapBounds {
+                start: 153,
+                end: 200
+            }
+        );
     }
 }

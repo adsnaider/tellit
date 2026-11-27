@@ -5,12 +5,15 @@ description: Code review diff viewer and commenting tool for Jujutsu (jj). Use w
 
 # tellit
 
-`tellit` is a code review diff viewer and commenting tool for Jujutsu (`jj`) and Git repositories. It provides an interactive web diff viewer and CLI comment management, persisting discussion threads and commit approval status as structured JSON files organized by Jujutsu change IDs and Git commit hashes.
+`tellit` is a code review diff viewer and commenting tool for Jujutsu (`jj`) and
+Git repositories. It provides an interactive web diff viewer and CLI comment
+management, persisting discussion threads and commit approval status as
+structured JSON files organized by Jujutsu change IDs and Git commit hashes.
 
 ## Storage Layout
 
-The default store resolves to `<main-repo>/.tellit` (even inside Jujutsu workspaces).
-The file hierarchy follows:
+The default store resolves to `<main-repo>/.tellit` (even inside Jujutsu
+workspaces). The file hierarchy follows:
 
 ```
 <store>/[jj change ID]/[git commit hash]/[thread-id].json
@@ -36,7 +39,8 @@ The file hierarchy follows:
 ```
 
 - `filepath`: Relative path from the repository root.
-- `line_range`: `{ "start": u32, "end": u32 }` (omitted for whole-file comments).
+- `line_range`: `{ "start": u32, "end": u32 }` (omitted for whole-file
+  comments).
 - `comments`: Ordered list of comment strings.
 - `resolved`: Boolean flag indicating if the thread is resolved.
 
@@ -50,37 +54,50 @@ The file hierarchy follows:
 ```
 
 - Approvals are strictly tracked per **Git commit hash**.
-- A change is considered approved **only if its latest commit** has an active approval.
-- Modifying, squashing, or amending a change creates a new commit hash in Jujutsu, naturally resetting approval without mutating historical records.
+- A change is considered approved **only if its latest commit** has an active
+  approval.
+- Modifying, squashing, or amending a change creates a new commit hash in
+  Jujutsu, naturally resetting approval without mutating historical records.
 
 ---
 
 ## Web Diff Viewer (`tellit launch`)
 
-Launches the interactive web review interface with Jujutsu revision picker, virtual commit message diffs, and comment threading:
+Launches the interactive web review interface with Jujutsu revision picker,
+virtual commit message diffs, and comment threading:
 
 ```bash
 tellit launch [COMMIT_ISH] [COMPARE_WITH] [OPTIONS]
 ```
 
 - `tellit launch` : Review current working copy `@`.
-- `tellit launch <rev>` : Review specific commit or change ID (e.g. `tellit launch ntrwwmqm`).
+- `tellit launch <rev>` : Review specific commit or change ID (e.g. `tellit
+  launch ntrwwmqm`).
 - `tellit launch <base> <target>` : Compare two revisions.
 - `--port <PORT>` : Custom port (defaults to 3333 or next free port).
 - `--no-open` : Do not open browser automatically.
 - `--keep-alive` : Keep server running even after browser disconnects.
 
 ### UI Features:
-- **Change & Commit Navigation**: Dropdowns on the top toolbar let you switch between Jujutsu changes and view all commits within each change (evolog) in reverse chronological order (latest on top).
-- **Diff Comparison Controls**: Select `[From (base)] -> [To (diff head)]` directly in the toolbar.
-- **Approve Button**: An `Approve` / `Approved` toggle button sits directly beside the comparison controls to approve the commit currently being diffed.
-- **Virtual Commit Message Diff**: Appears like a file at the top of the diff viewer, showing additions or inter-commit diffs between commit descriptions.
+
+- **Change & Commit Navigation**: Dropdowns on the top toolbar let you switch
+  between Jujutsu changes and view all commits within each change (evolog) in
+  reverse chronological order (latest on top).
+- **Diff Comparison Controls**: Select `[From (base)] -> [To (diff head)]`
+  directly in the toolbar.
+- **Approve Button**: An `Approve` / `Approved` toggle button sits directly
+  beside the comparison controls to approve the commit currently being diffed.
+- **Virtual Commit Message Diff**: Appears like a file at the top of the diff
+  viewer, showing additions or inter-commit diffs between commit descriptions.
 - **Review Status Indicators (Colored Dots)**:
   - **Yellow**: Unresolved comments present (comments always take precedence).
-  - **Green**: Approved commit or change (only when 0 unresolved comments exist).
+  - **Green**: Approved commit or change (only when 0 unresolved comments
+    exist).
   - **Gray**: All comments resolved, but not approved.
   - **None**: No comments and not approved.
-- **Comments Sidebar**: Click the `Comments` button in the top navigation to view all comments for the change, grouped with unresolved comments first and resolved comments after.
+- **Comments Sidebar**: Click the `Comments` button in the top navigation to
+  view all comments for the change, grouped with unresolved comments first and
+  resolved comments after.
 
 ---
 
@@ -88,8 +105,8 @@ tellit launch [COMMIT_ISH] [COMPARE_WITH] [OPTIONS]
 
 ### 1. Adding a Comment (`add`)
 
-Creates a new comment thread with an autogenerated UUID v4.
-Outputs the generated `thread-id` to `stdout`. All logs/diagnostics go to `stderr`.
+Creates a new comment thread with an autogenerated UUID v4. Outputs the
+generated `thread-id` to `stdout`. All logs/diagnostics go to `stderr`.
 
 ```bash
 tellit comment add --file <FILEPATH> --content "<COMMENT>" [--at <RANGE>] [-r <REV>]
@@ -100,7 +117,8 @@ tellit comment add --file <FILEPATH> --content "<COMMENT>" [--at <RANGE>] [-r <R
 - `--at`, `-a` (optional): Line range. Supports:
   - Single line: `42`
   - Range: `10..20`, `10..=20`, `10-20`, `10:20`
-- `-r`, `--rev` (optional): Jujutsu revision (defaults to `@` or global `-C/--change`).
+- `-r`, `--rev` (optional): Jujutsu revision (defaults to `@` or global
+  `-C/--change`).
 
 ### 2. Replying to a Comment (`reply`)
 
@@ -114,7 +132,9 @@ tellit comment reply <THREAD_ID> "<REPLY>"
 
 ### 3. Resolving / Unresolving a Comment (`resolve`)
 
-Marks a comment thread as resolved (or unresolved).
+Marks a comment thread as resolved (or unresolved). Never resolve review comment
+threads yourself after addressing feedback; leave them open for the reviewer or
+user to verify and resolve unless they explicitly ask you to resolve them.
 
 ```bash
 tellit comment resolve --thread <THREAD_ID>
@@ -132,7 +152,8 @@ Approves (or revokes approval for) a commit or change.
 tellit comment approve [TARGET] [--disapprove]
 ```
 
-- `TARGET` (optional, defaults to `@`): Commit hash or change ID. If a change ID is provided, approves the latest commit representing that change.
+- `TARGET` (optional, defaults to `@`): Commit hash or change ID. If a change ID
+  is provided, approves the latest commit representing that change.
 - `--disapprove`: Revokes the approval.
 
 ### 5. Querying Comments & Approval (`get` and `get-all`)
@@ -143,7 +164,8 @@ tellit comment approve [TARGET] [--disapprove]
 tellit comment get thread <THREAD_ID>
 ```
 
-Outputs full JSON object including `thread_id`, `change_id`, `commit_id`, `git_commit_hash`, `filepath`, `line_range`, `comments`, and `resolved`.
+Outputs full JSON object including `thread_id`, `change_id`, `commit_id`,
+`git_commit_hash`, `filepath`, `line_range`, `comments`, and `resolved`.
 
 #### Get Commit Hashes for a Change ID
 
@@ -151,7 +173,8 @@ Outputs full JSON object including `thread_id`, `change_id`, `commit_id`, `git_c
 tellit comment get change <CHANGE_ID> [--threads] [--json]
 ```
 
-- Returns `{ "commits": [...], "approval": bool }` (or `{ "threads": [...], "approval": bool }` with `--threads`).
+- Returns `{ "commits": [...], "approval": bool }` (or `{ "threads": [...],
+  "approval": bool }` with `--threads`).
 - `approval` evaluates whether the **latest** commit of the change is approved.
 
 #### Get Thread IDs for a Git Commit Hash
@@ -164,7 +187,8 @@ tellit comment get commit <COMMIT_HASH> [--threads] [--json]
 
 #### Get All Thread IDs for a Change, Commit, or Revision (`get-all`)
 
-Retrieves a JSON array of thread IDs for a Jujutsu change ID, Git commit hash, or revision (e.g. `@`, `@-`). Ideal for agents inspecting comments in a change.
+Retrieves a JSON array of thread IDs for a Jujutsu change ID, Git commit hash,
+or revision (e.g. `@`, `@-`). Ideal for agents inspecting comments in a change.
 
 ```bash
 tellit comment get-all [TARGET] [--unresolved] [--resolved]
@@ -172,12 +196,14 @@ tellit comment get-all [TARGET] [--unresolved] [--resolved]
 tellit comment get all [TARGET] [--unresolved] [--resolved]
 ```
 
-- `TARGET` (optional, defaults to `@`): Change ID, commit hash, or Jujutsu revision.
+- `TARGET` (optional, defaults to `@`): Change ID, commit hash, or Jujutsu
+  revision.
 - `--unresolved`: Only return unresolved comment thread IDs.
 - `--resolved`: Only return resolved comment thread IDs.
 - If neither flag is passed, returns all comment thread IDs.
 
 Example:
+
 ```bash
 # Get all unresolved comment thread IDs in the active change (@)
 tellit comment get-all --unresolved
